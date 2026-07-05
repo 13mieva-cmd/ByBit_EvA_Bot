@@ -113,6 +113,31 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     spike=vr/vb if vb>0 else 0
     e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
     uptrend=price>e50 and e21>e50
+    ext=(price-e21)/e21 if e21>0 else 0                 # насколько цена выше EMA21 (гонка за свечой)
+    consol_base=min(lows[-8:]) if len(lows)>=8 else min(lows)   # база наторговки (недавняя опора)
+    old_high=max(highs[-72:-4]) if len(highs)>76 else max(highs[:-4] or highs)  # старый хай (уровень)
+    extended = ext>0.05
+    # --- детектор треугольника (сужение диапазона -> крышка -> пробой) ---
+    TRI=20
+    tri=None; tri_top=price
+    if len(highs)>=TRI+2:
+        wh=highs[-TRI-1:-1]; wl=lows[-TRI-1:-1]           # окно без текущего бара
+        half=TRI//2
+        r1=max(wh[:half])-min(wl[:half]); r2=max(wh[half:])-min(wl[half:])
+        contracting = r1>0 and r2 < r1*0.8                # вторая половина уже первой = сужение
+        tri_top=max(wh)                                    # крышка (сопротивление)
+        if price>tri_top:            tri="breakout"        # закрытие выше крышки = пробой
+        elif contracting and (tri_top-price)/price<=0.015: tri="ready"   # поджатие к крышке
+        elif contracting:            tri="forming"        # просто сужается
+    # --- детектор флага (импульс -> небольшой наклонный откат -> продолжение) ---
+    flag=None; flag_top=price
+    if len(closes)>=30:
+        imp = closes[-15]/closes[-25]-1                      # был ли импульс ~10-25 баров назад
+        pull = closes[-1]/closes[-15]-1                      # откат после импульса
+        pull_range = (max(highs[-12:])-min(lows[-12:]))/price
+        if imp>=0.05 and -0.06<=pull<=0.01 and pull_range<0.06:   # импульс вверх + неглубокий откат/консолидация
+            flag_top=max(highs[-12:-1])
+            flag = "breakout" if price>flag_top else "forming"
     hi7=max(highs[-168:]) if len(highs)>=168 else max(highs)
     dd=price/hi7-1
     turn=sum(vols[-24:])*price
@@ -123,7 +148,9 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     tf=sum([oi1>0.01, oi4>=OI_4H_MIN, oi24>0.10])
     brk=price>max(highs[-168:-1]) if len(highs)>168 else False
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
-                uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta)
+                uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
+                e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
+                tri=tri,tri_top=tri_top,flag=flag,flag_top=flag_top)
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
             and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
@@ -155,6 +182,7 @@ def card(m, ex):
     elif m["cor"]>=HI_CORR: cautions.append(f"сильно ходит за биткоином (corr {m['cor']:.2f})")
     if ex.get("funding",0)>0.01: cautions.append("перегрет плечом (высокий funding)")
     if ex.get("liq_spike",0)>=2: cautions.append(f"всплеск ликвидаций \u00d7{ex['liq_spike']:.1f}")
+    if m.get("extended"): cautions.append("вход на пике импульса \u2014 лучше ждать откат")
 
     sc=_score(m,ex)
     head = "\U0001F7E2" if not cautions else "\U0001F7E1"
@@ -193,6 +221,49 @@ def card(m, ex):
     else:
         lines.append("\U0001F6E1 Риски: чисто \u2705 (не нож, ликвидность ок)")
 
+    # зона входа — не гнаться за свечой, ждать откат к базе/EMA21
+    e21=m.get("e21",m["price"]); base=m.get("consol_base",m["price"]); oh=m.get("old_high",m["price"])
+    ext=m.get("ext",0)
+    # --- блок треугольника ---
+    tri=m.get("tri"); tt=m.get("tri_top",m["price"])
+    if tri:
+        lines.append("")
+        if tri=="forming":
+            lines.append("\U0001F53A <b>Треугольник: формируется</b>")
+            lines.append(f"\u2022 цена поджимается, диапазон сужается \u2014 идёт наторговка в треугольник")
+            lines.append(f"\u2022 крышка (сопротивление): <b>${tt:.5g}</b>")
+            lines.append("\u2022 <i>ждём выхода за крышку, рано входить</i>")
+        elif tri=="ready":
+            lines.append("\u26A1 <b>Треугольник: готовность к пробою</b>")
+            lines.append(f"\u2022 цена вплотную подошла к крышке <b>${tt:.5g}</b> и поджимается")
+            lines.append(f"\u2022 <i>следи за закрытием свечи ВЫШЕ ${tt:.5g} \u2014 это будет пробой</i>")
+            lines.append("\u2022 <i>не входи заранее: часто бывает ложный прокол вниз</i>")
+        elif tri=="breakout":
+            lines.append("\U0001F680 <b>Треугольник: ПРОБОЙ вверх</b>")
+            lines.append(f"\u2022 цена закрылась выше крышки <b>${tt:.5g}</b> \u2014 треугольник пробит")
+            lines.append(f"\u2022 \u26A0\uFE0F бывают ЛОЖНЫЕ пробои (снятие стопов) \u2014 подтверждение: удержание выше ${tt:.5g} или ретест крышки сверху")
+    # --- блок флага ---
+    fl=m.get("flag"); ft=m.get("flag_top",m["price"])
+    if fl:
+        lines.append("")
+        if fl=="forming":
+            lines.append("\U0001F6A9 <b>Флаг: откат после импульса</b>")
+            lines.append("\u2022 был сильный импульс вверх, сейчас неглубокий откат-консолидация (флажок)")
+            lines.append(f"\u2022 верх флага: <b>${ft:.5g}</b>")
+            lines.append(f"\u2022 <i>классически цель \u2014 продолжение вверх при выходе за ${ft:.5g}</i>")
+            lines.append("\u2022 <i>вход выгоднее у низа отката, чем на выходе</i>")
+        elif fl=="breakout":
+            lines.append("\U0001F6A9\U0001F680 <b>Флаг: пробой вверх</b>")
+            lines.append(f"\u2022 цена вышла из флага выше <b>${ft:.5g}</b> \u2014 импульс продолжается")
+            lines.append("\u2022 \u26A0\uFE0F подтверждение: удержание выше уровня; ложные выходы тоже бывают")
+    lines.append("")
+    lines.append("\U0001F4CD <b>Где входить:</b>")
+    if m.get("extended"):
+        lines.append(f"\u26A0\uFE0F цена на <b>+{ext*100:.0f}%</b> выше EMA21 \u2014 не гонись за свечой")
+    lines.append(f"\u2022 зона отката (лимитка): <b>${e21:.5g}</b> (EMA21) \u2013 <b>${base:.5g}</b> (база наторговки)")
+    hi_note = " \u2014 пробивается \U0001F680" if m["price"]>oh else " \u2014 цель"
+    lines.append(f"\u2022 старый хай (уровень): <b>${oh:.5g}</b>{hi_note}")
+    lines.append("\u2022 <i>выгоднее лимитка в зоне отката, чем по рынку на пике</i>")
     lines += ["", "\u2501"*16,
         "<i>\u26A0\uFE0F Подсветка, не приказ. Пойдёт ли вверх \u2014 не гарантия. "
         "Стоп на Bybit \u2014 обязателен.</i>"]
@@ -247,8 +318,8 @@ def close_trade(coin):
     return pnl,p["entry"],price
 
 # ---------- скан ----------
-def run_scan(cid):
-    tg_send(cid,"🔍 Ищу лонг-сетапы (деньги заходят + тренд вверх)...")
+def run_scan(cid, announce=False):
+    if announce: tg_send(cid,"🔍 Ищу лонг-сетапы, подожди пару минут...")
     try: coins=universe()
     except Exception as e: tg_send(cid,f"Ошибка данных: {e}"); return
     to=int(time.time()); frm=to-9*24*3600
@@ -353,7 +424,7 @@ def main():
                     tg_send(cid,"✅ Сканер на сервере, работает 24/7.\n"
                                 "/scan — искать лонг-сетапы\n/pos — мои позиции\n/log — журнал сделок\n\n"
                                 "Подсвечу сетап → нажмёшь «Я вошёл» → буду вести позицию и комментировать. Решаешь ты.")
-                elif text.startswith("/scan"): run_scan(cid)
+                elif text.startswith("/scan"): run_scan(cid, announce=True)
                 elif text.startswith("/pos"):
                     if POSITIONS: tg_send(cid,"Открытые: "+", ".join(POSITIONS))
                     else: tg_send(cid,"Открытых позиций нет.")
@@ -364,7 +435,7 @@ def main():
                     else: tg_send(cid,"Журнал пуст — ещё не было закрытых сделок.")
             # авто-скан
             if chat and time.time()-last_scan>SCAN_EVERY_MIN*60:
-                run_scan(chat); last_scan=time.time()
+                run_scan(chat, announce=False); last_scan=time.time()
             # сопровождение позиций: часто проверяем, тревога мгновенно, спокойное реже
             for coin in list(POSITIONS):
                 p=POSITIONS[coin]; now=time.time()
