@@ -133,7 +133,7 @@ def long_ok(m):
 # ---------- карточка с расписанной логикой ----------
 def _bar(frac, width=10):
     frac=max(0.0,min(1.0,frac)); f=int(round(frac*width))
-    return "\u2588"*f + "\u2591"*(width-f)
+    return "\U0001F7E9"*f + "\u2B1C"*(width-f)   # 🟩 заполнено / ⬜ пусто — видно везде
 
 def _score(m, ex):
     s=0
@@ -162,21 +162,21 @@ def card(m, ex):
     rsi=int(m.get("rsi",50))
     tf_txt={3:"1ч+4ч+24ч \u2705",2:"2 интервала",1:"1 интервал \u26A0\uFE0F"}.get(m["tf"],"")
 
-    # аккуратный моноблок со шкалами (выравнивается в Telegram)
+    # шкалы обычными строками (эмодзи-квадраты видно на любом телефоне)
     table=(
-        f"Приток OI  {m['oi4']*100:+5.0f}%  {_bar(m['oi4']/0.20)}\n"
-        f"Объём      \u00d7{m['spike']:<4.1f}  {_bar(m['spike']/5)}\n"
-        f"RSI        {rsi:>5}   {_bar(rsi/100)}\n"
-        f"Ликвидн.  ${m['turn']/1e6:>5.0f}M {_bar(m['turn']/100e6)}"
+        f"\U0001F4B0 Приток OI  <b>{m['oi4']*100:+.0f}%</b>  {_bar(m['oi4']/0.20,5)}\n"
+        f"\U0001F4C8 Объём      <b>\u00d7{m['spike']:.1f}</b>  {_bar(m['spike']/5,5)}\n"
+        f"\U0001F321 RSI        <b>{rsi}</b>  {_bar(rsi/100,5)}\n"
+        f"\U0001F4A7 Ликвидн.   <b>${m['turn']/1e6:.0f}M</b>  {_bar(min(m['turn']/100e6,1),5)}"
     )
 
     lines=[
         f"{head} <b>{m['coin']}</b> \u00b7 лонг-сетап",
         f"\U0001F4B5 <b>${m['price']:.5g}</b>  {arrow} {m['p4']*100:+.1f}% за 4ч",
         "",
-        f"\U0001F4AA <b>Сила сетапа:</b> {sc}/10  {_bar(sc/10)}",
+        f"\U0001F4AA <b>Сила сетапа:</b> {sc}/10  {_bar(sc/10,5)}",
         "",
-        f"<pre>{table}</pre>",
+        table,
         f"\U0001F4CA Подтверждение: {tf_txt}",
     ]
     reasons=[]
