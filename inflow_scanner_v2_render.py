@@ -29,6 +29,9 @@ RSI_MAX=78              # не ловить параболу на вершине
 MIN_BARS=200            # отсечь свежие листинги (казино)
 COOLDOWN_H=4            # не показывать одну монету чаще, чем раз в 4ч
 LAST_ALERT={}           # coin -> ts последней подсветки
+WATCH={}                # coin -> {sym, zone_hi, zone_lo, ts, price0} — ждём ретеста
+WATCH_HOURS=12          # сколько отслеживать ретест
+RETEST_NEED_BOUNCE=True # ретест = касание зоны + отбой (зелёная свеча)
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
 TG_TOKEN=""; CA_KEY=""
@@ -53,6 +56,18 @@ def tg_send_doc(cid,path,caption=""):
     except Exception as e: print("doc:",e)
 
 # ---------- Coinalyze ----------
+def bybit_price(coin):
+    """Текущая цена перпа на Bybit. None если недоступно (напр. US-блок региона)."""
+    try:
+        r=requests.get("https://api.bybit.com/v5/market/tickers",
+                       params={"category":"linear","symbol":coin+"USDT"}, timeout=8)
+        if r.status_code!=200: return None
+        j=r.json()
+        lst=(j.get("result") or {}).get("list") or []
+        return float(lst[0]["lastPrice"]) if lst else None
+    except Exception:
+        return None
+
 def ca(path,params):
     params=dict(params); params["api_key"]=CA_KEY
     r=requests.get(f"{COINALYZE}{path}",params=params,timeout=30)
@@ -198,9 +213,16 @@ def card(m, ex):
         f"\U0001F4A7 Ликвидн.   <b>${m['turn']/1e6:.0f}M</b>  {_bar(min(m['turn']/100e6,1),5)}"
     )
 
+    by=m.get("bybit")
+    if by:
+        spread=(by-m["price"])/m["price"]*100
+        rel = "вровень" if abs(spread)<0.15 else (f"Bybit выше +{spread:.1f}%" if spread>0 else f"Bybit ниже {spread:.1f}%")
+        price_line=f"\U0001F4B5 Binance <b>${m['price']:.5g}</b> | Bybit <b>${by:.5g}</b> ({rel})"
+    else:
+        price_line=f"\U0001F4B5 <b>${m['price']:.5g}</b> (Binance)  {arrow} {m['p4']*100:+.1f}% за 4ч   <i>Bybit: н/д</i>"
     lines=[
         f"{head} <b>{m['coin']}</b> \u00b7 лонг-сетап",
-        f"\U0001F4B5 <b>${m['price']:.5g}</b>  {arrow} {m['p4']*100:+.1f}% за 4ч",
+        price_line,
         "",
         f"\U0001F4AA <b>Сила сетапа:</b> {sc}/10  {_bar(sc/10,5)}",
         "",
@@ -257,6 +279,12 @@ def card(m, ex):
             lines.append(f"\u2022 цена вышла из флага выше <b>${ft:.5g}</b> \u2014 импульс продолжается")
             lines.append("\u2022 \u26A0\uFE0F подтверждение: удержание выше уровня; ложные выходы тоже бывают")
     lines.append("")
+    if m.get("watching"):
+        zlo,zhi=m["watching"]; wk=m.get("watch_kind","зоне")
+        lines.append("")
+        lines.append(f"\u23F3 <b>Взял на отслеживание</b> \u2014 позову на ретесте к {wk} ${zlo:.5g}\u2013${zhi:.5g}")
+        if m.get("tri")=="breakout":
+            lines.append("\u2022 <i>вход не на проколе, а на ретесте крышки сверху \u2014 защита от ложного пробоя</i>")
     lines.append("\U0001F4CD <b>Где входить:</b>")
     if m.get("extended"):
         lines.append(f"\u26A0\uFE0F цена на <b>+{ext*100:.0f}%</b> выше EMA21 \u2014 не гонись за свечой")
@@ -350,7 +378,23 @@ def run_scan(cid, announce=False):
         ex={}
         try: ex=enrich(sym)
         except Exception: pass
+        m["bybit"]=bybit_price(m["coin"])          # цена Bybit (или None)
         LAST_ALERT[m["coin"]]=time.time()
+        # отслеживание ретеста: 1) пробой треугольника -> ждём ретест КРЫШКИ,
+        #                        2) иначе цена оторвалась от зоны отката -> ждём зону
+        if m.get("tri")=="breakout" and m.get("tri_top",0)>0:
+            top=m["tri_top"]
+            WATCH[m["coin"]]=dict(sym=sym, zone_hi=top*1.004, zone_lo=top*0.985,
+                                  ts=time.time(), price0=m["price"], kind="пробой треугольника")
+            m["watching"]=(top*0.985, top*1.004)
+            m["watch_kind"]="крышке треугольника"
+        else:
+            zone_hi=m.get("e21",m["price"]); zone_lo=m.get("consol_base",m["price"])
+            if m.get("extended") and zone_hi>0:
+                WATCH[m["coin"]]=dict(sym=sym, zone_hi=zone_hi, zone_lo=zone_lo,
+                                      ts=time.time(), price0=m["price"], kind="откат к зоне")
+                m["watching"]=(zone_lo,zone_hi)
+                m["watch_kind"]="зоне отката"
         btn=[[{"text":"✅ Я вошёл","callback_data":f"enter|{m['coin']}|{m['price']:.6g}"}]]
         tg_send(cid, card(m,ex), buttons=btn); shown+=1
     if shown==0:
@@ -369,6 +413,39 @@ def enrich(sym):
         if fr: out["funding"]=fr[-1][0]
     except Exception: pass
     return out
+
+def check_watchlist(chat):
+    """Проверяет монеты в ожидании ретеста; зовёт, когда цена вернулась в зону."""
+    if not chat or not WATCH: return
+    now=time.time()
+    for coin in list(WATCH):
+        w=WATCH[coin]
+        if now-w["ts"]>WATCH_HOURS*3600:
+            del WATCH[coin]; continue                      # просрочено — снимаем
+        to=int(now); frm=to-3*24*3600
+        try:
+            px=H("/ohlcv-history",w["sym"],frm,to,["o","c","l"]); time.sleep(1.4)
+        except Exception:
+            continue
+        if len(px)<3: continue
+        o,c,lo = px[-1][0], px[-1][1], px[-1][2]
+        # цена коснулась зоны (лоу свечи зашёл в зону) ?
+        touched = lo <= w["zone_hi"]
+        bounced = c >= o                                    # зелёная свеча = отбой
+        # сетап развалился (ушли сильно ниже базы) — снимаем
+        if c < w["zone_lo"]*0.97:
+            del WATCH[coin]; continue
+        if touched and (bounced or not RETEST_NEED_BOUNCE):
+            by=bybit_price(coin)
+            byline = f"\nBybit: ${by:.5g}" if by else ""
+            kind=w.get("kind","зоне")
+            tg_send(chat,
+                f"\U0001F3AF <b>{coin}: РЕТЕСТ ({kind})!</b>\n"
+                f"Цена вернулась к ${w['zone_lo']:.5g}\u2013${w['zone_hi']:.5g} и отбивается (зелёная свеча).\n"
+                f"Сейчас: <b>${c:.5g}</b>{byline}\n"
+                f"<i>Вот безопасная точка входа, которую ты ждал. Проверь глазами, стоп обязателен.</i>",
+                buttons=[[{"text":"\u2705 Я вошёл","callback_data":f"enter|{coin}|{c:.6g}"}]])
+            del WATCH[coin]
 
 # ---------- чат ----------
 def save_chat(c):
@@ -436,6 +513,9 @@ def main():
             # авто-скан
             if chat and time.time()-last_scan>SCAN_EVERY_MIN*60:
                 run_scan(chat, announce=False); last_scan=time.time()
+            # проверка ретестов из списка ожидания
+            try: check_watchlist(chat)
+            except Exception as e: print('watch:',e)
             # сопровождение позиций: часто проверяем, тревога мгновенно, спокойное реже
             for coin in list(POSITIONS):
                 p=POSITIONS[coin]; now=time.time()
