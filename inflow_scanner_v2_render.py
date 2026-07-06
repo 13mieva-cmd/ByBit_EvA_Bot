@@ -31,6 +31,7 @@ COOLDOWN_H=4            # не показывать одну монету чащ
 LAST_ALERT={}           # coin -> ts последней подсветки
 WATCH={}                # coin -> {sym, zone_hi, zone_lo, ts, price0} — ждём ретеста
 WATCH_HOURS=12          # сколько отслеживать ретест
+WATCH_CHECK_MIN=3       # как часто проверять ретесты (не чаще!)
 RETEST_NEED_BOUNCE=True # ретест = касание зоны + отбой (зелёная свеча)
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
@@ -499,12 +500,18 @@ def main():
                 if text.startswith("/start"):
                     chat=cid; save_chat(cid)
                     tg_send(cid,"✅ Сканер на сервере, работает 24/7.\n"
-                                "/scan — искать лонг-сетапы\n/pos — мои позиции\n/log — журнал сделок\n\n"
+                                "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n/log — журнал сделок\n\n"
                                 "Подсвечу сетап → нажмёшь «Я вошёл» → буду вести позицию и комментировать. Решаешь ты.")
                 elif text.startswith("/scan"): run_scan(cid, announce=True)
                 elif text.startswith("/pos"):
                     if POSITIONS: tg_send(cid,"Открытые: "+", ".join(POSITIONS))
                     else: tg_send(cid,"Открытых позиций нет.")
+                elif text.startswith("/watch"):
+                    if WATCH:
+                        rows=[f"\u2022 {c}: жду ретест ${w['zone_lo']:.5g}\u2013${w['zone_hi']:.5g} ({w.get('kind','зона')})" for c,w in WATCH.items()]
+                        tg_send(cid,"\u23F3 <b>На отслеживании:</b>\n"+"\n".join(rows))
+                    else:
+                        tg_send(cid,"Список ожидания пуст \u2014 никого не отслеживаю.")
                 elif text.startswith("/log"):
                     if os.path.exists(TRADES) and os.path.getsize(TRADES)>0:
                         n=sum(1 for _ in open(TRADES))-1
@@ -513,9 +520,11 @@ def main():
             # авто-скан
             if chat and time.time()-last_scan>SCAN_EVERY_MIN*60:
                 run_scan(chat, announce=False); last_scan=time.time()
-            # проверка ретестов из списка ожидания
-            try: check_watchlist(chat)
-            except Exception as e: print('watch:',e)
+            # проверка ретестов из списка ожидания (раз в WATCH_CHECK_MIN минут)
+            if time.time()-globals().get('_last_watch',0) > WATCH_CHECK_MIN*60:
+                globals()['_last_watch']=time.time()
+                try: check_watchlist(chat)
+                except Exception as e: print('watch:',e)
             # сопровождение позиций: часто проверяем, тревога мгновенно, спокойное реже
             for coin in list(POSITIONS):
                 p=POSITIONS[coin]; now=time.time()
