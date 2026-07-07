@@ -122,6 +122,29 @@ def corr(a,b):
     if ra.std()==0 or rb.std()==0: return 0.0
     return float(np.corrcoef(ra,rb)[0,1])
 
+def find_levels(highs, lows, closes, price, min_touches=3):
+    """Ищет горизонтальные уровни, к которым цена возвращалась >=min_touches раз."""
+    pts=highs[-120:]+lows[-120:]
+    if not pts: return []
+    tol=price*0.012                                   # уровень = зона +-1.2%
+    used=[False]*len(pts); levels=[]
+    for i,p in enumerate(pts):
+        if used[i]: continue
+        cluster=[p]; used[i]=True
+        for j in range(i+1,len(pts)):
+            if not used[j] and abs(pts[j]-p)<=tol:
+                cluster.append(pts[j]); used[j]=True
+        if len(cluster)>=min_touches:
+            levels.append((sum(cluster)/len(cluster), len(cluster)))
+    levels.sort(key=lambda x:-x[1])
+    return levels[:4]                                 # топ-4 по силе
+
+def nearest_level(levels, price):
+    """Ближайший уровень к цене + позиция (цена под/над ним)."""
+    if not levels: return None
+    lv=min(levels, key=lambda x:abs(x[0]-price))
+    return dict(price=lv[0], touches=lv[1], dist=(price-lv[0])/price)
+
 def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     if len(closes)<MIN_BARS or len(oic)<25: return None   # свежие листинги отсекаем
     price=closes[-1]
@@ -139,6 +162,9 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     extended = ext>0.05
     # --- детектор треугольника (сужение диапазона -> крышка -> пробой) ---
     TRI=20
+    # горизонтальные уровни (сильные = 3+ касания)
+    levels=find_levels(highs,lows,closes,price,min_touches=3)
+    lvl=nearest_level(levels,price)
     tri=None; tri_top=price
     if len(highs)>=TRI+2:
         wh=highs[-TRI-1:-1]; wl=lows[-TRI-1:-1]           # окно без текущего бара
@@ -170,7 +196,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
                 uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
                 e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
-                tri=tri,tri_top=tri_top,flag=flag,flag_top=flag_top)
+                tri=tri,tri_top=tri_top,flag=flag,flag_top=flag_top,levels=levels,lvl=lvl)
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
             and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
@@ -284,6 +310,18 @@ def card(m, ex):
             lines.append(f"\u2022 цена вышла из флага выше <b>${ft:.5g}</b> \u2014 импульс продолжается")
             lines.append("\u2022 \u26A0\uFE0F подтверждение: удержание выше уровня; ложные выходы тоже бывают")
     lines.append("")
+    # --- блок горизонтальных уровней ---
+    lv=m.get("lvl")
+    if lv:
+        pos = "цена НА уровне" if abs(lv["dist"])<0.012 else ("цена НАД уровнем (уровень стал поддержкой)" if lv["dist"]>0 else "цена ПОД уровнем (уровень = сопротивление сверху)")
+        lines.append("")
+        lines.append(f"\U0001F4CF <b>Уровень:</b> ${lv['price']:.5g} \u2014 сильный ({lv['touches']} касаний)")
+        lines.append(f"\u2022 {pos}")
+        if abs(lv["dist"])<0.012:
+            lines.append("\u2022 <i>цена наторговывает у уровня \u2014 это твоя зона, но вход ТОЛЬКО на ретесте с отбоем</i>")
+    # правило входа — всегда на ретесте
+    lines.append("")
+    lines.append("\U0001F6D1 <b>Правило входа:</b> НЕ по рынку сейчас. Вход только на РЕТЕСТЕ уровня/зоны с отбоем (зелёная свеча). Бот позовёт.")
     if m.get("watching"):
         zlo,zhi=m["watching"]; wk=m.get("watch_kind","зоне")
         lines.append("")
@@ -387,7 +425,14 @@ def run_scan(cid, announce=False):
         LAST_ALERT[m["coin"]]=time.time()
         # отслеживание ретеста: 1) пробой треугольника -> ждём ретест КРЫШКИ,
         #                        2) иначе цена оторвалась от зоны отката -> ждём зону
-        if m.get("tri")=="breakout" and m.get("tri_top",0)>0:
+        lv=m.get("lvl")
+        if lv and abs(lv["dist"])<0.03 and lv["touches"]>=3:
+            base=lv["price"]
+            WATCH[m["coin"]]=dict(sym=sym, zone_hi=base*1.008, zone_lo=base*0.99,
+                                  ts=time.time(), price0=m["price"], kind=f"сильному уровню ${base:.5g}")
+            m["watching"]=(base*0.99, base*1.008)
+            m["watch_kind"]=f"уровню ${base:.5g} ({lv['touches']} касаний)"
+        elif m.get("tri")=="breakout" and m.get("tri_top",0)>0:
             top=m["tri_top"]
             WATCH[m["coin"]]=dict(sym=sym, zone_hi=top*1.004, zone_lo=top*0.985,
                                   ts=time.time(), price0=m["price"], kind="пробой треугольника")
