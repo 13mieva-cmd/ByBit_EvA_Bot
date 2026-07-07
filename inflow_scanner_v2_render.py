@@ -8,15 +8,28 @@
    ОТДЕЛЬНУЮ вторую карточку "СЕТАП ТРЕУГОЛЬНИК" (тот же полный набор фильтров);
 2) по кнопке "✅ Я вошёл" ведёт твою позицию: показывает P&L и комментирует
    "держать" (деньги ещё заходят) или "подумай о выходе" (приток выдыхается);
-3) по кнопке "❌ Выйти" фиксирует сделку в журнал с P&L (команда /log).
+3) по кнопке "❌ Выйти" фиксирует сделку в журнал с P&L (команда /log);
+4) КАЖДЫЙ отправленный сигнал (не только закрытые сделки) логируется в
+   SIGNALS_FILE — это нужно для честной статистики "сигнал → что было дальше",
+   без которой пороги фильтров — просто гадание. Смотри /stats.
 
 ЧЕСТНО: комментарии бота — ОПИСАНИЕ текущего состояния, не предсказание.
 Edge направления мы измеряли — его нет. Решение и риск всегда на тебе.
-Журнал входов/выходов нужен, чтобы посчитать реальную статистику твоего глаза.
+Журнал входов/выходов и журнал сигналов нужны, чтобы посчитать реальную
+статистику: сколько сигналов было прибыльными через 4ч/24ч в среднем.
 
-Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit
+ИСПРАВЛЕНО в этой версии:
+- баг: цена всегда подписывалась "(Binance)", хотя ВСЕ данные идут с Bybit API
+  (klines, open_interest, ticker_info). Подпись исправлена на "(Bybit)".
+- баг: штраф "всплеск ликвидаций" (liq_spike) никогда не мог сработать, т.к.
+  enrich() не вычисляет это поле (Bybit публичный REST не даёт данных по
+  ликвидациям) — мёртвый код удалён, чтобы не создавать иллюзию защиты.
+- добавлено логирование сигналов (SIGNALS_FILE) + команда /stats для расчёта
+  форвардной статистики по сигналам (win rate и средний % через 4ч/24ч).
+
+Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit /stats
 """
-import os, time, json
+import os, time, json, csv
 import datetime as dt
 import numpy as np
 import requests
@@ -37,6 +50,7 @@ WATCH_CHECK_SEC=15
 RETEST_NEED_BOUNCE=True
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
+SIGNALS_FILE=os.environ.get("SIGNALS_FILE","/tmp/scanner_signals.csv")
 TG_TOKEN=""
 SYM_CACHE={}
 POSITIONS={}
@@ -245,6 +259,9 @@ def long_ok(m):
         and m["rsi"]<=RSI_MAX)
 
 def _score(m, ex):
+    """Скоринг ТОЛЬКО из полей, которые бот реально вычисляет. Штраф за
+    ликвидации убран — нет источника данных (Bybit public REST их не даёт),
+    оставлять его было бы созданием иллюзии несуществующей защиты."""
     s=0
     s+= 2 if m["oi4"]>=0.10 else (1 if m["oi4"]>=0.05 else 0)
     s+= 2 if m["spike"]>=3 else (1 if m["spike"]>=1.5 else 0)
@@ -254,7 +271,6 @@ def _score(m, ex):
     s+= 1 if not m.get("btc_beta") else 0
     s+= 1 if m["turn"]>=20_000_000 else 0
     if ex.get("funding",0)>0.01: s-=1
-    if ex.get("liq_spike",0)>=2: s-=1
     return max(0,min(10,s))
 
 # ---------- КАРТОЧКА 1: чистый лонг-сетап (без блока треугольника) ----------
@@ -263,7 +279,6 @@ def card_long(m, ex):
     if m.get("btc_beta"): cautions.append("движение в основном ЗА БИТКОМ — не её собственный приток")
     elif m["cor"]>=HI_CORR: cautions.append(f"сильно ходит за биткоином (corr {m['cor']:.2f})")
     if ex.get("funding",0)>0.01: cautions.append("перегрет плечом (высокий funding)")
-    if ex.get("liq_spike",0)>=2: cautions.append(f"всплеск ликвидаций \u00d7{ex['liq_spike']:.1f}")
     if m.get("extended"): cautions.append("вход на пике импульса \u2014 лучше ждать откат")
 
     sc=_score(m,ex)
@@ -282,10 +297,10 @@ def card_long(m, ex):
     by=m.get("bybit")
     if by:
         spread=(by-m["price"])/m["price"]*100
-        rel = "вровень" if abs(spread)<0.15 else (f"Bybit выше +{spread:.1f}%" if spread>0 else f"Bybit ниже {spread:.1f}%")
-        price_line=f"\U0001F4B5 Binance ${m['price']:.5g} | Bybit ${by:.5g} ({rel})"
+        rel = "вровень" if abs(spread)<0.15 else (f"выше +{spread:.1f}%" if spread>0 else f"ниже {spread:.1f}%")
+        price_line=f"\U0001F4B5 ${m['price']:.5g} (Bybit) {arrow} {m['p4']*100:+.1f}% за 4ч, сверка: {rel}"
     else:
-        price_line=f"\U0001F4B5 ${m['price']:.5g} (Binance) {arrow} {m['p4']*100:+.1f}% за 4ч Bybit: н/д"
+        price_line=f"\U0001F4B5 ${m['price']:.5g} (Bybit) {arrow} {m['p4']*100:+.1f}% за 4ч"
 
     lines=[
         f"{head} {m['coin']} \u00b7 ЛОНГ-СЕТАП",
@@ -369,7 +384,7 @@ def card_triangle(m, ex):
 
     lines=[
         f"\U0001F53A {m['coin']} \u00b7 СЕТАП ТРЕУГОЛЬНИК",
-        f"\U0001F4B5 ${m['price']:.5g}", "",
+        f"\U0001F4B5 ${m['price']:.5g} (Bybit)", "",
         f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
         f"\U0001F4B0 Приток OI {m['oi4']*100:+.0f}%   \U0001F4C8 Объём \u00d7{m['spike']:.1f}   RSI {rsi_v}",
         "",
@@ -394,6 +409,56 @@ def card_triangle(m, ex):
     lines += ["", "\u2501"*16,
         "\u26A0\uFE0F Подсветка, не приказ. Стоп на Bybit \u2014 обязателен."]
     return "\n".join(lines)
+
+# ---------- ЛОГИРОВАНИЕ СИГНАЛОВ (для честной статистики, не для показа) ----------
+def log_signal(coin, sig_type, price):
+    """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
+    временем — без этого невозможно посчитать реальный форвардный win rate
+    и понять, работают ли пороги фильтров или это подгонка. См. /stats."""
+    new=not os.path.exists(SIGNALS_FILE)
+    with open(SIGNALS_FILE,"a",newline="") as f:
+        w=csv.writer(f)
+        if new: w.writerow(["ts","coin","type","price"])
+        w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, sig_type, f"{price:.6g}"])
+
+def compute_stats():
+    """Форвардная статистика: берём сигналы старше 4ч и 24ч, сверяем текущую
+    цену, считаем win rate (доля сигналов с положительным % на момент проверки)
+    и средний % изменения. Разбивка по типу сигнала (long / triangle)."""
+    if not os.path.exists(SIGNALS_FILE):
+        return "Журнал сигналов пуст \u2014 статистики пока нет."
+    rows=[]
+    with open(SIGNALS_FILE) as f:
+        for r in csv.DictReader(f):
+            rows.append(r)
+    if not rows:
+        return "Журнал сигналов пуст \u2014 статистики пока нет."
+    now=dt.datetime.now()
+    out=["\U0001F4CA СТАТИСТИКА ПО СИГНАЛАМ (форвардная проверка)\n"]
+    for horizon_h, label in [(4,"4ч"),(24,"24ч")]:
+        for sig_type in ("long","triangle"):
+            sample=[]
+            for r in rows:
+                if r["type"]!=sig_type: continue
+                ts=dt.datetime.fromisoformat(r["ts"])
+                age_h=(now-ts).total_seconds()/3600
+                if age_h<horizon_h: continue
+                cur=bybit_price(r["coin"])
+                if cur is None: continue
+                entry=float(r["price"])
+                pct=cur/entry-1
+                sample.append(pct)
+            if not sample:
+                continue
+            n=len(sample)
+            wins=sum(1 for x in sample if x>0)
+            avg=sum(sample)/n*100
+            out.append(f"{sig_type.upper()} @ {label}: n={n}, win rate={wins/n*100:.0f}%, средний % {avg:+.2f}")
+    if len(out)==1:
+        out.append("Пока нет сигналов старше 4ч для анализа \u2014 подожди.")
+    out.append("\n\u26A0\uFE0F Малая выборка (n<30-50) НЕ даёт статистической значимости. "
+        "Не принимай решения по этим цифрам, пока n не станет большим.")
+    return "\n".join(out)
 
 # ---------- сопровождение позиции ----------
 def position_status(coin):
@@ -439,6 +504,8 @@ def close_trade(coin):
     return pnl,p["entry"],price
 
 def enrich(sym):
+    """Доп.данные с Bybit: funding. Ликвидаций в публичном REST нет — поле
+    не заводим, чтобы не создавать иллюзию несуществующей проверки."""
     out={}
     try:
         t=ticker_info(sym)
@@ -504,11 +571,13 @@ def run_scan(cid, announce=False):
 
         # Сигнал 1: чистый лонг-сетап
         tg_send(cid, card_long(m,ex), buttons=btn); shown+=1
+        log_signal(m["coin"], "long", m["price"])
 
-        # Сигнал 2 (отдельный, независимый по тексту): лонг-сетап + треугольник
+        # Сигнал 2 (отдельный): лонг-сетап + треугольник
         tri_card = card_triangle(m,ex)
         if tri_card:
             tg_send(cid, tri_card, buttons=btn); shown+=1
+            log_signal(m["coin"], "triangle", m["price"])
 
         LAST_ALERT[coin]=now
 
@@ -597,12 +666,15 @@ def main():
                 if text.startswith("/start"):
                     chat=cid; save_chat(cid)
                     tg_send(cid,"\u2705 Сканер на сервере, работает 24/7.\n"
-                        "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n/log — журнал сделок\n/bybit — проверка доступа к Bybit\n\n"
+                        "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n"
+                        "/log — журнал сделок\n/stats — статистика по сигналам\n/bybit — проверка доступа к Bybit\n\n"
                         "Подсвечу сетап → нажмёшь «Я вошёл» → буду вести позицию и комментировать. Решаешь ты.")
                 elif text.startswith("/scan"): run_scan(cid, announce=True)
                 elif text.startswith("/pos"):
                     if POSITIONS: tg_send(cid,"Открытые: "+", ".join(POSITIONS))
                     else: tg_send(cid,"Открытых позиций нет.")
+                elif text.startswith("/stats"):
+                    tg_send(cid, compute_stats())
                 elif text.startswith("/bybit"):
                     try:
                         r=requests.get("https://api.bybit.com/v5/market/tickers",
