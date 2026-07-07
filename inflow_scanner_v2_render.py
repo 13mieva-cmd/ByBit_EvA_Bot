@@ -45,6 +45,8 @@ MIN_BARS=200
 COOLDOWN_H=4
 LAST_ALERT={}
 WATCH={}
+TRI_ALERT={} # coin -> {sym, top, ts} - активно ждём момент пробоя крышки треугольника (стадия ready)
+TRI_ALERT_HOURS=6 # сколько часов держим монету на активном ожидании пробоя после ready
 WATCH_HOURS=12
 WATCH_CHECK_SEC=15
 RETEST_NEED_BOUNCE=True
@@ -200,6 +202,77 @@ def _bar(frac, n=5):
     filled=int(round(frac*n))
     return "\u25A0"*filled + "\u25A1"*(n-filled)
 
+
+def _swing_points(vals, is_high, win=3):
+    """Находит локальные экстремумы (свинги) в массиве."""
+    pts=[]
+    for i in range(win, len(vals)-win):
+        seg=vals[i-win:i+win+1]
+        if is_high and vals[i]==max(seg): pts.append((i,vals[i]))
+        if not is_high and vals[i]==min(seg): pts.append((i,vals[i]))
+    return pts
+
+def _fit_line(pts):
+    """Линейная регрессия через точки [(x,y),...]. Возвращает (slope, intercept) или None."""
+    if len(pts)<2: return None
+    xs=np.array([p[0] for p in pts], dtype=float)
+    ys=np.array([p[1] for p in pts], dtype=float)
+    if xs.std()==0: return None
+    slope,intercept=np.polyfit(xs,ys,1)
+    return float(slope), float(intercept)
+
+def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
+    """Настоящий треугольник: сходящиеся трендлинии — нисходящая линия
+    сопротивления через swing-хаи (наклон < 0) И восходящая линия поддержки
+    через swing-лои (наклон > 0), которые СБЛИЖАЮТСЯ (конвергенция), а цена
+    находится ВНУТРИ этого сужающегося клина.
+    Возвращает (tri, tri_top, res_now, sup_now):
+      tri in (None,'forming','ready','breakout')
+      tri_top — текущий уровень сопротивления (для совместимости с картой)
+      res_now, sup_now — текущие значения верхней/нижней линии треугольника
+    """
+    n=len(closes)
+    if n<win+5: return None,price,price,price
+    H=highs[-win:]; L=lows[-win:]; C=closes[-win:]
+    hi_pts=_swing_points(H, True, swing_win)
+    lo_pts=_swing_points(L, False, swing_win)
+    if len(hi_pts)<2 or len(lo_pts)<2: return None,price,price,price
+
+    res=_fit_line(hi_pts); sup=_fit_line(lo_pts)
+    if not res or not sup: return None,price,price,price
+    r_slope,r_int=res; s_slope,s_int=sup
+
+    # обе линии должны сходиться: сопротивление падает ИЛИ хотя бы почти плоское
+    # снизу, а поддержка растёт (либо наоборот при желании — тут строго под лонг:
+    # растущая поддержка + падающее/плоское сопротивление = сужающийся клин вверх)
+    if not (r_slope<=0.0005*price/win and s_slope>=-0.0005*price/win):
+        return None,price,price,price
+    if not (s_slope>r_slope):  # линии должны реально сходиться, а не идти параллельно/расходиться
+        return None,price,price,price
+
+    last_x=win-1
+    res_now=r_slope*last_x+r_int
+    sup_now=s_slope*last_x+s_int
+    if res_now<=sup_now:  # клин уже "закрылся" геометрически — треугольник не валиден
+        return None,price,price,price
+
+    width_now=res_now-sup_now
+    x0=hi_pts[0][0] if hi_pts[0][0]<lo_pts[0][0] else lo_pts[0][0]
+    res_0=r_slope*x0+r_int; sup_0=s_slope*x0+s_int
+    width_0=res_0-sup_0
+    contracting = width_0>0 and width_now < width_0*0.7  # диапазон сузился минимум на 30%
+
+    if not contracting:
+        return None,price,price,price
+
+    if price>res_now:
+        return "breakout",res_now,res_now,sup_now
+    dist_to_res=(res_now-price)/price if price>0 else 1
+    if dist_to_res<=0.02:
+        return "ready",res_now,res_now,sup_now
+    return "forming",res_now,res_now,sup_now
+
+
 def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     if len(closes)<MIN_BARS or len(oic)<25: return None
     price=closes[-1]
@@ -216,19 +289,9 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     old_high=max(highs[-72:-4]) if len(highs)>76 else max(highs[:-4] or highs)
     extended = ext>0.05
 
-    TRI=20
     levels=find_levels(highs,lows,closes,price,min_touches=3)
     lvl=nearest_level(levels,price)
-    tri=None; tri_top=price
-    if len(highs)>=TRI+2:
-        wh=highs[-TRI-1:-1]; wl=lows[-TRI-1:-1]
-        half=TRI//2
-        r1=max(wh[:half])-min(wl[:half]); r2=max(wh[half:])-min(wl[half:])
-        contracting = r1>0 and r2 < r1*0.8
-        tri_top=max(wh)
-        if price>tri_top: tri="breakout"
-        elif contracting and (tri_top-price)/price<=0.015: tri="ready"
-        elif contracting: tri="forming"
+    tri,tri_top,tri_res_now,tri_sup_now = detect_triangle(highs,lows,closes,price)
 
     flag=None; flag_top=price
     if len(closes)>=30:
@@ -250,7 +313,8 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
-        tri=tri,tri_top=tri_top,flag=flag,flag_top=flag_top,levels=levels,lvl=lvl)
+        tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
+        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl)
 
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
@@ -394,6 +458,7 @@ def card_triangle(m, ex):
         lines.append(f"\u2022 цена вплотную подошла к крышке ${tt:.5g} и поджимается")
         lines.append(f"\u2022 следи за закрытием свечи ВЫШЕ ${tt:.5g} \u2014 это будет пробой")
         lines.append("\u2022 не входи заранее: часто бывает ложный прокол вниз")
+        lines.append("\u2022 \U0001F514 Бот сам предупредит отдельным сообщением, когда пробой произойдёт \u2014 не нужно сидеть у графика")
     elif tri=="breakout":
         lines.append("\U0001F680 ПРОБОЙ вверх")
         lines.append(f"\u2022 цена закрылась выше крышки ${tt:.5g} \u2014 треугольник пробит")
@@ -573,16 +638,23 @@ def run_scan(cid, announce=False):
         tg_send(cid, card_long(m,ex), buttons=btn); shown+=1
         log_signal(m["coin"], "long", m["price"])
 
-        # Сигнал 2 (отдельный): лонг-сетап + треугольник
+        # Сигнал 2 (отдельный): лонг-сетап + треугольник (ready или breakout)
         tri_card = card_triangle(m,ex)
         if tri_card:
             tg_send(cid, tri_card, buttons=btn); shown+=1
             log_signal(m["coin"], "triangle", m["price"])
 
+        # Если стадия "ready" — ставим монету на АКТИВНОЕ ожидание пробоя.
+        # Это отдельный от антиспама механизм: даже если карточка лонг-сетапа
+        # не придёт повторно 4 часа (COOLDOWN_H), пробой крышки треугольника
+        # всё равно прилетит мгновенно отдельным уведомлением (проверка раз в 15с).
+        if m.get("tri")=="ready" and m.get("tri_top",0)>0 and m["coin"] not in TRI_ALERT:
+            TRI_ALERT[m["coin"]]=dict(sym=sym, top=m["tri_top"], ts=time.time())
+
         LAST_ALERT[coin]=now
 
-    if shown==0:
-        tg_send(cid,"Сетапы были, но недавно уже показаны (антиспам) или не найдены. Жди новых.")
+    if shown==0 and announce:
+        tg_send(cid,"Сейчас чистых сетапов не найдено. Бот продолжает сканировать автоматически \u2014 пришлю, как только появится.")
 
 def check_watchlist(chat):
     if not chat or not WATCH: return
