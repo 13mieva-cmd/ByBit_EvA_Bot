@@ -123,21 +123,42 @@ def corr(a,b):
     return float(np.corrcoef(ra,rb)[0,1])
 
 def find_levels(highs, lows, closes, price, min_touches=3):
-    """Ищет горизонтальные уровни, к которым цена возвращалась >=min_touches раз."""
-    pts=highs[-120:]+lows[-120:]
-    if not pts: return []
-    tol=price*0.012                                   # уровень = зона +-1.2%
-    used=[False]*len(pts); levels=[]
-    for i,p in enumerate(pts):
+    """Сильные горизонтальные уровни. Касание = ОТДЕЛЬНЫЙ подход к уровню
+    (цена подошла, ОТОШЛА минимум на 1.5%, потом вернулась). Не считаем
+    каждую свечу у уровня — только реальные разы возврата."""
+    if len(closes)<40: return []
+    tol=price*0.010                      # зона уровня +-1.0%
+    away=price*0.015                     # "отошла" = дальше 1.5% от уровня
+    # свечи-экстремумы за окно
+    H=highs[-150:]; L=lows[-150:]
+    # кандидаты уровней — из локальных экстремумов
+    cand=[]
+    for i in range(2,len(H)-2):
+        if H[i]>=max(H[i-2:i+3]): cand.append(H[i])   # локальный максимум
+        if L[i]<=min(L[i-2:i+3]): cand.append(L[i])   # локальный минимум
+    levels=[]
+    used=[False]*len(cand)
+    for i,base in enumerate(cand):
         if used[i]: continue
-        cluster=[p]; used[i]=True
-        for j in range(i+1,len(pts)):
-            if not used[j] and abs(pts[j]-p)<=tol:
-                cluster.append(pts[j]); used[j]=True
-        if len(cluster)>=min_touches:
-            levels.append((sum(cluster)/len(cluster), len(cluster)))
-    levels.sort(key=lambda x:-x[1])
-    return levels[:4]                                 # топ-4 по силе
+        cluster=[base]; used[i]=True
+        for j in range(i+1,len(cand)):
+            if not used[j] and abs(cand[j]-base)<=tol:
+                cluster.append(cand[j]); used[j]=True
+        lvl=sum(cluster)/len(cluster)
+        # считаем ОТДЕЛЬНЫЕ подходы: идём по цене, +1 когда вернулись после отхода
+        touches=0; state="away"
+        for c in closes[-150:]:
+            if abs(c-lvl)<=tol and state=="away":
+                touches+=1; state="near"
+            elif abs(c-lvl)>away:
+                state="away"
+        if touches>=min_touches:
+            levels.append((lvl,touches))
+    # убираем дубли-уровни близко друг к другу, оставляем сильнейший
+    levels.sort(key=lambda x:-x[1]); out=[]
+    for lv in levels:
+        if all(abs(lv[0]-o[0])>tol*2 for o in out): out.append(lv)
+    return out[:4]
 
 def nearest_level(levels, price):
     """Ближайший уровень к цене + позиция (цена под/над ним)."""
@@ -315,8 +336,10 @@ def card(m, ex):
     if lv:
         pos = "цена НА уровне" if abs(lv["dist"])<0.012 else ("цена НАД уровнем (уровень стал поддержкой)" if lv["dist"]>0 else "цена ПОД уровнем (уровень = сопротивление сверху)")
         lines.append("")
-        lines.append(f"\U0001F4CF <b>Уровень:</b> ${lv['price']:.5g} \u2014 сильный ({lv['touches']} касаний)")
+        strength = "очень сильный" if lv['touches']>=6 else ("сильный" if lv['touches']>=4 else "заметный")
+        lines.append(f"\U0001F4CF <b>Уровень ${lv['price']:.5g}</b> \u2014 {strength}: цена подходила к нему <b>{lv['touches']} раз(а)</b>")
         lines.append(f"\u2022 {pos}")
+        lines.append(f"\u2022 <i>чем больше подходов, тем важнее уровень (рынок его «уважает»)</i>")
         if abs(lv["dist"])<0.012:
             lines.append("\u2022 <i>цена наторговывает у уровня \u2014 это твоя зона, но вход ТОЛЬКО на ретесте с отбоем</i>")
     # правило входа — всегда на ретесте
