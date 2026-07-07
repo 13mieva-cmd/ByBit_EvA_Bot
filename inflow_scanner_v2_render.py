@@ -20,7 +20,7 @@ import numpy as np
 import requests
 
 BYBIT="https://api.bybit.com"; QUOTE="USDT"
-MAX_COINS=150; SCAN_EVERY_MIN=15; MAX_ALERTS=8
+MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=5_000_000
 BTC_DUMP_1H=-0.02; HI_CORR=0.8
@@ -31,7 +31,7 @@ COOLDOWN_H=4            # не показывать одну монету чащ
 LAST_ALERT={}           # coin -> ts последней подсветки
 WATCH={}                # coin -> {sym, zone_hi, zone_lo, ts, price0} — ждём ретеста
 WATCH_HOURS=12          # сколько отслеживать ретест
-WATCH_CHECK_SEC=60     # проверка ретеста раз в 60с (Bybit лимиты позволяют)
+WATCH_CHECK_SEC=15     # проверка ретеста раз в 15с (максимально быстро)
 RETEST_NEED_BOUNCE=True # ретест = касание зоны + отбой (зелёная свеча)
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
