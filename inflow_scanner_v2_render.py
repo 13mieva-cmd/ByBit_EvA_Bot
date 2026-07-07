@@ -572,12 +572,29 @@ def main():
                 if text.startswith("/start"):
                     chat=cid; save_chat(cid)
                     tg_send(cid,"✅ Сканер на сервере, работает 24/7.\n"
-                                "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n/log — журнал сделок\n\n"
+                                "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n/log — журнал сделок\n/bybit — проверка доступа к Bybit\n\n"
                                 "Подсвечу сетап → нажмёшь «Я вошёл» → буду вести позицию и комментировать. Решаешь ты.")
                 elif text.startswith("/scan"): run_scan(cid, announce=True)
                 elif text.startswith("/pos"):
                     if POSITIONS: tg_send(cid,"Открытые: "+", ".join(POSITIONS))
                     else: tg_send(cid,"Открытых позиций нет.")
+                elif text.startswith("/bybit"):
+                    # диагностика: доступен ли Bybit API с этого сервера
+                    try:
+                        r=requests.get("https://api.bybit.com/v5/market/tickers",
+                                       params={"category":"linear","symbol":"BTCUSDT"}, timeout=10)
+                        if r.status_code==200:
+                            j=r.json()
+                            p=(j.get("result") or {}).get("list",[{}])[0].get("lastPrice","?")
+                            tg_send(cid, f"\u2705 <b>Bybit ДОСТУПЕН с сервера!</b>\n"
+                                        f"BTC цена с Bybit: ${p}\n"
+                                        f"Регион EU работает \u2014 можно переходить на Bybit-данные.")
+                        else:
+                            tg_send(cid, f"\u274C Bybit вернул код {r.status_code} (возможно, блок региона). "
+                                        f"Ответ: {r.text[:200]}")
+                    except Exception as e:
+                        tg_send(cid, f"\u274C Bybit НЕдоступен с сервера: {type(e).__name__}. "
+                                    f"Похоже, регион всё ещё блокируется.")
                 elif text.startswith("/watch"):
                     if WATCH:
                         rows=[f"\u2022 {c}: жду ретест ${w['zone_lo']:.5g}\u2013${w['zone_hi']:.5g} ({w.get('kind','зона')})" for c,w in WATCH.items()]
