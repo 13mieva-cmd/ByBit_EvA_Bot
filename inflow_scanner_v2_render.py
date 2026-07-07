@@ -12,15 +12,15 @@
 Edge направления мы измеряли — его нет. Решение и риск всегда на тебе.
 Журнал входов/выходов нужен, чтобы посчитать реальную статистику твоего глаза.
 
-Ключи через Environment: TG_TOKEN, CA_KEY.   Команды: /start /scan /log /pos
+Ключи через Environment: TG_TOKEN.   Команды: /start /scan /log /pos
 """
 import os, time, json
 import datetime as dt
 import numpy as np
 import requests
 
-COINALYZE="https://api.coinalyze.net/v1"; QUOTE="USDT"
-MAX_COINS=150; SCAN_EVERY_MIN=30; MAX_ALERTS=8
+BYBIT="https://api.bybit.com"; QUOTE="USDT"
+MAX_COINS=150; SCAN_EVERY_MIN=15; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=5_000_000
 BTC_DUMP_1H=-0.02; HI_CORR=0.8
@@ -31,11 +31,11 @@ COOLDOWN_H=4            # не показывать одну монету чащ
 LAST_ALERT={}           # coin -> ts последней подсветки
 WATCH={}                # coin -> {sym, zone_hi, zone_lo, ts, price0} — ждём ретеста
 WATCH_HOURS=12          # сколько отслеживать ретест
-WATCH_CHECK_MIN=3       # как часто проверять ретесты (не чаще!)
+WATCH_CHECK_SEC=60     # проверка ретеста раз в 60с (Bybit лимиты позволяют)
 RETEST_NEED_BOUNCE=True # ретест = касание зоны + отбой (зелёная свеча)
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
-TG_TOKEN=""; CA_KEY=""
+TG_TOKEN=""   # данные с Bybit, ключ не нужен
 SYM_CACHE={}            # coin -> symbol (для ведения позиции)
 POSITIONS={}           # coin -> {entry, ts, sym, last_upd, last_state}
 
@@ -60,7 +60,7 @@ def tg_send_doc(cid,path,caption=""):
                           data={"chat_id":cid,"caption":caption},files={"document":f},timeout=60)
     except Exception as e: print("doc:",e)
 
-# ---------- Coinalyze ----------
+# ---------- Bybit ----------
 def bybit_price(coin):
     """Текущая цена перпа на Bybit. None если недоступно (напр. US-блок региона)."""
     try:
@@ -73,34 +73,55 @@ def bybit_price(coin):
     except Exception:
         return None
 
-def ca(path,params):
-    params=dict(params); params["api_key"]=CA_KEY
-    r=requests.get(f"{COINALYZE}{path}",params=params,timeout=30)
+def bget(path, params):
+    r=requests.get(f"{BYBIT}{path}", params=params, timeout=20)
     if r.status_code!=200: raise RuntimeError(f"HTTP {r.status_code}")
-    return r.json()
-_markets=None
+    j=r.json()
+    if j.get("retCode")!=0: raise RuntimeError(f"Bybit retCode {j.get('retCode')}: {j.get('retMsg')}")
+    return j["result"]
+
+_tickers_cache={"ts":0,"data":[]}
+def all_tickers():
+    """Все линейные тикеры Bybit (цена, оборот, funding) одним запросом, кэш 60с."""
+    if time.time()-_tickers_cache["ts"]<60 and _tickers_cache["data"]:
+        return _tickers_cache["data"]
+    res=bget("/v5/market/tickers", {"category":"linear"})
+    _tickers_cache["data"]=res["list"]; _tickers_cache["ts"]=time.time()
+    return res["list"]
+
 def universe():
-    global _markets
-    if _markets is None: _markets=ca("/future-markets",{})
-    perps=[x for x in _markets if x.get("is_perpetual") and x.get("quote_asset")==QUOTE
-           and x.get("symbol","").endswith(".A")]
+    """Топ USDT-перпов Bybit по обороту 24ч."""
+    rows=[x for x in all_tickers() if x["symbol"].endswith("USDT")]
+    rows.sort(key=lambda x: float(x.get("turnover24h",0) or 0), reverse=True)
     seen=set(); out=[]
-    for x in perps:
-        b=x.get("base_asset")
+    for x in rows:
+        b=x["symbol"][:-4]
         if b and b not in seen: seen.add(b); out.append((b,x["symbol"]))
     return out[:MAX_COINS]
-def H(path,sym,frm,to,keys,usd=False):
-    pr={"symbols":sym,"interval":"1hour","from":frm,"to":to}
-    if usd: pr["convert_to_usd"]="true"
-    j=ca(path,pr)
-    if not j or "history" not in j[0]: return []
-    out=[]
-    for h in j[0]["history"]:
-        try: out.append(tuple(float(h[k]) for k in keys))
-        except Exception: pass
-    return out
 
-# ---------- математика ----------
+def klines(symbol, limit=200):
+    """Часовые свечи Bybit. Возврат: closes,highs,lows,vols (старые->новые)."""
+    res=bget("/v5/market/kline", {"category":"linear","symbol":symbol,"interval":"60","limit":limit})
+    k=res["list"][::-1]   # Bybit даёт новые->старые
+    closes=[float(x[4]) for x in k]; highs=[float(x[2]) for x in k]
+    lows=[float(x[3]) for x in k]; vols=[float(x[5]) for x in k]
+    return closes,highs,lows,vols
+
+def open_interest(symbol, limit=50):
+    """История OI (часовая), старые->новые."""
+    res=bget("/v5/market/open-interest", {"category":"linear","symbol":symbol,
+                                           "intervalTime":"1h","limit":limit})
+    oi=res["list"][::-1]
+    return [float(x["openInterest"]) for x in oi]
+
+def ticker_info(symbol):
+    for t in all_tickers():
+        if t["symbol"]==symbol:
+            return dict(price=float(t["lastPrice"]),
+                        funding=float(t.get("fundingRate",0) or 0),
+                        turnover=float(t.get("turnover24h",0) or 0))
+    return None
+
 def rsi(closes, period=14):
     if len(closes)<period+1: return 50.0
     d=[closes[i+1]-closes[i] for i in range(len(closes)-1)]
@@ -367,13 +388,11 @@ def card(m, ex):
 def position_status(coin):
     p=POSITIONS.get(coin)
     if not p: return None,None
-    to=int(time.time()); frm=to-8*24*3600
     try:
-        px=H("/ohlcv-history",p["sym"],frm,to,["c"]); time.sleep(1.0)
-        oi=H("/open-interest-history",p["sym"],frm,to,["c"],usd=True); time.sleep(1.0)
+        closes,_,_,_=klines(p["sym"],limit=80); time.sleep(0.15)
+        oic=open_interest(p["sym"],limit=10); time.sleep(0.15)
     except Exception: return None,None
-    if len(px)<55 or len(oi)<6: return None,None
-    closes=[x[0] for x in px]; oic=[x[0] for x in oi]
+    if len(closes)<55 or len(oic)<6: return None,None
     price=closes[-1]; pnl=price/p["entry"]-1
     oi1=oic[-1]/oic[-2]-1 if oic[-2]>0 else 0
     oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
@@ -399,9 +418,8 @@ def pos_buttons(coin): return [[{"text":"❌ Выйти / зафиксирова
 def close_trade(coin):
     p=POSITIONS.pop(coin,None)
     if not p: return None
-    to=int(time.time()); frm=to-2*24*3600
     try:
-        px=H("/ohlcv-history",p["sym"],frm,to,["c"]); price=px[-1][0]
+        cc,_,_,_=klines(p["sym"],limit=2); price=cc[-1]
     except Exception: price=p["entry"]
     pnl=price/p["entry"]-1
     new=not os.path.exists(TRADES)
@@ -416,20 +434,18 @@ def run_scan(cid, announce=False):
     if announce: tg_send(cid,"🔍 Ищу лонг-сетапы, подожди пару минут...")
     try: coins=universe()
     except Exception as e: tg_send(cid,f"Ошибка данных: {e}"); return
-    to=int(time.time()); frm=to-9*24*3600
     try:
-        btc=[x[0] for x in H("/ohlcv-history","BTCUSDT.A",frm,to,["c"])]; time.sleep(1.7)
+        btc,_,_,_=klines("BTCUSDT",limit=30); time.sleep(0.15)
         btc_dump=len(btc)>2 and (btc[-1]/btc[-2]-1)<BTC_DUMP_1H
         btc_p4=(btc[-1]/btc[-5]-1) if len(btc)>=5 else 0.0
     except Exception: btc=[]; btc_dump=False; btc_p4=0.0
     hits=[]
     for coin,sym in coins:
         try:
-            px=H("/ohlcv-history",sym,frm,to,["c","h","l","v"]); time.sleep(1.7)
-            oi=H("/open-interest-history",sym,frm,to,["c"],usd=True); time.sleep(1.7)
-            if len(px)<MIN_BARS or len(oi)<25: continue
-            m=core(coin,[a[0] for a in px],[a[1] for a in px],[a[2] for a in px],
-                   [a[3] for a in px],[a[0] for a in oi],btc,btc_p4)
+            closes,highs,lows,vols=klines(sym,limit=200); time.sleep(0.15)
+            oic=open_interest(sym,limit=50); time.sleep(0.15)
+            if len(closes)<MIN_BARS or len(oic)<25: continue
+            m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4)
             if not (m and long_ok(m)): continue
             # антиспам: не повторять монету чаще COOLDOWN_H часов
             if time.time()-LAST_ALERT.get(coin,0) < COOLDOWN_H*3600: continue
@@ -474,39 +490,32 @@ def run_scan(cid, announce=False):
         tg_send(cid,"Сетапы были, но недавно уже показаны (антиспам). Жди новых.")
 
 def enrich(sym):
-    to=int(time.time()); frm=to-2*24*3600; out={}
+    """Доп.данные с Bybit: funding. (Ликвидаций в публичном REST нет.)"""
+    out={}
     try:
-        liq=H("/liquidation-history",sym,frm,to,["l","s"],usd=True); time.sleep(1.7)
-        if liq:
-            rec=sum(a+b for a,b in liq[-4:]); base=(sum(a+b for a,b in liq[-28:-4])/24*4) if len(liq)>=28 else rec
-            out["liq_spike"]=rec/base if base>0 else 0
-    except Exception: pass
-    try:
-        fr=H("/funding-rate-history",sym,int(time.time())-10*24*3600,to,["c"])
-        if fr: out["funding"]=fr[-1][0]
+        t=ticker_info(sym)
+        if t: out["funding"]=t["funding"]
     except Exception: pass
     return out
 
 def check_watchlist(chat):
-    """Проверяет монеты в ожидании ретеста; зовёт, когда цена вернулась в зону."""
+    """Проверяет монеты в ожидании ретеста; зовёт, когда цена вернулась в зону и отбилась."""
     if not chat or not WATCH: return
     now=time.time()
     for coin in list(WATCH):
         w=WATCH[coin]
         if now-w["ts"]>WATCH_HOURS*3600:
-            del WATCH[coin]; continue                      # просрочено — снимаем
-        to=int(now); frm=to-3*24*3600
+            del WATCH[coin]; continue
         try:
-            px=H("/ohlcv-history",w["sym"],frm,to,["o","c","l"]); time.sleep(1.4)
+            res=bget("/v5/market/kline", {"category":"linear","symbol":w["sym"],"interval":"60","limit":3})
+            k=res["list"]; time.sleep(0.15)          # новые->старые, последняя = [0]
         except Exception:
             continue
-        if len(px)<3: continue
-        o,c,lo = px[-1][0], px[-1][1], px[-1][2]
-        # цена коснулась зоны (лоу свечи зашёл в зону) ?
+        if len(k)<1: continue
+        last=k[0]; o=float(last[1]); c=float(last[4]); lo=float(last[3])
         touched = lo <= w["zone_hi"]
-        bounced = c >= o                                    # зелёная свеча = отбой
-        # сетап развалился (ушли сильно ниже базы) — снимаем
-        if c < w["zone_lo"]*0.97:
+        bounced = c >= o
+        if c < w["zone_lo"]*0.97:                     # сетап развалился
             del WATCH[coin]; continue
         if touched and (bounced or not RETEST_NEED_BOUNCE):
             by=bybit_price(coin)
@@ -553,10 +562,9 @@ def handle_callback(q):
                     f"Записал в журнал. Команда /log — скачать всю историю сделок.")
 
 def main():
-    global TG_TOKEN,CA_KEY
+    global TG_TOKEN
     TG_TOKEN=os.environ.get("TG_TOKEN","").strip() or input("Токен бота: ").strip()
-    CA_KEY=os.environ.get("CA_KEY","").strip() or input("Ключ Coinalyze: ").strip()
-    if len(TG_TOKEN)<20 or len(CA_KEY)<10: print("Нет валидных TG_TOKEN/CA_KEY."); return
+    if len(TG_TOKEN)<20: print("Нет валидного TG_TOKEN."); return
     me=tg("getMe")
     if not me.get("ok"): print("Не подключиться — проверь TG_TOKEN."); return
     print(f"Бот @{me['result']['username']} запущен (server mode).")
@@ -611,7 +619,7 @@ def main():
                 print(f'[scan] авто-скан 150 монет, chat={"есть" if chat else "НЕТ /start"}')
                 run_scan(chat, announce=False); last_scan=time.time()
             # проверка ретестов из списка ожидания (раз в WATCH_CHECK_MIN минут)
-            if time.time()-globals().get('_last_watch',0) > WATCH_CHECK_MIN*60:
+            if time.time()-globals().get('_last_watch',0) > WATCH_CHECK_SEC:
                 globals()['_last_watch']=time.time()
                 try: check_watchlist(chat)
                 except Exception as e: print('watch:',e)
