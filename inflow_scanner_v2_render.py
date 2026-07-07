@@ -41,8 +41,12 @@ POSITIONS={}           # coin -> {entry, ts, sym, last_upd, last_state}
 
 # ---------- Telegram ----------
 def tg(method, **p):
-    try: return requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/{method}",params=p,timeout=35).json()
-    except Exception as e: print("TG:",e); return {}
+    try:
+        return requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/{method}",params=p,timeout=40).json()
+    except requests.exceptions.ReadTimeout:
+        return {}                      # штатный тайм-аут long-polling — молчим
+    except Exception as e:
+        print("TG:",e); return {}
 def kb(rows): return json.dumps({"inline_keyboard":rows})
 def tg_send(cid,t,buttons=None):
     p={"chat_id":cid,"text":t,"parse_mode":"HTML"}
@@ -519,6 +523,7 @@ def main():
                     else: tg_send(cid,"Журнал пуст — ещё не было закрытых сделок.")
             # авто-скан
             if chat and time.time()-last_scan>SCAN_EVERY_MIN*60:
+                print(f'[scan] авто-скан 150 монет, chat={"есть" if chat else "НЕТ /start"}')
                 run_scan(chat, announce=False); last_scan=time.time()
             # проверка ретестов из списка ожидания (раз в WATCH_CHECK_MIN минут)
             if time.time()-globals().get('_last_watch',0) > WATCH_CHECK_MIN*60:
