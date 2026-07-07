@@ -480,11 +480,14 @@ def log_signal(coin, sig_type, price):
     """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
     временем — без этого невозможно посчитать реальный форвардный win rate
     и понять, работают ли пороги фильтров или это подгонка. См. /stats."""
-    new=not os.path.exists(SIGNALS_FILE)
-    with open(SIGNALS_FILE,"a",newline="") as f:
-        w=csv.writer(f)
-        if new: w.writerow(["ts","coin","type","price"])
-        w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, sig_type, f"{price:.6g}"])
+    try:
+        new=not os.path.exists(SIGNALS_FILE)
+        with open(SIGNALS_FILE,"a",newline="") as f:
+            w=csv.writer(f)
+            if new: w.writerow(["ts","coin","type","price"])
+            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, sig_type, f"{price:.6g}"])
+    except Exception as e:
+        print("log_signal:",e)
 
 def compute_stats():
     """Форвардная статистика: берём сигналы старше 4ч и 24ч, сверяем текущую
@@ -687,8 +690,18 @@ def check_watchlist(chat):
             del WATCH[coin]
 
 # ---------- чат ----------
+def ensure_dirs():
+    """Создаёт директории для журналов, если их нет (нужно для volume /data)."""
+    for path in (TRADES, SIGNALS_FILE, CHAT_FILE):
+        d=os.path.dirname(path)
+        if d and not os.path.exists(d):
+            try: os.makedirs(d, exist_ok=True)
+            except Exception as e: print("mkdir",d,e)
+
 def save_chat(c):
-    with open(CHAT_FILE,"w") as f: f.write(str(c))
+    try:
+        with open(CHAT_FILE,"w") as f: f.write(str(c))
+    except Exception as e: print("save_chat:",e)
 
 def load_chat():
     try:
@@ -723,6 +736,7 @@ def main():
     global TG_TOKEN
     TG_TOKEN=os.environ.get("TG_TOKEN","").strip() or input("Токен бота: ").strip()
     if len(TG_TOKEN)<20: print("Нет валидного TG_TOKEN."); return
+    ensure_dirs()
     me=tg("getMe")
     if not me.get("ok"): print("Не подключиться — проверь TG_TOKEN."); return
     print(f"Бот @{me['result']['username']} запущен (server mode).")
