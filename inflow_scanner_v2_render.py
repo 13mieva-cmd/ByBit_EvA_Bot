@@ -51,6 +51,7 @@ RSI_MAX=78
 MIN_BARS=200
 COOLDOWN_H=4
 FUNDING_CUTOFF=0.0005   # 0.05% за интервал — перегрев лонгами, жёсткий отказ
+ATR_MIN_RATIO=0.6       # текущий ATR(14) < 60% средней за 30 баров = сжатие/чоп, сигнал не идёт
 LOSS_COOLDOWN_MULT=3    # во сколько раз дольше кулдаун по монете после убыточной сделки
 RECENT_LOSSES={}        # coin -> ts последнего стоп-лосса (для удлинённого кулдауна)
 LAST_ALERT={}
@@ -284,6 +285,38 @@ def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
     return "forming",res_now,res_now,sup_now
 
 
+def atr(highs, lows, closes, period=14):
+    """Average True Range — мера волатильности. Для фильтра рыночного режима:
+    если текущий ATR аномально низкий относительно средней за 30 периодов,
+    рынок в фазе сжатия/чопа — сигналы там чаще дают ложные пробои."""
+    n=len(closes)
+    if n<period+2: return 0.0
+    trs=[]
+    for i in range(1,n):
+        tr=max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    if len(trs)<period: return 0.0
+    a=sum(trs[:period])/period
+    for x in trs[period:]:
+        a=(a*(period-1)+x)/period
+    return a
+
+def atr_ratio(highs, lows, closes):
+    """Текущий ATR(14) / средний ATR(14) за последние 30 баров. <1 = волатильность
+    ниже нормы (сжатие диапазона, флэт)."""
+    n=len(closes)
+    if n<60: return 1.0
+    cur=atr(highs[-20:],lows[-20:],closes[-20:],period=14)
+    hist=[]
+    for i in range(30):
+        end=n-i; start=end-20
+        if start<14: break
+        hist.append(atr(highs[start:end],lows[start:end],closes[start:end],period=14))
+    if not hist: return 1.0
+    avg=sum(hist)/len(hist)
+    if avg==0: return 1.0
+    return cur/avg
+
 def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     if len(closes)<MIN_BARS or len(oic)<25: return None
     price=closes[-1]
@@ -321,17 +354,19 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     btc_beta = cor>=HI_CORR and btc_p4>0 and abs(p4-btc_p4)<0.01
     tf=sum([oi1>0.01, oi4>=OI_4H_MIN, oi24>0.10])
     brk=price>max(highs[-168:-1]) if len(highs)>168 else False
+    atrr=atr_ratio(highs,lows,closes)   # режим рынка: <1 = сжатие/чоп
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
-        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl)
+        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr)
 
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
         and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
         and m["p4"]>=PRICE_UP_4H_MIN
-        and m["rsi"]<=RSI_MAX)
+        and m["rsi"]<=RSI_MAX
+        and m.get("atrr",1.0)>=ATR_MIN_RATIO)  # рынок не в аномальном сжатии/чопе
 
 def _score(m, ex):
     """Скоринг ТОЛЬКО из полей, которые бот реально вычисляет. Штраф за
@@ -369,6 +404,7 @@ def card_long(m, ex):
         f"\U0001F4C8 Объём \u00d7{m['spike']:.1f} {_bar(m['spike']/5,5)}\n"
         f"\U0001F321 RSI {rsi_v} {_bar(rsi_v/100,5)}\n"
         f"\U0001F4A7 Ликвидн. ${m['turn']/1e6:.0f}M {_bar(min(m['turn']/100e6,1),5)}\n"
+        f"\u26A1 Волатильность {m.get('atrr',1.0)*100:.0f}% от нормы {_bar(min(m.get('atrr',1.0),1.5)/1.5,5)}\n"
         f"\U0001F517 Корр. с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}"
     )
 
