@@ -137,6 +137,12 @@ def universe():
         if b and b not in seen: seen.add(b); out.append((b,x["symbol"]))
     return out[:MAX_COINS]
 
+def klines_tf(symbol, interval, limit=200):
+    res=bget("/v5/market/kline", {"category":"linear","symbol":symbol,"interval":interval,"limit":limit})
+    k=res["list"][::-1]
+    return ([float(x[4]) for x in k],[float(x[2]) for x in k],
+            [float(x[3]) for x in k],[float(x[5]) for x in k])
+
 def klines(symbol, limit=200):
     res=bget("/v5/market/kline", {"category":"linear","symbol":symbol,"interval":"60","limit":limit})
     k=res["list"][::-1]
@@ -149,6 +155,55 @@ def open_interest(symbol, limit=50):
         "intervalTime":"1h","limit":limit})
     oi=res["list"][::-1]
     return [float(x["openInterest"]) for x in oi]
+
+def stop_map(m):
+    """Оценка зон скопления стопов (ориентир, не точная карта — публичный API её не даёт).
+    Стопы ЛОНГИСТОВ стоят ниже цены (под поддержкой), стопы ШОРТИСТОВ — выше (над сопротивлением).
+    Опираемся на уровни, что бот уже считает: ближайшую поддержку снизу и сопротивление сверху."""
+    price=m["price"]; levels=m.get("levels") or []
+    below=[lv for lv in levels if lv[0]<price*0.998]   # уровни ниже цены
+    above=[lv for lv in levels if lv[0]>price*1.002]   # уровни выше цены
+    # стопы лонгистов — под ближайшей сильной поддержкой (строго ниже цены)
+    if below: long_stops=max(below, key=lambda x:x[1])[0]
+    else:
+        cb=m.get("consol_base")
+        long_stops=cb if (cb and cb<price) else None
+    # стопы шортистов — над ближайшим сопротивлением (строго ВЫШЕ цены)
+    if above: short_stops=min(above, key=lambda x:x[0])[0]
+    else:
+        oh=m.get("old_high")
+        short_stops=oh if (oh and oh>price) else None
+    return long_stops, short_stops
+
+def liq_zones(price, funding=0.0):
+    """Оценка зон ликвидации через популярное плечо (метод как у CoinGlass/Hyblock):
+    при плече L ликвидация лонга ≈ на 1/L ниже входа. Берём 10x и 25x — самые
+    популярные. funding уточняет, с какой стороны кластер плотнее (знак перекоса).
+    Возвращает dict с зонами лонг-ликвидаций (ниже) и шорт-ликвидаций (выше)."""
+    k=0.005  # коэф. поддержания маржи (типовой)
+    out={}
+    for L in (10,25):
+        out[f"long_{L}x"]=price*(1-(1.0/L)+k)   # лонги ликвидируются НИЖЕ
+        out[f"short_{L}x"]=price*(1+(1.0/L)-k)  # шорты ликвидируются ВЫШЕ
+    # какая сторона перегружена (по funding): + = перегруз лонгами -> ниже плотнее
+    if funding>=0.0003: out["heavy"]="long"     # лонги перегружены -> магнит вниз
+    elif funding<=-0.0003: out["heavy"]="short" # шорты перегружены -> магнит вверх
+    else: out["heavy"]=None
+    return out
+
+def long_short_ratio(symbol):
+    """Соотношение лонг/шорт аккаунтов с Bybit (account-ratio). None если недоступно.
+    ratio>1 = лонгистов больше (толпа в лонге), <1 = шортистов больше."""
+    try:
+        res=bget("/v5/market/account-ratio", {"category":"linear","symbol":symbol,
+                                               "period":"1h","limit":1})
+        lst=res.get("list") or []
+        if not lst: return None
+        b=float(lst[0].get("buyRatio",0)); s=float(lst[0].get("sellRatio",0))
+        if s<=0: return None
+        return b/s
+    except Exception:
+        return None
 
 def ticker_info(symbol):
     for t in all_tickers():
@@ -355,7 +410,7 @@ def detect_compression(highs, lows, closes, vols):
     vol_ok = vols[-1] >= vb*EARLY_VOL_MIN if vb>0 else False
     return (compressed and broke_up and vol_ok), zone_hi, zone_lo
 
-def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
+def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None):
     if len(closes)<MIN_BARS or len(oic)<25: return None
     price=closes[-1]
     p4=price/closes[-5]-1 if len(closes)>=5 else 0
@@ -397,7 +452,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
-        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr)
+        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr,tri_mtf=tri_mtf)
 
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
@@ -445,6 +500,36 @@ def card_long(m, ex):
         f"\u26A1 Волатильность {m.get('atrr',1.0)*100:.0f}% от нормы {_bar(min(m.get('atrr',1.0),1.5)/1.5,5)}\n"
         f"\U0001F517 Корр. с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}"
     )
+    # --- КАРТА СТОПОВ: перекос толпы + зоны стопов обеих сторон ---
+    lsr=m.get("ls_ratio")
+    long_stops,short_stops=stop_map(m)
+    stop_lines=["", "\U0001F5FA <b>Карта стопов</b> (ориентир, не точная):"]
+    if lsr:
+        if lsr>=1.5: perekos=f"перекос в ЛОНГ ×{lsr:.1f} — толпа в лонге, риск слива за их стопами"
+        elif lsr<=0.67: perekos=f"перекос в ШОРТ (Л/Ш {lsr:.2f}) — шортов много, их стопы = топливо вверх"
+        else: perekos=f"баланс (Л/Ш {lsr:.2f})"
+        stop_lines.append(f"\u2696\uFE0F Толпа: {perekos}")
+    if short_stops:
+        stop_lines.append(f"\U0001F3AF Стопы шортистов: над <b>${short_stops:.5g}</b> — топливо для рывка вверх")
+    if long_stops:
+        stop_lines.append(f"\U0001F6D1 Стопы лонгистов: под <b>${long_stops:.5g}</b> — риск слива за ними")
+    # зоны ликвидации через плечо (метод CoinGlass-стайл: 10x/25x)
+    lz=liq_zones(m["price"], ex.get("funding",0.0))
+    stop_lines.append(f"\U0001F525 Ликвидации лонгов (плечо): ~${lz['long_25x']:.5g} (25x) / ~${lz['long_10x']:.5g} (10x) — магнит вниз")
+    stop_lines.append(f"\U0001F525 Ликвидации шортов (плечо): ~${lz['short_25x']:.5g} (25x) / ~${lz['short_10x']:.5g} (10x) — магнит вверх")
+    if lz["heavy"]=="long":
+        stop_lines.append("\u2022 <i>funding+ : рынок перегружен лонгами \u2014 нижний кластер плотнее (риск слива вниз)</i>")
+    elif lz["heavy"]=="short":
+        stop_lines.append("\u2022 <i>funding\u2212 : рынок перегружен шортами \u2014 верхний кластер плотнее (топливо вверх)</i>")
+    # УМНЫЙ СТОП: ставить ЗА кластером лонг-ликвидаций, а не внутри (защита от стоп-ханта)
+    # ближайший к цене кластер СНИЗУ (чтобы стоп был тесным, а не за тридевять земель)
+    cands=[z for z in (lz["long_25x"], lz["long_10x"], long_stops) if z and z<m["price"]]
+    long_cluster = max(cands) if cands else lz["long_25x"]   # ближайший снизу
+    smart_stop = long_cluster*0.995                    # чуть НИЖЕ кластера
+    risk=(m["price"]-smart_stop)/m["price"]*100
+    stop_lines.append(f"\U0001F6E1 <b>Умный стоп: под ${smart_stop:.5g}</b> (за кластером лонг-ликвидаций ${long_cluster:.5g}, риск ~{risk:.1f}%)")
+    stop_lines.append("\u2022 <i>стоп ЗА кластером, а не внутри — чтобы не выбило на стоп-ханте перед разворотом</i>")
+    stop_lines.append("<i>точных стопов публичный API не даёт \u2014 это оценка по уровням + типовому плечу (как CoinGlass)</i>")
 
     by=m.get("bybit")
     if by:
@@ -460,7 +545,7 @@ def card_long(m, ex):
         f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}", "",
         table,
         f"\U0001F4CA Подтверждение: {tf_txt}",
-    ]
+    ] + stop_lines
 
     reasons=[]
     reasons.append("деньги активно заходят" if m["oi4"]>=0.10 else "деньги заходят")
@@ -548,6 +633,17 @@ def card_triangle(m, ex):
         f"\U0001F517 Корреляция с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}",
         "",
     ]
+    # мультитаймфрейм-статус треугольника (справка): 15м / 1ч / 4ч
+    mtf=m.get("tri_mtf")
+    if mtf:
+        def _mk(v): return "\u2705" if v in ("ready","breakout","forming") else "\u2014"
+        n_active=sum(1 for tf in ("15м","1ч","4ч") if mtf.get(tf) in ("ready","breakout","forming"))
+        lines.append(f"\U0001F553 Треугольник по ТФ: 15м {_mk(mtf.get('15м'))}  1ч {_mk(mtf.get('1ч'))}  4ч {_mk(mtf.get('4ч'))}")
+        if n_active>=2:
+            lines.append(f"\u2022 <i>виден на {n_active} ТФ \u2014 структура подтверждена на нескольких горизонтах (надёжнее)</i>")
+        else:
+            lines.append("\u2022 <i>виден только на одном ТФ \u2014 слабее подтверждён</i>")
+        lines.append("")
     if tri=="ready":
         lines.append("\u26A1 Готовность к пробою")
         lines.append(f"\u2022 цена вплотную подошла к крышке ${tt:.5g} и поджимается")
@@ -868,7 +964,17 @@ def run_scan(cid, announce=False):
         except Exception:
             continue
         if len(closes)<MIN_BARS: continue
-        m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4)
+        # мультитаймфрейм-статус треугольника (справка): 15м / 1ч / 4ч
+        tri_mtf={"1ч": detect_triangle(highs,lows,closes,closes[-1])[0]}
+        try:
+            c15,h15,l15,_=klines_tf(sym,"15",limit=120); time.sleep(0.12)
+            tri_mtf["15м"]=detect_triangle(h15,l15,c15,c15[-1])[0]
+        except Exception: tri_mtf["15м"]=None
+        try:
+            c4,h4,l4,_=klines_tf(sym,"240",limit=120); time.sleep(0.12)
+            tri_mtf["4ч"]=detect_triangle(h4,l4,c4,c4[-1])[0]
+        except Exception: tri_mtf["4ч"]=None
+        m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4,tri_mtf=tri_mtf)
         if m: m["btc_weak"]=btc_weak
         if not m: continue
         SYM_CACHE[coin]=sym
@@ -904,6 +1010,7 @@ def run_scan(cid, announce=False):
             continue
         by=bybit_price(coin)
         if by: m["bybit"]=by
+        m["ls_ratio"]=long_short_ratio(sym); time.sleep(0.1)   # карта стопов: перекос толпы
 
         lv=m.get("lvl")
         if lv and abs(lv["dist"])<0.03 and lv["touches"]>=3:
