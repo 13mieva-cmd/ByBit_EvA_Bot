@@ -52,6 +52,13 @@ MIN_BARS=200
 COOLDOWN_H=4
 FUNDING_CUTOFF=0.0005   # 0.05% за интервал — перегрев лонгами, жёсткий отказ
 ATR_MIN_RATIO=0.6       # текущий ATR(14) < 60% средней за 30 баров = сжатие/чоп, сигнал не идёт
+# --- РАННИЙ СИГНАЛ (экспериментальный, тестируется на данных) ---
+EARLY_ENABLED=True          # ранний сигнал по пробою сжатия
+EARLY_COMPRESS_MAX=0.7      # текущий диапазон < 70% медианного = сжатие
+EARLY_VOL_MIN=1.2           # объём пробойной свечи >= 1.2x среднего
+EARLY_RSI_MAX=68            # строже обычного (78): не ловим сжатие перед разворотом вниз
+EARLY_COOLDOWN_H=4          # антиспам по раннему сигналу
+LAST_EARLY={}               # coin -> ts последнего раннего сигнала
 LOSS_COOLDOWN_MULT=3    # во сколько раз дольше кулдаун по монете после убыточной сделки
 RECENT_LOSSES={}        # coin -> ts последнего стоп-лосса (для удлинённого кулдауна)
 LAST_ALERT={}
@@ -317,6 +324,37 @@ def atr_ratio(highs, lows, closes):
     if avg==0: return 1.0
     return cur/avg
 
+def detect_compression(highs, lows, closes, vols):
+    """РАННИЙ детектор: цена сжалась в узкий диапазон, и последняя свеча только что
+    пробила его вверх на подросшем объёме. Ловит ПЕРВУЮ свечу движения — ДО того,
+    как OI/объём раздуются (то есть ДО обычного лонг-сигнала).
+    ЧЕСТНО: это НЕ подтверждение деньгами, а ставка на то, что сжатие разрешится
+    вверх. Пробой сжатия вверх и вниз почти равновероятны — отсюда доп. фильтры.
+    Возвращает (just_broke_up: bool, zone_hi, zone_lo)."""
+    n=len(closes)
+    if n<60: return False,0,0
+    # диапазон последних 24 свечей БЕЗ самой последней (окно сжатия)
+    win_h=highs[-25:-1]; win_l=lows[-25:-1]
+    zone_hi=max(win_h); zone_lo=min(win_l)
+    cur_range=zone_hi-zone_lo
+    if cur_range<=0: return False,0,0
+    # исторические диапазоны за предыдущие 30 окон по 24 свечи
+    hist=[]
+    for i in range(1,31):
+        e=n-1-i; s=e-24
+        if s<0: break
+        seg_h=highs[s:e]; seg_l=lows[s:e]
+        if seg_h and seg_l: hist.append(max(seg_h)-min(seg_l))
+    if len(hist)<10: return False,0,0
+    med=sorted(hist)[len(hist)//2]
+    if med<=0: return False,0,0
+    compressed = cur_range < med*EARLY_COMPRESS_MAX          # сейчас уже нормы = сжатие
+    last=closes[-1]
+    broke_up = last>zone_hi                                   # пробой вверх за границу сжатия
+    vb=sum(vols[-25:-1])/24 if len(vols)>=25 else (sum(vols)/len(vols))
+    vol_ok = vols[-1] >= vb*EARLY_VOL_MIN if vb>0 else False
+    return (compressed and broke_up and vol_ok), zone_hi, zone_lo
+
 def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0):
     if len(closes)<MIN_BARS or len(oic)<25: return None
     price=closes[-1]
@@ -562,6 +600,34 @@ def track_record(sig_type):
     _track_cache["data"][sig_type]=(n,win); _track_cache["ts"]=_t.time()
     return n,win
 
+def card_early(m, zone_hi, zone_lo):
+    """Ранний сигнал: пробой сжатия ДО подтверждения деньгами. Честно помечен."""
+    p=m["price"]; stop=zone_lo
+    risk=(p-stop)/p*100 if p>0 else 0
+    lines=[
+        f"\U0001F535 <b>{m['coin']} · РАННИЙ СИГНАЛ</b> (эксперим.)",
+        f"\U0001F4B5 ${p:.5g} \u2014 только что пробил зону сжатия ${zone_lo:.5g}\u2013${zone_hi:.5g}",
+        "",
+        "\u26A0\uFE0F <b>Это НЕ подтверждённый лонг-сетап.</b> Деньги (OI/объём) ещё "
+        "НЕ подтвердили движение. Это ставка на то, что сжатие разрешится вверх \u2014 "
+        "а пробой вверх и вниз почти равновероятны.",
+        "",
+        f"\U0001F4CA RSI {m.get('rsi',0):.0f}  \u00b7  корр. с BTC {m['cor']*100:.0f}%  \u00b7  волатильн. {m.get('atrr',1)*100:.0f}% от нормы",
+        "",
+        "\U0001F4CD <b>Если тестируешь:</b>",
+        "\u2022 <b>пробный объём</b>, не полный размер (сигнал недоказан)",
+        f"\u2022 стоп чуть ниже зоны сжатия: <b>${stop:.5g}</b> (риск ~{risk:.1f}%)",
+        "\u2022 если через 1-2ч придёт обычная \U0001F7E2 ЛОНГ-карточка по этой монете \u2014 "
+        "это деньги подтвердили движение, можно усиливать",
+    ]
+    _n,_w=track_record("early")
+    if _n>0:
+        lines += ["", f"\U0001F4C8 Трек-рекорд РАННИХ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
+    lines += ["", "\u2501"*16,
+        "\u26A0\uFE0F Экспериментальный сигнал на проверке. Пойдёт ли вверх \u2014 НЕ гарантия. "
+        "Стоп обязателен, размер пробный."]
+    return "\n".join(lines)
+
 def log_signal(coin, sig_type, price):
     """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
     временем — без этого невозможно посчитать реальный форвардный win rate
@@ -642,7 +708,7 @@ def compute_stats():
     btc_now=cur_price("BTC")
     out=["\U0001F4CA СТАТИСТИКА ПО СИГНАЛАМ (форвард + бенчмарк BTC)\n"]
     for horizon_h, label in [(4,"4ч"),(24,"24ч")]:
-        for sig_type in ("long","triangle"):
+        for sig_type in ("long","triangle","early"):
             sig_pcts=[]; btc_pcts=[]
             for r in rows:
                 if r["type"]!=sig_type: continue
@@ -806,6 +872,22 @@ def run_scan(cid, announce=False):
         if m: m["btc_weak"]=btc_weak
         if not m: continue
         SYM_CACHE[coin]=sym
+
+        # === РАННИЙ СИГНАЛ (эксперим.): пробой сжатия ДО подтверждения деньгами ===
+        if EARLY_ENABLED:
+            try:
+                broke, zhi, zlo = detect_compression(closes,highs,lows,vols)
+            except Exception:
+                broke, zhi, zlo = False,0,0
+            # строгие доп. условия: RSI не перегрет, не падающий нож, не в чопе, BTC не валится
+            if (broke and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
+                    and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS):
+                le=LAST_EARLY.get(coin,0)
+                if now-le>=EARLY_COOLDOWN_H*3600:
+                    LAST_EARLY[coin]=now
+                    bt=[[{"text":"\u2705 Я вошёл","callback_data":f"enter|{coin}|{m['price']:.6g}"}]]
+                    tg_send(cid, card_early(m,zhi,zlo), buttons=bt); shown+=1
+                    log_signal(coin, "early", m["price"])
 
         if not long_ok(m): continue
         last=LAST_ALERT.get(coin,0)
