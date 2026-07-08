@@ -39,10 +39,20 @@ MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=5_000_000
 BTC_DUMP_1H=-0.02; HI_CORR=0.8
+# --- зеркальный ШОРТОВЫЙ набор для BTC (рубильник лонгов по альтам) ---
+BTC_DROP_4H=-0.02      # падение BTC за 4ч больше 2%
+BTC_OI_DROP_4H=-0.05   # отток OI по BTC за 4ч (деньги уходят)
+BTC_VOL_SPIKE=1.5      # растущий объём на падении
+BTC_RSI_OVERSOLD=30    # перепроданность
+BTC_RISK_MIN_HITS=2    # сколько признаков = блок лонгов
+LAST_BTC_WARN=0        # антиспам предупреждения при автоскане
 PRICE_UP_4H_MIN=0.005
 RSI_MAX=78
 MIN_BARS=200
 COOLDOWN_H=4
+FUNDING_CUTOFF=0.0005   # 0.05% за интервал — перегрев лонгами, жёсткий отказ
+LOSS_COOLDOWN_MULT=3    # во сколько раз дольше кулдаун по монете после убыточной сделки
+RECENT_LOSSES={}        # coin -> ts последнего стоп-лосса (для удлинённого кулдауна)
 LAST_ALERT={}
 WATCH={}
 TRI_ALERT={} # coin -> {sym, top, ts} - активно ждём момент пробоя крышки треугольника (стадия ready)
@@ -53,6 +63,7 @@ RETEST_NEED_BOUNCE=True
 TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
 CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
 SIGNALS_FILE=os.environ.get("SIGNALS_FILE","/tmp/scanner_signals.csv")
+BLOCKS_FILE=os.environ.get("BLOCKS_FILE","/data/scanner_blocks.csv")
 TG_TOKEN=""
 SYM_CACHE={}
 POSITIONS={}
@@ -341,9 +352,11 @@ def _score(m, ex):
 def card_long(m, ex):
     cautions=[]
     if m.get("btc_beta"): cautions.append("движение в основном ЗА БИТКОМ — не её собственный приток")
-    elif m["cor"]>=HI_CORR: cautions.append(f"сильно ходит за биткоином (corr {m['cor']:.2f})")
-    if ex.get("funding",0)>0.01: cautions.append("перегрет плечом (высокий funding)")
+    elif m["cor"]>=HI_CORR: cautions.append(f"сильно ходит за биткоином (корреляция {m['cor']*100:.0f}%)")
+    if ex.get("funding",0)>0.01: cautions.append(f"повышенный funding ({ex.get('funding',0)*100:.3f}%) — плечо копится")
     if m.get("extended"): cautions.append("вход на пике импульса \u2014 лучше ждать откат")
+    if m.get("btc_weak") and m["cor"]>=0.3:
+        cautions.append(f"\U0001F7E1 BTC слабеет по факту ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть альт вниз (реакция, не прогноз)")
 
     sc=_score(m,ex)
     head = "\U0001F7E2" if not cautions else "\U0001F7E1"
@@ -355,7 +368,8 @@ def card_long(m, ex):
         f"\U0001F4B0 Приток OI {m['oi4']*100:+.0f}% {_bar(m['oi4']/0.20,5)}\n"
         f"\U0001F4C8 Объём \u00d7{m['spike']:.1f} {_bar(m['spike']/5,5)}\n"
         f"\U0001F321 RSI {rsi_v} {_bar(rsi_v/100,5)}\n"
-        f"\U0001F4A7 Ликвидн. ${m['turn']/1e6:.0f}M {_bar(min(m['turn']/100e6,1),5)}"
+        f"\U0001F4A7 Ликвидн. ${m['turn']/1e6:.0f}M {_bar(min(m['turn']/100e6,1),5)}\n"
+        f"\U0001F517 Корр. с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}"
     )
 
     by=m.get("bybit")
@@ -419,6 +433,9 @@ def card_long(m, ex):
     lines.append("")
     lines.append("\U0001F6D1 Правило входа: НЕ по рынку сейчас. Вход только на РЕТЕСТЕ уровня/зоны с отбоем (зелёная свеча). Бот позовёт.")
 
+    if m.get("btc_weak") and m["cor"]>=0.3:
+        lines.append("")
+        lines.append(f"\U0001F7E1 BTC слабеет ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть вниз")
     if m.get("watching"):
         zlo,zhi=m["watching"]; wk=m.get("watch_kind","зоне")
         lines.append("")
@@ -432,6 +449,9 @@ def card_long(m, ex):
     lines.append(f"\u2022 старый хай (уровень): ${oh:.5g}{hi_note}")
     lines.append("\u2022 выгоднее лимитка в зоне отката, чем по рынку на пике")
 
+    _n,_w=track_record("long")
+    if _n>0:
+        lines += ["", f"\U0001F4C8 Трек-рекорд ЛОНГ-сигналов: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
     lines += ["", "\u2501"*16,
         "\u26A0\uFE0F Подсветка, не приказ. Пойдёт ли вверх \u2014 не гарантия. "
         "Стоп на Bybit \u2014 обязателен."]
@@ -451,6 +471,7 @@ def card_triangle(m, ex):
         f"\U0001F4B5 ${m['price']:.5g} (Bybit)", "",
         f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
         f"\U0001F4B0 Приток OI {m['oi4']*100:+.0f}%   \U0001F4C8 Объём \u00d7{m['spike']:.1f}   RSI {rsi_v}",
+        f"\U0001F517 Корреляция с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}",
         "",
     ]
     if tri=="ready":
@@ -464,6 +485,9 @@ def card_triangle(m, ex):
         lines.append(f"\u2022 цена закрылась выше крышки ${tt:.5g} \u2014 треугольник пробит")
         lines.append(f"\u2022 \u26A0\uFE0F бывают ЛОЖНЫЕ пробои (снятие стопов) \u2014 подтверждение: удержание выше ${tt:.5g} или ретест крышки сверху")
 
+    if m.get("btc_weak") and m["cor"]>=0.3:
+        lines.append("")
+        lines.append(f"\U0001F7E1 BTC слабеет ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть вниз")
     if m.get("watching"):
         zlo,zhi=m["watching"]; wk=m.get("watch_kind","зоне")
         lines.append("")
@@ -471,11 +495,37 @@ def card_triangle(m, ex):
         if tri=="breakout":
             lines.append("\u2022 вход не на проколе, а на ретесте крышки сверху \u2014 защита от ложного пробоя")
 
+    _n,_w=track_record("triangle")
+    if _n>0:
+        lines += ["", f"\U0001F4C8 Трек-рекорд ТРЕУГОЛЬНИКОВ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
     lines += ["", "\u2501"*16,
         "\u26A0\uFE0F Подсветка, не приказ. Стоп на Bybit \u2014 обязателен."]
     return "\n".join(lines)
 
 # ---------- ЛОГИРОВАНИЕ СИГНАЛОВ (для честной статистики, не для показа) ----------
+_track_cache={"ts":0,"data":{}}
+def track_record(sig_type):
+    """Возвращает (n_measured, n_win) для сигналов типа старше 24ч. Кэш 10 мин."""
+    import time as _t
+    if _t.time()-_track_cache["ts"]<600 and sig_type in _track_cache["data"]:
+        return _track_cache["data"][sig_type]
+    n=win=0
+    if os.path.exists(SIGNALS_FILE):
+        now=dt.datetime.now()
+        try:
+            with open(SIGNALS_FILE) as f:
+                for r in csv.DictReader(f):
+                    if r.get("type")!=sig_type: continue
+                    ts=dt.datetime.fromisoformat(r["ts"])
+                    if (now-ts).total_seconds()/3600 < 24: continue
+                    cur=bybit_price(r["coin"])
+                    if cur is None: continue
+                    n+=1
+                    if cur/float(r["price"])-1>0: win+=1
+        except Exception: pass
+    _track_cache["data"][sig_type]=(n,win); _track_cache["ts"]=_t.time()
+    return n,win
+
 def log_signal(coin, sig_type, price):
     """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
     временем — без этого невозможно посчитать реальный форвардный win rate
@@ -484,48 +534,107 @@ def log_signal(coin, sig_type, price):
         new=not os.path.exists(SIGNALS_FILE)
         with open(SIGNALS_FILE,"a",newline="") as f:
             w=csv.writer(f)
-            if new: w.writerow(["ts","coin","type","price"])
-            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, sig_type, f"{price:.6g}"])
+            if new: w.writerow(["ts","coin","type","price","btc_price"])
+            btcp=""
+            try:
+                bp=bybit_price("BTC")
+                if bp: btcp=f"{bp:.2f}"
+            except Exception: pass
+            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, sig_type, f"{price:.6g}", btcp])
     except Exception as e:
         print("log_signal:",e)
 
+def btc_block_stats():
+    """Форвардная проверка САМОГО рубильника: для каждой блокировки смотрим,
+    что BTC сделал через 4ч/24ч после неё. Если после блокировок BTC в среднем
+    падал — порог '2 из 6' адекватен (защита сработала). Если рос — порог ложный,
+    надо поднимать до 3. Это проверяет, не глушим ли мы сигналы зря."""
+    if not os.path.exists(BLOCKS_FILE):
+        return "Блокировок ещё не было — рубильник BTC пока не срабатывал."
+    rows=[]
+    try:
+        with open(BLOCKS_FILE) as f:
+            for r in csv.DictReader(f): rows.append(r)
+    except Exception: return "Не удалось прочитать журнал блокировок."
+    if not rows: return "Блокировок ещё не было."
+    now=dt.datetime.now()
+    btc_now=None
+    try: btc_now=bybit_price("BTC")
+    except Exception: pass
+    out=["\U0001F6D1 ПРОВЕРКА BTC-РУБИЛЬНИКА (была ли блокировка оправдана)\n",
+         f"Всего блокировок: {len(rows)}"]
+    for horizon_h,label in [(4,"4ч"),(24,"24ч")]:
+        moves=[]
+        for r in rows:
+            ts=dt.datetime.fromisoformat(r["ts"])
+            if (now-ts).total_seconds()/3600 < horizon_h: continue
+            bp0=r.get("btc_price","")
+            if bp0 and btc_now:
+                try: moves.append(btc_now/float(bp0)-1)
+                except Exception: pass
+        if not moves: continue
+        n=len(moves); avg=sum(moves)/n*100
+        fell=sum(1 for x in moves if x<0)
+        verdict=("\u2705 в среднем BTC падал — блокировки оправданы" if avg<0
+                 else "\u26A0\uFE0F BTC в среднем РОС после блокировок — порог, возможно, слишком чувствительный")
+        out.append(f"Через {label}: n={n}, BTC в среднем {avg:+.2f}%, падал в {fell}/{n} случаях\n   {verdict}")
+    if len(out)==2:
+        out.append("Пока нет блокировок старше 4ч для проверки — подожди.")
+    out.append("\n<i>Так через месяц будет видно: порог '2 из 6' адекватен или его надо поднять до 3.</i>")
+    return "\n".join(out)
+
 def compute_stats():
-    """Форвардная статистика: берём сигналы старше 4ч и 24ч, сверяем текущую
-    цену, считаем win rate (доля сигналов с положительным % на момент проверки)
-    и средний % изменения. Разбивка по типу сигнала (long / triangle)."""
+    """Форвардная статистика с БЕНЧМАРКОМ против BTC. Для каждого сигнала считаем
+    его % через 4ч/24ч И сравниваем со следующим: а сколько дал бы за то же время
+    просто BTC ('купил биток и ничего не делал'). Если сигналы НЕ обгоняют биток —
+    это не edge, а иллюзия. Кэшируем цены, чтобы не дёргать API по кругу."""
     if not os.path.exists(SIGNALS_FILE):
         return "Журнал сигналов пуст \u2014 статистики пока нет."
     rows=[]
     with open(SIGNALS_FILE) as f:
-        for r in csv.DictReader(f):
-            rows.append(r)
+        for r in csv.DictReader(f): rows.append(r)
     if not rows:
         return "Журнал сигналов пуст \u2014 статистики пока нет."
     now=dt.datetime.now()
-    out=["\U0001F4CA СТАТИСТИКА ПО СИГНАЛАМ (форвардная проверка)\n"]
+    price_cache={}
+    def cur_price(coin):
+        if coin in price_cache: return price_cache[coin]
+        p=None
+        try: p=bybit_price(coin)
+        except Exception: pass
+        price_cache[coin]=p; return p
+    btc_now=cur_price("BTC")
+    out=["\U0001F4CA СТАТИСТИКА ПО СИГНАЛАМ (форвард + бенчмарк BTC)\n"]
     for horizon_h, label in [(4,"4ч"),(24,"24ч")]:
         for sig_type in ("long","triangle"):
-            sample=[]
+            sig_pcts=[]; btc_pcts=[]
             for r in rows:
                 if r["type"]!=sig_type: continue
                 ts=dt.datetime.fromisoformat(r["ts"])
-                age_h=(now-ts).total_seconds()/3600
-                if age_h<horizon_h: continue
-                cur=bybit_price(r["coin"])
+                if (now-ts).total_seconds()/3600 < horizon_h: continue
+                cur=cur_price(r["coin"])
                 if cur is None: continue
                 entry=float(r["price"])
-                pct=cur/entry-1
-                sample.append(pct)
-            if not sample:
-                continue
-            n=len(sample)
-            wins=sum(1 for x in sample if x>0)
-            avg=sum(sample)/n*100
-            out.append(f"{sig_type.upper()} @ {label}: n={n}, win rate={wins/n*100:.0f}%, средний % {avg:+.2f}")
+                sig_pcts.append(cur/entry-1)
+                # бенчмарк: что дал бы BTC за тот же период
+                bp0=r.get("btc_price","")
+                if bp0 and btc_now:
+                    try: btc_pcts.append(btc_now/float(bp0)-1)
+                    except Exception: pass
+            if not sig_pcts: continue
+            n=len(sig_pcts); wins=sum(1 for x in sig_pcts if x>0)
+            avg=sum(sig_pcts)/n*100
+            line=f"{sig_type.upper()} @ {label}: n={n}, win {wins/n*100:.0f}%, средний {avg:+.2f}%"
+            if btc_pcts:
+                bavg=sum(btc_pcts)/len(btc_pcts)*100
+                edge=avg-bavg
+                verdict="\u2705 обгоняет BTC" if edge>0 else "\u274C ХУЖЕ, чем просто держать BTC"
+                line+=f"\n   BTC за тот же период: {bavg:+.2f}% \u2192 твой edge: {edge:+.2f}% {verdict}"
+            out.append(line)
     if len(out)==1:
-        out.append("Пока нет сигналов старше 4ч для анализа \u2014 подожди.")
-    out.append("\n\u26A0\uFE0F Малая выборка (n<30-50) НЕ даёт статистической значимости. "
-        "Не принимай решения по этим цифрам, пока n не станет большим.")
+        out.append("Пока нет сигналов старше 4ч \u2014 подожди накопления.")
+    out.append("\n\u26A0\uFE0F Малая выборка (n<30-50) НЕ значима. Смотри на edge против BTC, "
+        "а не на голый win rate: обгонять 'просто держать биток' \u2014 вот реальная планка.")
     return "\n".join(out)
 
 # ---------- сопровождение позиции ----------
@@ -564,6 +673,9 @@ def close_trade(coin):
         cc,_,_,_=klines(p["sym"],limit=2); price=cc[-1]
     except Exception: price=p["entry"]
     pnl=price/p["entry"]-1
+    # кулдаун после стоп-лосса: запоминаем убыточную сделку по монете
+    if pnl<0:
+        RECENT_LOSSES[coin]=time.time()
     new=not os.path.exists(TRADES)
     with open(TRADES,"a") as f:
         if new: f.write("entry_ts,coin,entry_price,exit_ts,exit_price,pnl_pct\n")
@@ -582,15 +694,67 @@ def enrich(sym):
     return out
 
 # ---------- скан ----------
+def btc_short_risk():
+    """Зеркальный шортовый набор по самому BTC. Возвращает (hits, reasons, price, cor_note).
+    Если hits>=BTC_RISK_MIN_HITS — риск серьёзной коррекции подтверждён."""
+    try:
+        closes,highs,lows,vols=klines("BTCUSDT",limit=120); time.sleep(0.12)
+        oic=open_interest("BTCUSDT",limit=30); time.sleep(0.12)
+    except Exception:
+        return 0,[],None
+    if len(closes)<60 or len(oic)<6: return 0,[],(closes[-1] if closes else None)
+    price=closes[-1]
+    p1=closes[-1]/closes[-2]-1
+    p4=closes[-1]/closes[-5]-1
+    oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
+    e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
+    vr=sum(vols[-4:]); vb=(sum(vols[-28:-4])/24*4) if len(vols)>=28 else vr
+    vspike=vr/vb if vb>0 else 0
+    r=rsi(closes[-40:],14)
+    reasons=[]
+    if p1<=BTC_DUMP_1H:      reasons.append(f"обвал за 1ч {p1*100:+.1f}%")
+    if p4<=BTC_DROP_4H:      reasons.append(f"падение за 4ч {p4*100:+.1f}%")
+    if oi4<=BTC_OI_DROP_4H:  reasons.append(f"отток OI {oi4*100:+.0f}% (деньги уходят)")
+    if price<e50 and e21<e50: reasons.append("тренд вниз (ниже EMA50)")
+    if vspike>=BTC_VOL_SPIKE and p4<0: reasons.append(f"растущий объём на падении (×{vspike:.1f})")
+    if r<BTC_RSI_OVERSOLD:   reasons.append(f"RSI перепродан ({r:.0f})")
+    return len(reasons),reasons,price
+
 def run_scan(cid, announce=False):
     if announce: tg_send(cid,"\U0001F50D Ищу лонг-сетапы, подожди пару минут...")
     try: coins=universe()
     except Exception as e: tg_send(cid,f"Ошибка данных: {e}"); return
     try:
-        btc,_,_,_=klines("BTCUSDT",limit=30); time.sleep(0.15)
+        btc,_,_,_=klines("BTCUSDT",limit=30); time.sleep(0.12)
         btc_dump=len(btc)>2 and (btc[-1]/btc[-2]-1)<BTC_DUMP_1H
         btc_p4=btc[-1]/btc[-5]-1 if len(btc)>=5 else 0.0
     except Exception: btc=[]; btc_dump=False; btc_p4=0.0
+
+    # ЗЕРКАЛЬНЫЙ ШОРТОВЫЙ ФИЛЬТР BTC — рубильник лонгов
+    global LAST_BTC_WARN
+    btc_hits,btc_reasons,btc_price=btc_short_risk()
+    if btc_hits>=BTC_RISK_MIN_HITS:
+        msg=("\U0001F6D1 <b>Сигналы приостановлены: БИТКОИН по шортовым фильтрам "
+             "готов к серьёзной коррекции</b>\n\n"
+             + "\n".join("\u2022 "+r for r in btc_reasons)
+             + (f"\n\nЦена BTC: <b>${btc_price:,.0f}</b>" if btc_price else "")
+             + "\n\n<i>Это РЕАКТИВНАЯ защита (по факту, не прогноз): BTC уже показывает "
+               "медвежьи признаки. Не предсказываю обвал — реагирую на то, что уже происходит. "
+               "Пока BTC валится, лонги по альтам опасны, жду стабилизации.</i>")
+        # ручной /scan — всегда; автоскан — не чаще раза в 30 мин
+        if announce or time.time()-LAST_BTC_WARN>30*60:
+            tg_send(cid,msg); LAST_BTC_WARN=time.time()
+        try:
+            new=not os.path.exists(BLOCKS_FILE)
+            with open(BLOCKS_FILE,"a",newline="") as bf:
+                wb=csv.writer(bf)
+                if new: wb.writerow(["ts","btc_price","hits","reasons"])
+                wb.writerow([dt.datetime.now().isoformat(timespec="seconds"),
+                             f"{btc_price:.2f}" if btc_price else "", btc_hits, "; ".join(btc_reasons)])
+        except Exception as e: print("blocks:",e)
+        return
+    # 1 признак — мягкое предупреждение в карточки коррелированных монет
+    btc_weak = btc_reasons[0] if btc_hits==1 else None
 
     shown=0
     now=time.time()
@@ -603,14 +767,23 @@ def run_scan(cid, announce=False):
             continue
         if len(closes)<MIN_BARS: continue
         m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4)
+        if m: m["btc_weak"]=btc_weak
         if not m: continue
         SYM_CACHE[coin]=sym
 
         if not long_ok(m): continue
         last=LAST_ALERT.get(coin,0)
-        if now-last<COOLDOWN_H*3600: continue
+        # базовый кулдаун; если по монете недавно был стоп-лосс — кулдаун длиннее
+        cd=COOLDOWN_H*3600
+        loss_ts=RECENT_LOSSES.get(coin,0)
+        if loss_ts and now-loss_ts < COOLDOWN_H*LOSS_COOLDOWN_MULT*3600:
+            cd=COOLDOWN_H*LOSS_COOLDOWN_MULT*3600
+        if now-last<cd: continue
 
         ex=enrich(sym)
+        # FUNDING-CUTOFF: экстремальный funding = перегрев лонгами перед каскадом. Полный отказ.
+        if abs(ex.get("funding",0))>=FUNDING_CUTOFF:
+            continue
         by=bybit_price(coin)
         if by: m["bybit"]=by
 
@@ -692,7 +865,7 @@ def check_watchlist(chat):
 # ---------- чат ----------
 def ensure_dirs():
     """Создаёт директории для журналов, если их нет (нужно для volume /data)."""
-    for path in (TRADES, SIGNALS_FILE, CHAT_FILE):
+    for path in (TRADES, SIGNALS_FILE, CHAT_FILE, BLOCKS_FILE):
         d=os.path.dirname(path)
         if d and not os.path.exists(d):
             try: os.makedirs(d, exist_ok=True)
@@ -759,6 +932,8 @@ def main():
                 elif text.startswith("/pos"):
                     if POSITIONS: tg_send(cid,"Открытые: "+", ".join(POSITIONS))
                     else: tg_send(cid,"Открытых позиций нет.")
+                elif text.startswith("/btcstats"):
+                    tg_send(cid, btc_block_stats())
                 elif text.startswith("/stats"):
                     tg_send(cid, compute_stats())
                 elif text.startswith("/bybit"):
