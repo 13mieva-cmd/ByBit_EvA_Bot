@@ -296,53 +296,29 @@ def _fit_line(pts):
     return float(slope), float(intercept)
 
 def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
-    """Настоящий треугольник: сходящиеся трендлинии — нисходящая линия
-    сопротивления через swing-хаи (наклон < 0) И восходящая линия поддержки
-    через swing-лои (наклон > 0), которые СБЛИЖАЮТСЯ (конвергенция), а цена
-    находится ВНУТРИ этого сужающегося клина.
-    Возвращает (tri, tri_top, res_now, sup_now):
-      tri in (None,'forming','ready','breakout')
-      tri_top — текущий уровень сопротивления (для совместимости с картой)
-      res_now, sup_now — текущие значения верхней/нижней линии треугольника
-    """
+    """УПРОЩЁННЫЙ детектор: тренд вверх уже проверен воротами long_ok, поэтому
+    треугольнику достаточно поймать ФОРМИРОВАНИЕ — сужение диапазона (консолидация)
+    после движения. Без жёсткой геометрии сходящихся трендлиний (она отсекала почти всё).
+    Стадии: forming (сужается) -> ready (цена у верха) -> breakout (пробой верха).
+    Возвращает (tri, tri_top, res_now, sup_now) для совместимости."""
     n=len(closes)
     if n<win+5: return None,price,price,price
-    H=highs[-win:]; L=lows[-win:]; C=closes[-win:]
-    hi_pts=_swing_points(H, True, swing_win)
-    lo_pts=_swing_points(L, False, swing_win)
-    if len(hi_pts)<2 or len(lo_pts)<2: return None,price,price,price
-
-    res=_fit_line(hi_pts); sup=_fit_line(lo_pts)
-    if not res or not sup: return None,price,price,price
-    r_slope,r_int=res; s_slope,s_int=sup
-
-    # обе линии должны сходиться: сопротивление падает ИЛИ хотя бы почти плоское
-    # снизу, а поддержка растёт (либо наоборот при желании — тут строго под лонг:
-    # растущая поддержка + падающее/плоское сопротивление = сужающийся клин вверх)
-    if not (r_slope<=0.0005*price/win and s_slope>=-0.0005*price/win):
-        return None,price,price,price
-    if not (s_slope>r_slope):  # линии должны реально сходиться, а не идти параллельно/расходиться
-        return None,price,price,price
-
-    last_x=win-1
-    res_now=r_slope*last_x+r_int
-    sup_now=s_slope*last_x+s_int
-    if res_now<=sup_now:  # клин уже "закрылся" геометрически — треугольник не валиден
-        return None,price,price,price
-
-    width_now=res_now-sup_now
-    x0=hi_pts[0][0] if hi_pts[0][0]<lo_pts[0][0] else lo_pts[0][0]
-    res_0=r_slope*x0+r_int; sup_0=s_slope*x0+s_int
-    width_0=res_0-sup_0
-    contracting = width_0>0 and width_now < width_0*0.7  # диапазон сузился минимум на 30%
-
+    H=highs[-win:]; L=lows[-win:]
+    # сопротивление = максимум диапазона (верхняя граница консолидации, без последней свечи)
+    res_now=max(H[:-1]) if len(H)>1 else max(H)
+    sup_now=min(L[:-1]) if len(L)>1 else min(L)
+    # сужение: диапазон второй половины окна уже, чем первой (мягкий порог 0.85)
+    half=win//2
+    w_early=max(H[:half])-min(L[:half])
+    w_late =max(H[half:-1] or H[half:])-min(L[half:-1] or L[half:])
+    contracting = w_early>0 and w_late < w_early*0.85    # сузился хотя бы на 15%
     if not contracting:
         return None,price,price,price
-
+    # стадии по положению цены относительно верхней границы
     if price>res_now:
         return "breakout",res_now,res_now,sup_now
-    dist_to_res=(res_now-price)/price if price>0 else 1
-    if dist_to_res<=0.02:
+    dist=(res_now-price)/price if price>0 else 1
+    if dist<=0.02:
         return "ready",res_now,res_now,sup_now
     return "forming",res_now,res_now,sup_now
 
@@ -688,10 +664,11 @@ def track_record(sig_type):
                     if r.get("type")!=sig_type: continue
                     ts=dt.datetime.fromisoformat(r["ts"])
                     if (now-ts).total_seconds()/3600 < 24: continue
-                    cur=bybit_price(r["coin"])
-                    if cur is None: continue
+                    sym=r["coin"] if r["coin"].endswith("USDT") else r["coin"]+"USDT"
+                    fwd=price_at_cached(sym, ts+dt.timedelta(hours=24))  # цена через 24ч
+                    if fwd is None: continue
                     n+=1
-                    if cur/float(r["price"])-1>0: win+=1
+                    if fwd/float(r["price"])-1>0: win+=1
         except Exception: pass
     _track_cache["data"][sig_type]=(n,win); _track_cache["ts"]=_t.time()
     return n,win
@@ -781,6 +758,28 @@ def btc_block_stats():
     out.append("\n<i>Так через месяц будет видно: порог '2 из 6' адекватен или его надо поднять до 3.</i>")
     return "\n".join(out)
 
+def price_at(symbol, target_dt):
+    """Цена (close) свечи, ближайшей к моменту target_dt — то есть цена ИМЕННО
+    через N часов после сигнала, а не 'сейчас'. Берём часовые свечи Bybit по времени.
+    None если данных нет."""
+    try:
+        start_ms=int(target_dt.timestamp()*1000)
+        res=bget("/v5/market/kline", {"category":"linear","symbol":symbol,
+                 "interval":"60","start":start_ms,"limit":2})
+        lst=res.get("list") or []
+        if not lst: return None
+        # Bybit отдаёт новые->старые; берём свечу, чей старт ближе всего к target
+        best=min(lst, key=lambda x: abs(int(x[0])-start_ms))
+        return float(best[4])   # close
+    except Exception:
+        return None
+
+_price_at_cache={}
+def price_at_cached(symbol, target_dt):
+    key=(symbol, int(target_dt.timestamp()//3600))
+    if key in _price_at_cache: return _price_at_cache[key]
+    p=price_at(symbol, target_dt); _price_at_cache[key]=p; return p
+
 def compute_stats():
     """Форвардная статистика с БЕНЧМАРКОМ против BTC. Для каждого сигнала считаем
     его % через 4ч/24ч И сравниваем со следующим: а сколько дал бы за то же время
@@ -810,15 +809,19 @@ def compute_stats():
                 if r["type"]!=sig_type: continue
                 ts=dt.datetime.fromisoformat(r["ts"])
                 if (now-ts).total_seconds()/3600 < horizon_h: continue
-                cur=cur_price(r["coin"])
-                if cur is None: continue
+                target=ts+dt.timedelta(hours=horizon_h)          # ИМЕННО через N часов
+                sym=r["coin"] if r["coin"].endswith("USDT") else r["coin"]+"USDT"
+                fwd=price_at_cached(sym, target)                 # цена через N часов
+                if fwd is None: continue
                 entry=float(r["price"])
-                sig_pcts.append(cur/entry-1)
-                # бенчмарк: что дал бы BTC за тот же период
+                sig_pcts.append(fwd/entry-1)
+                # бенчмарк: что дал бы BTC за ТОТ ЖЕ период (через N часов)
                 bp0=r.get("btc_price","")
-                if bp0 and btc_now:
-                    try: btc_pcts.append(btc_now/float(bp0)-1)
-                    except Exception: pass
+                if bp0:
+                    btc_fwd=price_at_cached("BTCUSDT", target)
+                    if btc_fwd:
+                        try: btc_pcts.append(btc_fwd/float(bp0)-1)
+                        except Exception: pass
             if not sig_pcts: continue
             n=len(sig_pcts); wins=sum(1 for x in sig_pcts if x>0)
             avg=sum(sig_pcts)/n*100
