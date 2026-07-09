@@ -296,25 +296,32 @@ def _fit_line(pts):
     return float(slope), float(intercept)
 
 def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
-    """УПРОЩЁННЫЙ детектор: тренд вверх уже проверен воротами long_ok, поэтому
-    треугольнику достаточно поймать ФОРМИРОВАНИЕ — сужение диапазона (консолидация)
-    после движения. Без жёсткой геометрии сходящихся трендлиний (она отсекала почти всё).
-    Стадии: forming (сужается) -> ready (цена у верха) -> breakout (пробой верха).
-    Возвращает (tri, tri_top, res_now, sup_now) для совместимости."""
+    """ВОСХОДЯЩИЙ треугольник по классике (LiteFinance): плоский горизонтальный
+    ВЕРХ (сопротивление, к которому цена подходит несколько раз) + РАСТУЩЕЕ дно
+    (минимумы повышаются). Верх НЕ должен расти — иначе это восходящий КЛИН
+    (разворотный, нам не нужен). Тренд вверх уже гарантируют ворота long_ok.
+    Стадии: forming -> ready (у сопротивления) -> breakout (пробой).
+    Возвращает (tri, tri_top, res_now, sup_now)."""
     n=len(closes)
     if n<win+5: return None,price,price,price
     H=highs[-win:]; L=lows[-win:]
-    # сопротивление = максимум диапазона (верхняя граница консолидации, без последней свечи)
-    res_now=max(H[:-1]) if len(H)>1 else max(H)
-    sup_now=min(L[:-1]) if len(L)>1 else min(L)
-    # сужение: диапазон второй половины окна уже, чем первой (мягкий порог 0.85)
     half=win//2
-    w_early=max(H[:half])-min(L[:half])
-    w_late =max(H[half:-1] or H[half:])-min(L[half:-1] or L[half:])
-    contracting = w_early>0 and w_late < w_early*0.85    # сузился хотя бы на 15%
-    if not contracting:
+    # --- ВЕРХ: сопротивление (максимумы обеих половин примерно на одном уровне = плоский) ---
+    top_early=max(H[:half]); top_late=max(H[half:-1] or H[half:])
+    res_now=max(top_early, top_late)
+    # плоский верх: поздний максимум НЕ выше раннего более чем на 1.5% (иначе верх растёт = клин)
+    flat_top = top_late <= top_early*1.015
+    # --- ДНО: поддержка растёт (минимум поздней половины ВЫШЕ минимума ранней) ---
+    bot_early=min(L[:half]); bot_late=min(L[half:-1] or L[half:])
+    rising_bottom = bot_late > bot_early*1.003          # дно поднялось хотя бы на 0.3%
+    sup_now=bot_late
+    # --- сужение (следствие плоского верха + растущего дна) ---
+    w_early=top_early-bot_early; w_late=top_late-bot_late
+    contracting = w_early>0 and w_late < w_early*0.9
+    # все три классических признака восходящего треугольника
+    if not (flat_top and rising_bottom and contracting):
         return None,price,price,price
-    # стадии по положению цены относительно верхней границы
+    # стадии
     if price>res_now:
         return "breakout",res_now,res_now,sup_now
     dist=(res_now-price)/price if price>0 else 1
