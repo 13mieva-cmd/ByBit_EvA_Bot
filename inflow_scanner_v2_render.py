@@ -62,7 +62,8 @@ EARLY_WATCH_HOURS=6        # сколько следим за развитием
 EARLY_WATCH_CHECK_SEC=60   # как часто проверять развитие
 EARLY15_COOLDOWN_H=2
 EARLY_COMPRESS_MAX=0.7      # текущий диапазон < 70% медианного = сжатие
-EARLY_VOL_MIN=1.2           # объём пробойной свечи >= 1.2x среднего
+EARLY_RVOL_MIN=3.0          # RVOL: объём >= 3x нормы = начало крупного движения (не мелкий шум)
+EARLY_VOL_MIN=2.5           # объём пробойной свечи >= 2.5x среднего (было 1.2 — ловило шум)
 EARLY_RSI_MAX=68            # строже обычного (78): не ловим сжатие перед разворотом вниз
 EARLY_COOLDOWN_H=4          # антиспам по раннему сигналу
 LAST_EARLY={}               # coin -> ts последнего раннего сигнала
@@ -235,6 +236,28 @@ def ema(v,span):
     for x in v[1:]: e=a*x+(1-a)*e
     return e
 
+def ema_series(v, span):
+    """EMA как ряд (нужно для MACD)."""
+    a=2/(span+1); out=[v[0]]
+    for x in v[1:]: out.append(a*x+(1-a)*out[-1])
+    return out
+
+def macd_hist(closes, fast=12, slow=26, signal=9):
+    """MACD-гистограмма (12/26/9) на часовых. >0 = бычий момент, <0 = медвежий.
+    ЛАГОВЫЙ индикатор (производная цены) — используется ТОЛЬКО как справка-подтверждение,
+    не как сигнал входа и не как ворота."""
+    if len(closes)<slow+signal+2: return 0.0
+    ef=ema_series(closes,fast); es=ema_series(closes,slow)
+    macd_line=[ef[i]-es[i] for i in range(len(closes))]
+    sig=ema_series(macd_line[slow:], signal)   # сигнальная по стабильной части
+    if not sig: return 0.0
+    return macd_line[-1]-sig[-1]               # гистограмма = MACD - сигнальная
+
+def roc(closes, period=12):
+    """Rate of Change за period часов, %. >0 = цена росла. Справка-подтверждение."""
+    if len(closes)<period+1 or closes[-period-1]==0: return 0.0
+    return (closes[-1]/closes[-period-1]-1)*100
+
 def corr(a,b):
     n=min(len(a),len(b))
     if n<10: return 0.0
@@ -391,8 +414,8 @@ def detect_early_15m(c15, h15, l15, v15):
     # 3 ЗЕЛЁНЫЕ свечи подряд на 15м (движение реальное, а не одна свеча-выброс)
     # зелёная = close выше close предыдущей свечи
     three_green = len(c15)>=4 and c15[-1]>c15[-2]>c15[-3]>c15[-4]
-    started = vspike>=1.8 and 0.008<=move<=0.08 and three_green
-    return started, move
+    started = vspike>=EARLY_RVOL_MIN and 0.008<=move<=0.08 and three_green   # RVOL>=3 = реальный старт
+    return started, move, vspike
 
 def detect_compression(highs, lows, closes, vols):
     """РАННИЙ детектор: цена сжалась в узкий диапазон, и последняя свеча только что
@@ -425,7 +448,7 @@ def detect_compression(highs, lows, closes, vols):
     vol_ok = vols[-1] >= vb*EARLY_VOL_MIN if vb>0 else False
     return (compressed and broke_up and vol_ok), zone_hi, zone_lo
 
-def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None):
+def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None):
     if len(closes)<MIN_BARS or len(oic)<25: return None
     price=closes[-1]
     p4=price/closes[-5]-1 if len(closes)>=5 else 0
@@ -456,18 +479,31 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None):
 
     hi7=max(highs[-168:]) if len(highs)>=168 else max(highs)
     dd=price/hi7-1
-    turn=sum(vols[-24:])*price
+    # оборот за сутки: точный turnover24h с биржи (если передан), иначе оценка
+    turn = turn24 if (turn24 and turn24>0) else sum(vols[-24:])*price
+    # СУТОЧНЫЙ RVOL: сегодняшний 24ч-объём против среднего за доступную историю
+    vol24_now=sum(vols[-24:])
+    if len(vols)>=48:
+        # средний 24ч-объём по скользящим блокам (в монетах), исключая последние сутки
+        blocks=[sum(vols[i:i+24]) for i in range(0, len(vols)-24, 24)]
+        vol24_avg=sum(blocks)/len(blocks) if blocks else vol24_now
+    else:
+        vol24_avg=vol24_now
+    daily_rvol = vol24_now/vol24_avg if vol24_avg>0 else 1.0
     cor=corr(btc,closes)
     r=rsi(closes[-40:],14)
     btc_beta = cor>=HI_CORR and btc_p4>0 and abs(p4-btc_p4)<0.01
     tf=sum([oi1>0.01, oi4>=OI_4H_MIN, oi24>0.10])
     brk=price>max(highs[-168:-1]) if len(highs)>168 else False
     atrr=atr_ratio(highs,lows,closes)   # режим рынка: <1 = сжатие/чоп
+    mh=macd_hist(closes)                # MACD-гистограмма (справка-подтверждение)
+    rc=roc(closes,12)                   # ROC за 12ч, % (справка)
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
-        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr,tri_mtf=tri_mtf)
+        flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr,tri_mtf=tri_mtf,
+        macd_h=mh,roc=rc,daily_rvol=daily_rvol)
 
 def long_ok(m):
     return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
@@ -511,7 +547,8 @@ def card_long(m, ex):
         f"\U0001F4B0 Приток OI {m['oi4']*100:+.0f}% {_bar(m['oi4']/0.20,5)}\n"
         f"\U0001F4C8 Объём \u00d7{m['spike']:.1f} {_bar(m['spike']/5,5)}\n"
         f"\U0001F321 RSI {rsi_v} {_bar(rsi_v/100,5)}\n"
-        f"\U0001F4A7 Ликвидн. ${m['turn']/1e6:.0f}M {_bar(min(m['turn']/100e6,1),5)}\n"
+        f"\U0001F4A7 Ликвидн. ${m['turn']/1e6:.0f}M/сутки {_bar(min(m['turn']/100e6,1),5)}\n"
+        f"\U0001F525 Объём сегодня \u00d7{m.get('daily_rvol',1):.1f} от обычного {_bar(min(m.get('daily_rvol',1)/10,1),5)}\n"
         f"\u26A1 Волатильность {m.get('atrr',1.0)*100:.0f}% от нормы {_bar(min(m.get('atrr',1.0),1.5)/1.5,5)}\n"
         f"\U0001F517 Корр. с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}"
     )
@@ -545,6 +582,17 @@ def card_long(m, ex):
     stop_lines.append(f"\U0001F6E1 <b>Умный стоп: под ${smart_stop:.5g}</b> (за кластером лонг-ликвидаций ${long_cluster:.5g}, риск ~{risk:.1f}%)")
     stop_lines.append("\u2022 <i>стоп ЗА кластером, а не внутри — чтобы не выбило на стоп-ханте перед разворотом</i>")
     stop_lines.append("<i>точных стопов публичный API не даёт \u2014 это оценка по уровням + типовому плечу (как CoinGlass)</i>")
+
+    # --- MACD/ROC: вспомогательное подтверждение момента (НЕ сигнал, НЕ ворота) ---
+    mh=m.get("macd_h",0); rc=m.get("roc",0)
+    macd_txt="бычий \u2713" if mh>0 else "медвежий \u2717"
+    roc_txt=f"{rc:+.1f}%"
+    stop_lines.append("")
+    stop_lines.append(f"\U0001F4C9 Момент (справка): MACD {macd_txt}  \u00b7  ROC(12ч) {roc_txt}")
+    if mh>0 and rc>0:
+        stop_lines.append("\u2022 <i>MACD и ROC оба за рост — момент подтверждён (но это лаговые индикаторы, не гарантия)</i>")
+    elif mh<=0 or rc<=0:
+        stop_lines.append("\u2022 <i>момент по MACD/ROC смешанный — подтверждения нет, будь осторожнее</i>")
 
     by=m.get("bybit")
     if by:
@@ -1022,7 +1070,9 @@ def run_scan(cid, announce=False):
             c4,h4,l4,_=klines_tf(sym,"240",limit=120); time.sleep(0.12)
             tri_mtf["4ч"]=detect_triangle(h4,l4,c4,c4[-1])[0]
         except Exception: tri_mtf["4ч"]=None
-        m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4,tri_mtf=tri_mtf)
+        ti=ticker_info(sym)
+        turn24=ti["turnover"] if ti else None
+        m=core(coin,closes,highs,lows,vols,oic,btc,btc_p4,tri_mtf=tri_mtf,turn24=turn24)
         if m: m["btc_weak"]=btc_weak
         if not m: continue
         SYM_CACHE[coin]=sym
@@ -1036,9 +1086,9 @@ def run_scan(cid, announce=False):
         # === СТАДИЯ 1: РАННЕЕ ОБНАРУЖЕНИЕ НА 15м (движение началось, час подтвердит позже) ===
         if EARLY15_ENABLED and c15 and v15:
             try:
-                started, mv = detect_early_15m(c15,h15,l15,v15)
+                started, mv, rvol = detect_early_15m(c15,h15,l15,v15)
             except Exception:
-                started, mv = False,0
+                started, mv, rvol = False,0,0
             if (started and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
                     and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
                     and abs(ex.get("funding",0))<FUNDING_CUTOFF):
@@ -1050,7 +1100,7 @@ def run_scan(cid, announce=False):
                     EARLY_WATCH[coin]=dict(sym=sym, ts=now, v0=v0,
                         lsr0=m.get("ls_ratio"), fund0=ex.get("funding",0), price0=m["price"])
                     tg_send(cid,
-                        f"\U0001F440 <b>{coin}: РАННЕЕ (15м)</b> — движение началось (+{mv*100:.1f}% на 15м, объём вырос)\n"
+                        f"\U0001F440 <b>{coin}: РАННЕЕ (15м)</b> — движение началось (+{mv*100:.1f}% на 15м, RVOL \u00d7{rvol:.1f})\n"
                         f"\U0001F4B5 ${m['price']:.5g}  \u00b7  корр. с BTC {m['cor']*100:.0f}%\n"
                         f"\u23F3 <i>Взял на живое отслеживание — буду сигналить о развитии (объём, лонгисты, funding). "
                         f"Если через 1-2ч придёт полный \U0001F7E2 ЛОНГ-сигнал — движение подтвердилось деньгами.</i>")
