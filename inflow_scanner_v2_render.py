@@ -1027,6 +1027,12 @@ def run_scan(cid, announce=False):
         if not m: continue
         SYM_CACHE[coin]=sym
 
+        # доп.данные нужны и ранним сигналам, и основному — считаем ЗДЕСЬ, до сигналов
+        ex=enrich(sym)
+        m["ls_ratio"]=long_short_ratio(sym); time.sleep(0.1)
+        by=bybit_price(coin)
+        if by: m["bybit"]=by
+
         # === СТАДИЯ 1: РАННЕЕ ОБНАРУЖЕНИЕ НА 15м (движение началось, час подтвердит позже) ===
         if EARLY15_ENABLED and c15 and v15:
             try:
@@ -1034,7 +1040,8 @@ def run_scan(cid, announce=False):
             except Exception:
                 started, mv = False,0
             if (started and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
-                    and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS):
+                    and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
+                    and abs(ex.get("funding",0))<FUNDING_CUTOFF):
                 le15=LAST_EARLY15.get(coin,0)
                 if now-le15>=EARLY15_COOLDOWN_H*3600:
                     LAST_EARLY15[coin]=now
@@ -1058,7 +1065,8 @@ def run_scan(cid, announce=False):
                 broke, zhi, zlo = False,0,0
             # строгие доп. условия: RSI не перегрет, не падающий нож, не в чопе, BTC не валится
             if (broke and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
-                    and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS):
+                    and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
+                    and abs(ex.get("funding",0))<FUNDING_CUTOFF):
                 le=LAST_EARLY.get(coin,0)
                 if now-le>=EARLY_COOLDOWN_H*3600:
                     LAST_EARLY[coin]=now
@@ -1075,13 +1083,9 @@ def run_scan(cid, announce=False):
             cd=COOLDOWN_H*LOSS_COOLDOWN_MULT*3600
         if now-last<cd: continue
 
-        ex=enrich(sym)
         # FUNDING-CUTOFF: экстремальный funding = перегрев лонгами перед каскадом. Полный отказ.
         if abs(ex.get("funding",0))>=FUNDING_CUTOFF:
             continue
-        by=bybit_price(coin)
-        if by: m["bybit"]=by
-        m["ls_ratio"]=long_short_ratio(sym); time.sleep(0.1)   # карта стопов: перекос толпы
 
         lv=m.get("lvl")
         if lv and abs(lv["dist"])<0.03 and lv["touches"]>=3:
