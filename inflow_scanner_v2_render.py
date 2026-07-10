@@ -37,7 +37,7 @@ import requests
 BYBIT="https://api.bybit.com"; QUOTE="USDT"
 MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
-OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=5_000_000
+OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=30_000_000
 BTC_DUMP_1H=-0.02; HI_CORR=0.8
 # --- зеркальный ШОРТОВЫЙ набор для BTC (рубильник лонгов по альтам) ---
 BTC_DROP_4H=-0.02      # падение BTC за 4ч больше 2%
@@ -49,6 +49,7 @@ LAST_BTC_WARN=0        # антиспам предупреждения при а
 PRICE_UP_4H_MIN=0.005
 RSI_MAX=78
 MIN_BARS=200
+MIN_AGE_DAYS=180        # монете не меньше полугода (отсекаем свежие листинги)
 COOLDOWN_H=4
 FUNDING_CUTOFF=0.0005   # 0.05% за интервал — перегрев лонгами, жёсткий отказ
 ATR_MIN_RATIO=0.6       # текущий ATR(14) < 60% средней за 30 баров = сжатие/чоп, сигнал не идёт
@@ -368,6 +369,16 @@ def atr_ratio(highs, lows, closes):
     if avg==0: return 1.0
     return cur/avg
 
+def coin_age_days(symbol):
+    """Возраст монеты в днях по числу доступных ДНЕВНЫХ свечей. Свежие листинги
+    (< полугода) отсекаем — у них нет истории, паттерны/уровни недостоверны."""
+    try:
+        res=bget("/v5/market/kline", {"category":"linear","symbol":symbol,
+                 "interval":"D","limit":400})
+        return len(res.get("list") or [])
+    except Exception:
+        return 999   # если не смогли проверить — не блокируем
+
 def detect_early_15m(c15, h15, l15, v15):
     """РАННЕЕ обнаружение на 15м: движение только НАЧАЛОСЬ — всплеск объёма на 15м +
     цена растёт за последние 15м-свечи. Ловит старт на 1-2 свече, ДО того как
@@ -377,7 +388,10 @@ def detect_early_15m(c15, h15, l15, v15):
     vb=sum(v15[-16:-4])/12 if len(v15)>=16 else (sum(v15)/len(v15))
     vspike=(sum(v15[-4:])/4)/vb if vb>0 else 0     # объём последних 4х15м vs среднего
     move=c15[-1]/c15[-6]-1 if len(c15)>=6 else 0    # рост за ~1.5ч на 15м
-    started = vspike>=1.8 and 0.008<=move<=0.08     # объём вырос + цена пошла (но не улетела)
+    # 3 ЗЕЛЁНЫЕ свечи подряд на 15м (движение реальное, а не одна свеча-выброс)
+    # зелёная = close выше close предыдущей свечи
+    three_green = len(c15)>=4 and c15[-1]>c15[-2]>c15[-3]>c15[-4]
+    started = vspike>=1.8 and 0.008<=move<=0.08 and three_green
     return started, move
 
 def detect_compression(highs, lows, closes, vols):
@@ -992,6 +1006,12 @@ def run_scan(cid, announce=False):
         except Exception:
             continue
         if len(closes)<MIN_BARS: continue
+        # отсекаем свежие листинги (< полугода) — только для монет, прошедших предфильтр
+        # проверяем возраст 1 раз и кэшируем в SYM_CACHE-подобном словаре
+        if coin not in globals().setdefault("_age_ok",{}):
+            globals()["_age_ok"][coin] = coin_age_days(sym)>=MIN_AGE_DAYS
+            time.sleep(0.1)
+        if not globals()["_age_ok"][coin]: continue
         # мультитаймфрейм-статус треугольника (справка): 15м / 1ч / 4ч
         tri_mtf={"1ч": detect_triangle(highs,lows,closes,closes[-1])[0]}
         try:
