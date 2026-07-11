@@ -718,6 +718,8 @@ def card_long(m, ex):
     lines.append(f"\u2022 старый хай (уровень): ${oh:.5g}{hi_note}")
     lines.append("\u2022 выгоднее лимитка в зоне отката, чем по рынку на пике")
 
+    ch=chain_line(m["coin"],"long")
+    if ch: lines += ["", ch, "<i>по монете уже были сигналы — движение развивается по этапам (подтверждение)</i>"]
     _n,_w=track_record("long")
     if _n>0:
         lines += ["", f"\U0001F4C8 Трек-рекорд ЛОНГ-сигналов: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
@@ -842,6 +844,8 @@ def card_reversal(m, ex, details):
         "\u2022 <b>жди закрытия следующей свечи выше текущей</b> \u2014 только тогда вход",
         f"\u2022 стоп под минимумом разворота: ${details.get('recent_low', m['price']):.5g}",
     ]
+    ch=chain_line(m["coin"],"reversal")
+    if ch: lines += ["", ch]
     _n,_w=track_record("reversal")
     if _n>0:
         lines += ["", f"\U0001F4C8 Трек-рекорд РАЗВОРОТОВ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
@@ -887,6 +891,8 @@ def card_early15(m, ex, mv, rvol, slope, three_green_ok, btc_hits):
         "\u23F3 <b>ЧТО ДАЛЬШЕ:</b> взял на живое отслеживание (объём/лонгисты/funding). "
         "Если через 1-2ч придёт полный \U0001F7E2 ЛОНГ-сигнал \u2014 движение подтвердилось деньгами (OI+объём за 4ч).",
     ]
+    ch=chain_line(m["coin"],"early15")
+    if ch: L += ["", ch]
     _n,_w=track_record("early15")
     if _n>0:
         L += ["", f"\U0001F4C8 Трек-рекорд РАННИХ 15м: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
@@ -923,6 +929,40 @@ def card_early(m, zone_hi, zone_lo):
         "\u26A0\uFE0F Экспериментальный сигнал на проверке. Пойдёт ли вверх \u2014 НЕ гарантия. "
         "Стоп обязателен, размер пробный."]
     return "\n".join(lines)
+
+SIGNAL_CHAIN_HOURS=12   # окно, в котором сигналы считаются одной цепочкой развития
+
+def signal_chain(coin, exclude_type):
+    """Ищет недавние сигналы ДРУГИХ типов по этой монете за SIGNAL_CHAIN_HOURS.
+    Возвращает список (тип, часов_назад) — цепочку развития движения.
+    Идея: reversal -> early15 -> long по одной монете = разворот перешёл в тренд,
+    сильное подтверждение."""
+    if not os.path.exists(SIGNALS_FILE): return []
+    now=dt.datetime.now(); out=[]
+    try:
+        with open(SIGNALS_FILE) as f:
+            for r in csv.DictReader(f):
+                if r.get("coin")!=coin: continue
+                if r.get("type")==exclude_type: continue
+                ts=dt.datetime.fromisoformat(r["ts"])
+                hrs=(now-ts).total_seconds()/3600
+                if 0<=hrs<=SIGNAL_CHAIN_HOURS:
+                    out.append((r["type"], hrs))
+    except Exception: return []
+    # последние по каждому типу
+    seen={}
+    for t,h in sorted(out, key=lambda x:x[1]):
+        if t not in seen: seen[t]=h
+    return [(t,h) for t,h in seen.items()]
+
+def chain_line(coin, exclude_type):
+    """Строка-подсказка о цепочке сигналов для карточки (или пусто)."""
+    ch=signal_chain(coin, exclude_type)
+    if not ch: return None
+    names={"long":"🟢 лонг","triangle":"🔺 треугольник","early":"🔵 ранний",
+           "early15":"👀 ранний-15м","reversal":"🔻→🚀 разворот"}
+    parts=[f"{names.get(t,t)} ({h:.0f}ч назад)" for t,h in ch]
+    return "\U0001F517 <b>Цепочка по монете:</b> " + " → ".join(parts) + " → <b>сейчас</b>"
 
 def log_signal(coin, sig_type, price):
     """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
@@ -1124,7 +1164,7 @@ def night_mult():
     """Множитель порога объёма в тихие часы UTC (ночь 0-6 UTC + выходные) —
     тогда база объёма ниже, RVOL завышен, поэтому требуем выше порог."""
     import datetime as _dt
-    u=_dt.datetime.utcnow()
+    u=_dt.datetime.now(_dt.timezone.utc)   # timezone-aware (utcnow() устарел в 3.12+)
     quiet = u.hour<6 or u.weekday()>=5   # ночь UTC или сб/вс
     return NIGHT_VOL_MULT if quiet else 1.0
 
