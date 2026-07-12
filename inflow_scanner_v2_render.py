@@ -51,6 +51,10 @@ BTC_RSI_OVERSOLD=30    # перепроданность
 BTC_RISK_MIN_HITS=2    # сколько признаков = блок лонгов
 LAST_BTC_WARN=0        # антиспам предупреждения при автоскане
 PRICE_UP_4H_MIN=0.005
+OI_1H_MIN=0.02           # БЫСТРЫЙ триггер: OI +2% за 1 час (приток только начался)
+SPIKE_FAST_MIN=2.0       # объём последних 1-2 свечей >= 2x нормы (свежий всплеск)
+MAX_EXT_ENTRY=0.08       # ПОЗДНО: цена >8% выше EMA21 — движение выдохлось, сигнал НЕ шлём
+MAX_MOVE_4H=0.10         # ПОЗДНО: уже +10% за 4ч — конец движения, не гонимся
 RSI_MAX=78
 MIN_BARS=200
 MIN_AGE_DAYS=180        # монете не меньше полугода (отсекаем свежие листинги)
@@ -493,6 +497,9 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     oi24=oic[-1]/oic[-25]-1 if oic[-25]>0 else 0
     vr=sum(vols[-4:]); vb=(sum(vols[-28:-4])/24*4) if len(vols)>=28 else vr
     spike=vr/vb if vb>0 else 0
+    # СВЕЖИЙ всплеск: последние 1-2 свечи против нормы (ловит приток, начавшийся ЧАС назад)
+    vb1=vb/4 if vb>0 else 0                      # норма на одну свечу
+    spike_fast=(sum(vols[-2:])/2)/vb1 if vb1>0 else 0
     e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
     uptrend=price>e50 and e21>e50
     ext=(price-e21)/e21 if e21>0 else 0
@@ -534,7 +541,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     atrr=atr_ratio(highs,lows,closes)   # режим рынка: <1 = сжатие/чоп
     mh=macd_hist(closes)                # MACD-гистограмма (справка-подтверждение)
     rc=roc(closes,12)                   # ROC за 12ч, % (справка)
-    return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
+    return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,spike_fast=spike_fast,
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
@@ -542,11 +549,24 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
         macd_h=mh,roc=rc,daily_rvol=daily_rvol)
 
 def long_ok(m):
-    return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
+    """Лонг-сигнал. ДВА пути входа:
+      1) БЫСТРЫЙ — свежий приток (OI +2% за 1ч + объём последних свечей >=2x): ловим
+         движение через ~1 час после старта, а не через 4.
+      2) ОБЫЧНЫЙ — накопленная 4ч-картина (OI 4ч + объём 4ч).
+    И ВОРОТА 'ПОЗДНО': если движение уже выдохлось (цена далеко от EMA21 или уже +10%
+    за 4ч) — сигнал НЕ шлём, чтобы не звать на конце движения."""
+    # приток: быстрый ИЛИ накопленный
+    fast_inflow = m.get("oi1",0)>=OI_1H_MIN and m.get("spike_fast",0)>=SPIKE_FAST_MIN
+    slow_inflow = m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN
+    inflow = fast_inflow or slow_inflow
+    # ПОЗДНО? движение уже прошло основную часть — не гонимся за свечой
+    too_late = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H
+    return (inflow and m["uptrend"]
         and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
         and m["p4"]>=PRICE_UP_4H_MIN
         and m["rsi"]<=RSI_MAX
-        and m.get("atrr",1.0)>=ATR_MIN_RATIO)  # рынок не в аномальном сжатии/чопе
+        and m.get("atrr",1.0)>=ATR_MIN_RATIO
+        and not too_late)
 
 def _score(m, ex):
     """Скоринг ТОЛЬКО из полей, которые бот реально вычисляет. Штраф за
@@ -655,6 +675,10 @@ def card_long(m, ex):
         f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}", "",
         table,
         f"\U0001F4CA Подтверждение: {tf_txt}",
+        (f"\u26A1 <b>БЫСТРЫЙ триггер</b>: OI +{m.get('oi1',0)*100:.1f}% за 1ч, объём свежих свечей \u00d7{m.get('spike_fast',0):.1f} \u2014 приток только начался"
+         if (m.get('oi1',0)>=OI_1H_MIN and m.get('spike_fast',0)>=SPIKE_FAST_MIN)
+         else f"\U0001F551 Обычный триггер: накопленная 4ч-картина (OI +{m['oi4']*100:.0f}%, объём \u00d7{m['spike']:.1f})"),
+        f"\U0001F4CF Цена выше EMA21 на {m.get('ext',0)*100:.1f}% (ворота 'поздно': >{MAX_EXT_ENTRY*100:.0f}% \u2014 сигнал не шлём)",
     ] + stop_lines
 
     reasons=[]
