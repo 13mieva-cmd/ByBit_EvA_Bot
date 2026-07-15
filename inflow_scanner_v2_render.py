@@ -98,12 +98,16 @@ def http_json(url, timeout=12):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
-def tg(method, **kw):
+def tg(method, _timeout=10, **kw):
+    """_timeout — локальный сокет-таймаут urlopen. kw может содержать СВОЙ 'timeout' —
+    это параметр Telegram для long-polling (getUpdates), другая сущность. Раньше они
+    были перепутаны: urlopen обрывал соединение на 10с, пока просили Telegram ждать 25с
+    -> гонка и 'read operation timed out'. Теперь _timeout всегда больше, чем kw['timeout']."""
     if not TG_TOKEN: return None
     try:
         data = urllib.parse.urlencode(kw).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=data)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=_timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         print("tg err:", e); return None
@@ -595,7 +599,7 @@ def tg_loop(st):
     offset = 0
     while True:
         try:
-            r = tg("getUpdates", timeout=25, offset=offset)
+            r = tg("getUpdates", _timeout=35, timeout=25, offset=offset)
             if not r or not r.get("ok"):
                 time.sleep(2); continue
             for u in r["result"]:
