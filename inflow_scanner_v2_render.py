@@ -718,7 +718,27 @@ def _bt_leg(pos, price, part):
     pos["pnl"] += pnl
     return pnl
 
-def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts):
+def _bt_reason(msg):
+    """Нормализует причину отказа detect_signal в фиксированную метку для воронки."""
+    m = str(msg)
+    for sub, label in (("зелёных", "нет 3 зелёных подряд"),
+                       ("выше high", "нет закрытий выше high пред."),
+                       ("затишья", "не было затишья (объём шумел)"),
+                       ("всплеск", "всплеск слабее 2.5x"),
+                       ("фитиль", "длинный фитиль 3-й"),
+                       ("параболик", "свеча-параболик (ATR-кап)"),
+                       ("неравномерны", "свечи неравномерны (тела >3x)"),
+                       ("дельта", "CVD: дельта не растёт"),
+                       ("OI", "OI не растёт устойчиво"),
+                       ("аптренда", "нет аптренда EMA"),
+                       ("RSI", "RSI перегрет (>75)"),
+                       ("уровень", "уровень не пробит"),
+                       ("истории", "мало истории"),
+                       ("базы", "мало/ноль объёмной базы")):
+        if sub in m: return label
+    return "прочее"
+
+def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
     """Все сделки стратегии на истории одной монеты (окно расчёта = как в live).
     ПЕССИМИЗМ (внутри 15м-бара порядок цен неизвестен):
       1) SL проверяется РАНЬШЕ TP1;
@@ -758,11 +778,19 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts):
             else:
                 pending["ttl"] -= 1
                 if pending["ttl"] <= 0: pending = None
-        if pos is None and pending is None and len(oi_vals) >= 5:
+        if pos is None and pending is None:
+            if len(oi_vals) < 5:
+                if diag is not None: diag["no_oi"] += 1
+                continue
+            if diag is not None: diag["evals"] += 1
             ok, d = detect_signal(o[i+1-W:i+1], h[i+1-W:i+1], l[i+1-W:i+1],
                                   c[i+1-W:i+1], v[i+1-W:i+1], tb[i+1-W:i+1], oi_vals[-8:])
             if ok:
+                if diag is not None: diag["signals"] += 1
                 pending = dict(entry=d["entry"], sl=d["sl"], tp1=d["tp1"], ttl=ENTRY_TTL_BARS)
+            elif diag is not None:
+                lbl = _bt_reason(d)
+                diag["reasons"][lbl] = diag["reasons"].get(lbl, 0) + 1
     return positions
 
 def bt_portfolio(all_pos, deposit):
@@ -787,6 +815,7 @@ def run_backtest(chat, days=14, ncoins=30):
                       f"Займёт несколько минут — пришлю прогресс и итог с графиком.")
         coins = universe()[:ncoins]
         all_pos = []
+        diag = dict(evals=0, no_oi=0, signals=0, reasons={})
         for k, sym in enumerate(coins, 1):
             try:
                 o, h, l, c, v, tb, ct = bt_klines(sym, days)
@@ -794,16 +823,30 @@ def run_backtest(chat, days=14, ncoins=30):
                 oi_ts = bt_oi(sym, days)
                 if len(oi_ts) < 20: continue
                 all_pos += bt_simulate_coin(sym, o[:-1], h[:-1], l[:-1], c[:-1],
-                                            v[:-1], tb[:-1], ct[:-1], oi_ts)
+                                            v[:-1], tb[:-1], ct[:-1], oi_ts, diag=diag)
             except Exception as e:
                 print(f"bt {sym} err:", e)
             if k % 10 == 0:
-                tg_send(chat, f"\u2699\uFE0F Бэктест: {k}/{len(coins)} монет, сигналов пока {len(all_pos)}")
+                tg_send(chat, f"\u2699\uFE0F Бэктест: {k}/{len(coins)} монет \u00b7 сигналов {diag['signals']} \u00b7 исполнено {len(all_pos)}")
+        def _funnel_text():
+            if not diag["evals"] and not diag["no_oi"]: return None
+            top = sorted(diag["reasons"].items(), key=lambda x: -x[1])[:8]
+            L = [f"\U0001F52C <b>ВОРОНКА ОТСЕВА</b> — что рубит чек-лист чаще всего "
+                 f"(проверок: {diag['evals']:,}, сигналов: {diag['signals']}):"]
+            for name, cnt in top:
+                L.append(f"\u2022 {name}: {cnt:,} ({cnt/max(diag['evals'],1)*100:.1f}%)")
+            if diag["no_oi"]:
+                L.append(f"\u2022 нет OI-истории (оценка пропущена): {diag['no_oi']:,}")
+            L.append("<i>Если сигналов слишком мало — ослабляем ВЕРХНЕЕ условие воронки, по данным, а не наугад.</i>")
+            return "\n".join(L)
+
         taken, eq = bt_portfolio(all_pos, DEPOSIT)
         if not taken:
             tg_send(chat, f"\U0001F4ED Бэктест: за {days} дн по {len(coins)} монетам "
-                          f"чек-лист не дал ни одной сделки. Фильтры строгие — это нормально; "
-                          f"попробуй больше монет: /backtest {days} 60")
+                          f"чек-лист не дал ни одной сделки (сигналов было: {diag['signals']}, "
+                          f"исполнилось на ретесте: 0). Смотри воронку ниже — она скажет, что именно рубит.")
+            ft = _funnel_text()
+            if ft: tg_send(chat, ft)
             return
         n = len(taken); wins = sum(1 for t in taken if t["pnl"] > 0)
         total = eq[-1] - DEPOSIT
@@ -820,6 +863,8 @@ def run_backtest(chat, days=14, ncoins=30):
                f"в спорном баре стоп раньше тейка (пессимизм). Это ориентир на малой выборке — "
                f"судья по-прежнему форвардный paper (/stats).</i>")
         tg_send(chat, txt)
+        ft = _funnel_text()
+        if ft: tg_send(chat, ft)
         if HAS_MPL:
             try:
                 plt.figure(figsize=(10, 5))
