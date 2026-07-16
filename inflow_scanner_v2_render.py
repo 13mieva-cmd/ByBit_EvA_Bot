@@ -35,6 +35,8 @@ Start Command:  python eva_v3_impulse.py
 """
 
 import os, time, json, csv, math, threading
+
+state_lock = threading.RLock()   # защита v3_state.json: пишут ДВА потока (main + telegram)
 import datetime as dt
 import urllib.request, urllib.parse
 
@@ -337,7 +339,8 @@ def load_state():
 
 def save_state(st):
     try:
-        with open(STATE_FILE, "w") as f: json.dump(st, f)
+        with state_lock:                       # два потока не пишут файл одновременно
+            with open(STATE_FILE, "w") as f: json.dump(st, f)
     except Exception as e: print("state save err:", e)
 
 def utc_day():
@@ -559,7 +562,15 @@ def check_pending(st, chat):
 
 # ============================== СТАТИСТИКА ==============================
 def pos_text(st):
-    pens = st.get("pendings", {}); poss = st.get("positions", {})
+    # снапшот: main-поток может закрыть позицию ПРЯМО во время команды /pos ->
+    # иначе RuntimeError (dict changed size during iteration)
+    pens, poss = {}, {}
+    for _ in range(5):
+        try:
+            pens = dict(st.get("pendings", {})); poss = dict(st.get("positions", {}))
+            break
+        except RuntimeError:
+            time.sleep(0.02)
     margin_used = MARGIN * slots_used(st)
     head = (f"\U0001F4CA Слоты: {slots_used(st)}/{MAX_CONCURRENT} \u00b7 "
             f"сделок сегодня {daily_txt(st)} \u00b7 "
@@ -689,6 +700,7 @@ def main():
             if now - last_scan >= SCAN_EVERY_SEC:
                 last_scan = now
                 scan_once(st, chat)
+                print(f"[scan] слоты {slots_used(st)}/{MAX_CONCURRENT} · сделок сегодня {st.get('trades_today',0)}")
         except Exception as e:
             print("main err:", e)
         time.sleep(2)
