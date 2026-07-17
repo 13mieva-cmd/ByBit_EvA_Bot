@@ -54,14 +54,14 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.5     # ЭКСТРЕННЫЙ ОТКАТ: жёсткий порог всплеска, без входов на слабом объёме
-QUIET_BARS = 8          # ЭКСТРЕННЫЙ ОТКАТ: строго 8 чистых баров затишья перед импульсом
+VOL_SPIKE_MIN = 2.5     # ужесточено: без входов на слабом/фейковом объёмном всплеске
+QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
 WICK_MAX = 0.30
 ATR_LEN = 14
 BAR_ATR_MAX = 2.5       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
-OI_MIN_GROW = 0.2       # отключено: не рубим спот-пампы, где OI на Bybit отстаёт
+OI_MIN_GROW = 0.02      # OI-ПОДТВЕРЖДЕНИЕ: (OI_now - OI_prev)/OI_prev < 2% -> сигнал отбрасывается (фейковый объём без реального интереса)
 RSI_LEN = 14
 RSI_MAX = 78.0          # поднято с 75: на сильных пампах RSI летит быстро
 CVD_MODE = "all"
@@ -382,13 +382,13 @@ def detect_signal(o, h, l, c, v, tb, oi):
     delta = 2 * tb[i1] - v[i1]
     if delta <= 0: return False, "дельта не растёт"
 
-    # 6) OI: устойчивый рост за импульс (>= +1% и без слома на импульсной свече)
+    # 6) OI-ПОДТВЕРЖДЕНИЕ: рост Open Interest СТРОГО на сигнальной свече (Current vs Previous)
+    # (Current_OI - Previous_OI) / Previous_OI < OI_MIN_GROW (2%) -> сигнал отбрасывается мгновенно
     oi_ok = False; oi_chg = 0.0
-    if len(oi) >= 5:
-        oi_before = oi[-5]
-        oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
-        oi_ok = oi_chg >= OI_MIN_GROW and oi[-1] >= oi[-2] * 0.995
-    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
+    if len(oi) >= 2 and oi[-2] > 0:
+        oi_chg = (oi[-1] - oi[-2]) / oi[-2]
+        oi_ok = oi_chg >= OI_MIN_GROW
+    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%, нужно \u2265{OI_MIN_GROW*100:.0f}%)"
 
     # 7) тренд: close > EMA21 > EMA50
     e21 = ema_series(c, EMA_FAST)[-1]; e50 = ema_series(c, EMA_SLOW)[-1]
