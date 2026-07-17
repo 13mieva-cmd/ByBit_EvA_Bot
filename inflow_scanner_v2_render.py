@@ -56,7 +56,8 @@ TF               = "15m"
 VOL_MA_LEN       = 20        # Volume MA 20
 VOL_SPIKE_MIN    = 2.5       # всплеск 1-й свечи >= 2.5x MA20 (спека: 2-3x)
 QUIET_BARS       = 12        # затишье до импульса: 12 свечей без всплесков
-QUIET_MAX        = 1.8       # ...без объёма > 1.8x MA20
+QUIET_MAX        = 1.8
+QUIET_ALLOW      = 0         # сколько ШУМНЫХ баров допустимо в тихой базе (0 = строго, как раньше)       # ...без объёма > 1.8x MA20
 WICK_MAX         = 0.30      # верхняя тень 3-й свечи <= 30% размаха
 ATR_LEN          = 14
 BAR3_ATR_MAX     = 2.5       # размах ЛЮБОЙ из 3 свечей <= 2.5x ATR14 (не параболик)
@@ -64,6 +65,7 @@ BODY_RATIO_MAX   = 3.0       # самое крупное тело <= 3x само
 OI_MIN_GROW      = 0.01      # OI за импульс >= +1%
 RSI_LEN          = 14
 RSI_MAX          = 75.0
+CVD_MODE         = "all"     # "all" = дельта>0 на всех 3 свечах (как раньше); "sum" = сумма>0 и последняя>0
 LEVEL_LOOKBACK   = 96        # уровень = max(high) за ~сутки (96 x 15м) ДО импульса
 EMA_FAST, EMA_SLOW = 21, 50
 
@@ -251,8 +253,8 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
-    quiet = all(x <= vma * QUIET_MAX for x in v[i1 - QUIET_BARS:i1])
-    if not quiet: return False, "не было затишья"
+    noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
+    if noisy > QUIET_ALLOW: return False, f"не было затишья ({noisy} шумн.)"
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
@@ -278,7 +280,11 @@ def detect_signal(o, h, l, c, v, tb, oi):
 
     # 5) CVD: дельта > 0 на всех трёх свечах (агрессивные покупки)
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
-    if not all(d > 0 for d in deltas): return False, "дельта не растёт"
+    if CVD_MODE == "sum":
+        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0     # мягче: суммарный перевес покупок + последняя за нас
+    else:
+        cvd_ok = all(d > 0 for d in deltas)             # строго: все три (live-дефолт)
+    if not cvd_ok: return False, "дельта не растёт"
 
     # 6) OI: устойчивый рост за импульс (>= +1% и без слома на 3-й)
     oi_ok = False; oi_chg = 0.0
@@ -611,6 +617,8 @@ _last_bar_scanned = {}
 
 def scan_once(st, chat):
     """Проверка закрытых 15м-свечей по вселенной: ищем сетапы, заполняем свободные слоты."""
+    if BT_RUNNING["on"]:
+        return   # во время бэктеста скан на паузе: временные параметры не должны попасть в живые сигналы
     ok_allowed, why = trading_allowed(st)
     if not ok_allowed:
         return
@@ -642,6 +650,69 @@ def scan_once(st, chat):
 
 # ============================== БЭКТЕСТЕР ==============================
 BT_RUNNING = {"on": False}
+
+# параметры, которые можно крутить В БЭКТЕСТЕ командой (живой бот не трогается):
+def _cvd_cast(s):
+    s = str(s).lower()
+    if s not in ("all", "sum"): raise ValueError("cvd: all|sum")
+    return s
+
+BT_PARAMS = {
+    "spike":  ("VOL_SPIKE_MIN",  lambda s: float(s)),        # всплеск 1-й свечи, x от MA20
+    "quiet":  ("QUIET_MAX",      lambda s: float(s)),        # порог "тишины" базы
+    "qbars":  ("QUIET_BARS",     lambda s: int(float(s))),   # длина тихой базы
+    "qallow": ("QUIET_ALLOW",    lambda s: int(float(s))),   # допуск шумных баров в базе
+    "wick":   ("WICK_MAX",       lambda s: float(s)),        # фитиль 3-й
+    "atr":    ("BAR3_ATR_MAX",   lambda s: float(s)),        # кап размаха свечи
+    "body":   ("BODY_RATIO_MAX", lambda s: float(s)),        # соразмерность тел
+    "oi":     ("OI_MIN_GROW",    lambda s: float(s)),        # мин. рост OI
+    "rsi":    ("RSI_MAX",        lambda s: float(s)),        # потолок RSI
+    "cvd":    ("CVD_MODE",       _cvd_cast),                 # all | sum
+}
+
+# ПРЕСЕТ soft: каждое послабление привязано к своему этажу воронки
+BT_PRESETS = {
+    "soft": {"quiet": "2.2", "qallow": "2", "spike": "2.0",
+             "atr": "3.5", "body": "4", "wick": "0.35", "cvd": "sum"},
+}
+
+def _bt_apply_overrides(overrides):
+    """Временно подменяет константы детектора НА ВРЕМЯ бэктеста. Возвращает (applied, saved)."""
+    applied, saved = {}, {}
+    for k, raw in (overrides or {}).items():
+        if k in BT_PARAMS:
+            gname, cast = BT_PARAMS[k]
+            try:
+                val = cast(raw)
+                saved[gname] = globals()[gname]
+                globals()[gname] = val
+                applied[k] = val
+            except Exception:
+                pass
+    return applied, saved
+
+def _bt_restore(saved):
+    for g, v in saved.items():
+        globals()[g] = v
+
+def _ov_str(applied):
+    return " ".join(f"{k}={v}" for k, v in applied.items()) if applied else "базовые (как в живом боте)"
+
+def _parse_bt_args(text):
+    """'/backtest 30 60 soft spike=1.8' -> (30, 60, {пресет soft, spike переопределён})"""
+    parts = text.split()[1:]
+    nums = [p for p in parts if p.isdigit()]
+    days = int(nums[0]) if len(nums) > 0 else 14
+    ncoins = int(nums[1]) if len(nums) > 1 else 30
+    ov = {}
+    for p in parts:                                  # 1) пресеты
+        if p.lower() in BT_PRESETS:
+            ov.update(BT_PRESETS[p.lower()])
+    for p in parts:                                  # 2) явные key=value поверх пресета
+        if "=" in p:
+            k, _, val = p.partition("=")
+            ov[k.strip().lower()] = val.strip()
+    return days, ncoins, ov
 
 try:
     import matplotlib
@@ -805,13 +876,16 @@ def bt_portfolio(all_pos, deposit):
     for t in taken: eq.append(eq[-1] + t["pnl"])
     return taken, eq
 
-def run_backtest(chat, days=14, ncoins=30):
+def run_backtest(chat, days=14, ncoins=30, overrides=None):
     if BT_RUNNING["on"]:
         tg_send(chat, "\u23F3 Бэктест уже идёт — дождись окончания."); return
     BT_RUNNING["on"] = True
+    applied, saved = _bt_apply_overrides(overrides)
     try:
         days = max(3, min(days, 30)); ncoins = max(5, min(ncoins, 60))
         tg_send(chat, f"\U0001F9EA <b>Бэктест запущен</b>: {days} дн \u00d7 топ-{ncoins} монет.\n"
+                      f"\u2699\uFE0F Параметры: {_ov_str(applied)}\n"
+                      f"Живой скан на паузе до конца бэктеста (чтобы временные параметры не протекли).\n"
                       f"Займёт несколько минут — пришлю прогресс и итог с графиком.")
         coins = universe()[:ncoins]
         all_pos = []
@@ -842,7 +916,7 @@ def run_backtest(chat, days=14, ncoins=30):
 
         taken, eq = bt_portfolio(all_pos, DEPOSIT)
         if not taken:
-            tg_send(chat, f"\U0001F4ED Бэктест: за {days} дн по {len(coins)} монетам "
+            tg_send(chat, f"\U0001F4ED Бэктест [{_ov_str(applied)}]: за {days} дн по {len(coins)} монетам "
                           f"чек-лист не дал ни одной сделки (сигналов было: {diag['signals']}, "
                           f"исполнилось на ретесте: 0). Смотри воронку ниже — она скажет, что именно рубит.")
             ft = _funnel_text()
@@ -855,6 +929,7 @@ def run_backtest(chat, days=14, ncoins=30):
             peak = max(peak, x); dd = max(dd, (peak - x) / peak)
         skipped = len(all_pos) - n
         txt = (f"\U0001F9EA <b>БЭКТЕСТ: {days} дн \u00d7 {len(coins)} монет</b>\n"
+               f"\u2699\uFE0F Параметры: {_ov_str(applied)}\n"
                f"Сделок взято: {n} (пропущено из-за 2 слотов: {skipped})\n"
                f"В плюсе: {wins} ({wins/n*100:.0f}%)\n"
                f"Итог: {total:+.2f}$ ({total/DEPOSIT*100:+.1f}% депо) \u00b7 макс.просадка {dd*100:.1f}%\n"
@@ -879,6 +954,7 @@ def run_backtest(chat, days=14, ncoins=30):
         else:
             tg_send(chat, "\U0001F5BC matplotlib не установлен — график пропущен (добавь в requirements.txt).")
     finally:
+        _bt_restore(saved)
         BT_RUNNING["on"] = False
 
 def tg_loop(st):
@@ -901,7 +977,9 @@ def tg_loop(st):
                         "/start — запуск и краткая сводка\n"
                         "/pos — текущая позиция/лимитка: цена, PnL, стадия\n"
                         "/stats — PAPER-статистика: win rate, средний R, PnL $ и %\n"
-                        "/backtest [дней] [монет] — прогон стратегии по истории + график эквити (по умолч. 14 и 30)\n"
+                        "/backtest [дней] [монет] [ключ=знач ...] — прогон по истории + воронка + график.\n"
+                        "   Калибровка порогов (живой бот не трогается): spike= quiet= qbars= wick= atr= body= oi= rsi=\n"
+                        "   Пример: /backtest 30 60 spike=2.0 quiet=2.2 \u00b7 или пресет: /backtest 30 60 soft\n"
                         "/pause — пауза (новые сигналы не ищутся, позиция ведётся)\n"
                         "/resume — возобновить сканирование\n"
                         "/help — эта справка")
@@ -924,10 +1002,8 @@ def tg_loop(st):
                 elif text.startswith("/stats"):
                     tg_send(cid, stats_text())
                 elif text.startswith("/backtest"):
-                    parts = text.split()
-                    bd = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 14
-                    bc = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
-                    threading.Thread(target=run_backtest, args=(cid, bd, bc), daemon=True).start()
+                    bd, bc, ov = _parse_bt_args(text)
+                    threading.Thread(target=run_backtest, args=(cid, bd, bc, ov), daemon=True).start()
         except Exception as e:
             print("tg_loop err:", e); time.sleep(3)
 
