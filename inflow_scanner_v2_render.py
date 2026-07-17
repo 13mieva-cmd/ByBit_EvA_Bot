@@ -54,28 +54,31 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.5
-QUIET_BARS = 12
-QUIET_MAX = 1.8
-QUIET_ALLOW = 0
+VOL_SPIKE_MIN = 1.5     # снижено с 2.5: ловим импульс в зародыше, не на хаях
+QUIET_BARS = 5          # снижено с 12: достаточно полки накопления для крипты
+QUIET_MAX = 2.5         # расширено с 1.8: объём чуть "дышит" в полке
+QUIET_ALLOW = 1         # разрешаем 1 шумный бар внутри полки затишья
 WICK_MAX = 0.30
 ATR_LEN = 14
-BAR_ATR_MAX = 2.5
-OI_MIN_GROW = 0.01
+BAR_ATR_MAX = 3.5       # поднято с 2.5: не боимся истинно сильных импульсов
+OI_MIN_GROW = 0.0       # отключено: не рубим спот-пампы, где OI на Bybit отстаёт
 RSI_LEN = 14
-RSI_MAX = 75.0
+RSI_MAX = 78.0          # поднято с 75: на сильных пампах RSI летит быстро
 CVD_MODE = "all"
 LEVEL_LOOKBACK = 96
 EMA_FAST, EMA_SLOW = 21, 50
 
 # --- вход/выход (спека) ---
 FIB_RETRACE = 0.382
-ENTRY_TTL_BARS = 8
-SL_BUFFER = 0.001
-TP1_RR = 1.0
-TRAIL_CALLBACK = 0.004
+ENTRY_TTL_BARS = 4     # снижено с 8: если за 4 бара не налили - импульс скис
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.00055
+
+# --- ATR-риск-менеджмент: частичная фиксация TP1/TP2 (position scaling) ---
+ATR_SL_MULT = 1.5      # SL = entry - 1.5*ATR
+ATR_TP1_MULT = 2.0     # TP1 = entry + 2.0*ATR -> закрыть 50% позиции
+ATR_TP2_MULT = 4.5     # TP2 = entry + 4.5*ATR -> закрыть оставшиеся 50%
+ATR_TRAIL_MULT = 1.5   # после TP1: SL остатка -> БУ, трейлинг 1.5*ATR от пика до TP2
 
 # --- вселенная ---
 MAX_COINS = 300
@@ -282,15 +285,17 @@ def detect_signal(o, h, l, c, v, tb, oi):
     impulse = h[i1] - l[i1]
     if impulse <= 0: return False, "нет импульса"
     entry = h[i1] - FIB_RETRACE * impulse
-    sl = l[i1] * (1 - SL_BUFFER)
+    if a <= 0: return False, "нет ATR для риск-менеджмента"
+    sl = entry - ATR_SL_MULT * a           # динамический SL: entry - 1.5*ATR
     if entry <= sl: return False, "вход ниже стопа"
     risk_pct = (entry - sl) / entry
-    tp1 = entry + (entry - sl) * TP1_RR
+    tp1 = entry + ATR_TP1_MULT * a         # TP1: entry + 2.0*ATR -> закрыть 50%
+    tp2 = entry + ATR_TP2_MULT * a         # TP2: entry + 4.5*ATR -> закрыть остаток
 
     return True, dict(
         spike=spike, delta=delta, oi_chg=oi_chg, rsi=r,
         e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
-        entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
         wick=upper_wick, close3=c[i1],
     )
 
@@ -378,28 +383,31 @@ def log_trade(row):
     except Exception as e: print("log_trade err:", e)
 
 # ============================== PAPER-ДВИЖОК ==============================
-def _profit_scenarios(entry, sl, tp1, qty):
+def _profit_scenarios(entry, sl, tp1, tp2, qty, atr):
+    """Частичная фиксация: TP1=entry+2*ATR (50%), TP2=entry+4.5*ATR (50%).
+    После TP1 остаток переводится в БУ, трейлинг 1.5*ATR от пика до TP2."""
     fee_in = NOTIONAL * FEE_MAKER
     def leg(exit_px, q, fee_share):
         return (exit_px - entry) * q - exit_px * q * FEE_TAKER - fee_share
     half = qty / 2
-    risk = entry - sl
-    stop_full = leg(sl, qty, fee_in)
-    tp1_half = leg(tp1, half, fee_in / 2)
-    trail_at_t1 = tp1_half + leg(tp1 * (1 - TRAIL_CALLBACK), half, fee_in / 2)
-    r2 = tp1_half + leg(entry + 2 * risk, half, fee_in / 2)
-    r3 = tp1_half + leg(entry + 3 * risk, half, fee_in / 2)
-    return stop_full, tp1_half, trail_at_t1, r2, r3
+    stop_full = leg(sl, qty, fee_in)                       # полный стоп до TP1
+    tp1_half = leg(tp1, half, fee_in / 2)                  # закрытие 50% на TP1
+    be_after_tp1 = tp1_half + leg(entry, half, fee_in / 2)  # остаток закрылся по БУ (комиссии в минус)
+    tp2_full = tp1_half + leg(tp2, half, fee_in / 2)       # остаток дошёл до TP2
+    trail_min = tp1_half + leg(tp1, half, fee_in / 2)      # минимум сразу после переноса в БУ (трейлинг ещё не дал профит)
+    return stop_full, tp1_half, be_after_tp1, tp2_full, trail_min
 
 def open_pending(st, sym, d, chat):
-    st["pendings"][sym] = dict(sym=sym, entry=d["entry"], sl=d["sl"], tp1=d["tp1"],
+    st["pendings"][sym] = dict(sym=sym, entry=d["entry"], sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
+                                atr=d["atr"],
                                 low1=d["low1"], high3=d["high3"], ttl=ENTRY_TTL_BARS,
                                 last_bar=None, born=time.time())
     save_state(st)
     risk_all = open_risk_usd(st)
     qty = NOTIONAL / d["entry"]
     risk_usd = NOTIONAL * d["risk_pct"]
-    stop_full, tp1_half, trail_min, r2, r3 = _profit_scenarios(d["entry"], d["sl"], d["tp1"], qty)
+    stop_full, tp1_half, be_after_tp1, tp2_full, trail_min = _profit_scenarios(
+        d["entry"], d["sl"], d["tp1"], d["tp2"], qty, d["atr"])
     by = bybit_price(sym)
     impulse_pct = (d["high3"] / d["low1"] - 1) * 100
     warn = ""
@@ -416,26 +424,25 @@ def open_pending(st, sym, d, chat):
         f"\u2705 Фитиль {d['wick']*100:.0f}% (\u226430%) — продавец не гасит",
         f"\u2705 Свеча в норме ATR (не параболик)",
         f"\u2705 CVD растёт: дельта покупок положительна (+{d['delta']:,.0f})",
-        f"\u2705 OI {d['oi_chg']*100:+.1f}% — заходят НОВЫЕ деньги (не шорт-сквиз)",
         f"\u2705 Тренд: цена > EMA21 (${d['e21']:.6g}) > EMA50 (${d['e50']:.6g})",
         f"\u2705 Пробит суточный уровень ${d['level']:.6g}",
         f"\u2705 RSI {d['rsi']:.0f} (<{RSI_MAX:.0f}) — не перегрет",
         "",
-        "\U0001F4CB ПЛАН СДЕЛКИ:",
+        "\U0001F4CB ПЛАН СДЕЛКИ (частичная фиксация TP1/TP2):",
         f"\U0001F4CC Вход ЛИМИТКОЙ на ретесте (фибо 38.2%): ${d['entry']:.6g}",
         f"\U0001F4E6 Объём: ${NOTIONAL:.0f} = {qty:.4g} {sym.replace('USDT','')} (маржа {MARGIN:.0f}$ \u00d7 плечо {LEVERAGE:.0f})",
-        f"\U0001F6D1 Стоп: ${d['sl']:.6g} (под Low импульса, \u2212{d['risk_pct']*100:.2f}%) \u2192 потеря {stop_full:+.2f}$",
-        f"\U0001F3AF TP1 (1:1): ${d['tp1']:.6g} \u2192 закрываю 50% \u2192 {tp1_half:+.2f}$ в карман",
-        f"\U0001F513 После TP1: трейлинг {TRAIL_CALLBACK*100:.1f}% на остаток 50%",
+        f"\U0001F6D1 Стоп: ${d['sl']:.6g} (entry \u2212 {ATR_SL_MULT}\u00d7ATR, \u2212{d['risk_pct']*100:.2f}%) \u2192 потеря {stop_full:+.2f}$",
+        f"\U0001F3AF TP1: ${d['tp1']:.6g} (entry + {ATR_TP1_MULT}\u00d7ATR) \u2192 закрываю 50% \u2192 {tp1_half:+.2f}$ в карман",
+        f"\U0001F3AF TP2: ${d['tp2']:.6g} (entry + {ATR_TP2_MULT}\u00d7ATR) \u2192 остаток 50% \u2192 {tp2_full:+.2f}$ суммарно",
+        f"\U0001F513 После TP1: SL остатка \u2192 БУ, трейлинг {ATR_TRAIL_MULT}\u00d7ATR от пика до TP2",
         "",
         "\U0001F4B0 СЦЕНАРИИ ИТОГА (с комиссиями):",
-        f"\u2022 стоп-лосс: {stop_full:+.2f}$",
-        f"\u2022 TP1 + трейлинг сразу: {trail_min:+.2f}$ (минимум после TP1 — уже в плюсе)",
-        f"\u2022 тренд до 2R: {r2:+.2f}$",
-        f"\u2022 тренд до 3R: {r3:+.2f}$",
+        f"\u2022 полный стоп-лосс (до TP1): {stop_full:+.2f}$",
+        f"\u2022 TP1, затем БУ-стоп по остатку: {be_after_tp1:+.2f}$",
+        f"\u2022 TP1 + TP2 (полный ход): {tp2_full:+.2f}$",
         f"{warn}",
         "",
-        f"\u23F3 Жду ретеста {ENTRY_TTL_BARS} свечей (2ч). Отмена: закрытие ниже стопа или таймаут.",
+        f"\u23F3 Жду ретеста {ENTRY_TTL_BARS} свечей (1ч). Отмена: закрытие ниже стопа или таймаут.",
         (f"\U0001F517 Суммарный риск занятых слотов: \u2248{risk_all:.2f}$ ({risk_all/DEPOSIT*100:.1f}% депозита) — две лонг-позиции = удвоенная ставка на рынок"
          if slots_used(st) > 1 else None),
         f"\U0001F9EA PAPER-режим \u00b7 Слоты: {slots_used(st)}/{MAX_CONCURRENT} заняты \u00b7 сделок сегодня: {st.get('trades_today',0)}",
@@ -454,13 +461,15 @@ def fill_pending(st, chat, sym):
     p = st["pendings"].pop(sym)
     qty = NOTIONAL / p["entry"]
     fee_in = NOTIONAL * FEE_MAKER
-    st["positions"][sym] = dict(sym=sym, entry=p["entry"], sl=p["sl"], tp1=p["tp1"],
+    st["positions"][sym] = dict(sym=sym, entry=p["entry"], sl=p["sl"], tp1=p["tp1"], tp2=p["tp2"],
+                                 atr=p["atr"],
                                  qty=qty, qty_init=qty, fee_in=fee_in,
-                                 half_closed=False, peak=0.0,
+                                 half_closed=False, be_moved=False, peak=0.0,
                                  opened=dt.datetime.now().isoformat(timespec="seconds"))
     st["trades_today"] = st.get("trades_today", 0) + 1
     save_state(st)
-    stop_full, tp1_half, trail_min, r2, r3 = _profit_scenarios(p["entry"], p["sl"], p["tp1"], qty)
+    stop_full, tp1_half, be_after_tp1, tp2_full, trail_min = _profit_scenarios(
+        p["entry"], p["sl"], p["tp1"], p["tp2"], qty, p["atr"])
     tg_send(chat,
             f"\u2705 {p['sym']}: ВХОД ИСПОЛНЕН (ретест сработал)\n"
             f"\U0001F4B5 Цена входа: ${p['entry']:.6g}\n"
@@ -468,7 +477,7 @@ def fill_pending(st, chat, sym):
             f"(маржа {MARGIN:.0f}$ \u00d7{LEVERAGE:.0f})\n"
             f"\U0001F6D1 Стоп ${p['sl']:.6g} \u2192 {stop_full:+.2f}$ \u00b7 "
             f"\U0001F3AF TP1 ${p['tp1']:.6g} \u2192 {tp1_half:+.2f}$ за 50%\n"
-            f"\U0001F513 После TP1 — трейлинг {TRAIL_CALLBACK*100:.1f}%: тренд до 2R даст {r2:+.2f}$, до 3R \u2014 {r3:+.2f}$\n"
+            f"\U0001F3AF TP2 ${p['tp2']:.6g} \u2192 {tp2_full:+.2f}$ суммарно (после переноса остатка в БУ)\n"
             f"\U0001F4C5 Сделка \u2116{st['trades_today']} сегодня \u00b7 Слоты: {slots_used(st)}/{MAX_CONCURRENT} \u00b7 PAPER (комиссии учтены)\n"
             f"Команды: /pos \u00b7 /stats")
 
@@ -495,6 +504,8 @@ def close_part(st, chat, pos, price, part, reason):
     save_state(st)
 
 def manage_position(st, chat):
+    """Частичная фиксация: TP1 (entry+2*ATR) закрывает 50%, сразу переносит SL остатка в БУ.
+    TP2 (entry+4.5*ATR) закрывает финальные 50%. Между TP1 и TP2 — трейлинг 1.5*ATR от пика."""
     for sym, pos in list(st.get("positions", {}).items()):
         price = bybit_price(sym); time.sleep(0.05)
         if price is None: continue
@@ -502,17 +513,23 @@ def manage_position(st, chat):
             if price <= pos["sl"]:
                 close_part(st, chat, pos, pos["sl"], 1.0, "СТОП-ЛОСС"); continue
             if price >= pos["tp1"]:
-                close_part(st, chat, pos, pos["tp1"], 0.5, "ТЕЙК-ПРОФИТ 1 (1:1)")
+                close_part(st, chat, pos, pos["tp1"], 0.5, "ТЕЙК-ПРОФИТ 1 (2\u00d7ATR)")
                 if sym in st.get("positions", {}):
-                    pos["half_closed"] = True; pos["peak"] = price; save_state(st)
-                    tg_send(chat, f"\U0001F513 {sym}: трейлинг включён (откат {TRAIL_CALLBACK*100:.1f}% от пика).")
+                    pos["half_closed"] = True; pos["be_moved"] = True
+                    pos["sl"] = pos["entry"]; pos["peak"] = price; save_state(st)
+                    tg_send(chat, f"\U0001F513 {sym}: SL остатка \u2192 БУ (${pos['entry']:.6g}), "
+                                  f"трейлинг {ATR_TRAIL_MULT}\u00d7ATR до TP2.")
                 continue
         else:
+            if price >= pos["tp2"]:
+                close_part(st, chat, pos, pos["tp2"], 1.0, "ТЕЙК-ПРОФИТ 2 (4.5\u00d7ATR)"); continue
             if price > pos["peak"]:
                 pos["peak"] = price; save_state(st)
-            trail_stop = pos["peak"] * (1 - TRAIL_CALLBACK)
+            trail_stop = pos["peak"] - ATR_TRAIL_MULT * pos["atr"]
             if price <= trail_stop:
-                close_part(st, chat, pos, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП")
+                close_part(st, chat, pos, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП (ATR)"); continue
+            if price <= pos["sl"]:
+                close_part(st, chat, pos, pos["sl"], 1.0, "СТОП В БУ")
 
 def check_pending(st, chat):
     for sym, p in list(st.get("pendings", {}).items()):
@@ -644,6 +661,10 @@ BT_PARAMS = {
     "oi": ("OI_MIN_GROW", lambda s: float(s)),
     "rsi": ("RSI_MAX", lambda s: float(s)),
     "cvd": ("CVD_MODE", _cvd_cast),
+    "slmult": ("ATR_SL_MULT", lambda s: float(s)),
+    "tp1mult": ("ATR_TP1_MULT", lambda s: float(s)),
+    "tp2mult": ("ATR_TP2_MULT", lambda s: float(s)),
+    "trailmult": ("ATR_TRAIL_MULT", lambda s: float(s)),
 }
 
 BT_PRESETS = {
@@ -777,6 +798,8 @@ def _bt_reason(msg):
     return "прочее"
 
 def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
+    """Симуляция частичной фиксации: TP1=entry+2*ATR (закрыть 50%, SL остатка -> БУ),
+    TP2=entry+4.5*ATR (закрыть остаток), между TP1 и TP2 трейлинг 1.5*ATR от пика."""
     W = LEVEL_LOOKBACK + 40
     positions = []; pending = None; pos = None
     j = 0; oi_vals = []
@@ -791,12 +814,21 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
                     pos["close_ts"] = ct[i]; positions.append(pos); pos = None
                 elif bar_h >= pos["tp1"]:
                     _bt_leg(pos, pos["tp1"], 0.5)
-                    pos["half"] = True; pos["peak"] = pos["tp1"]
+                    pos["half"] = True; pos["sl"] = pos["entry"]
+                    pos["peak"] = max(pos["tp1"], bar_h)
             if pos and pos["half"]:
-                pos["peak"] = max(pos["peak"], bar_h)
-                trail = pos["peak"] * (1 - TRAIL_CALLBACK)
+                if bar_h >= pos["tp2"]:
+                    _bt_leg(pos, pos["tp2"], 1.0)
+                    pos["close_ts"] = ct[i]; positions.append(pos); pos = None
+                    continue
+                pos["peak"] = max(pos.get("peak", 0), bar_h)
+                trail = pos["peak"] - ATR_TRAIL_MULT * pos["atr"]
                 if bar_l <= trail:
                     _bt_leg(pos, trail, 1.0)
+                    pos["close_ts"] = ct[i]; positions.append(pos); pos = None
+                    continue
+                if bar_l <= pos["sl"]:
+                    _bt_leg(pos, pos["sl"], 1.0)
                     pos["close_ts"] = ct[i]; positions.append(pos); pos = None
         elif pending:
             if bar_c < pending["sl"]:
@@ -804,6 +836,7 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
             elif bar_l <= pending["entry"]:
                 qty = NOTIONAL / pending["entry"]
                 pos = dict(sym=sym, entry=pending["entry"], sl=pending["sl"], tp1=pending["tp1"],
+                           tp2=pending["tp2"], atr=pending["atr"],
                            qty=qty, qty_init=qty, fee_in=NOTIONAL * FEE_MAKER,
                            half=False, peak=0.0, pnl=0.0, open_ts=ct[i])
                 pending = None
@@ -819,7 +852,8 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
                                    c[i+1-W:i+1], v[i+1-W:i+1], tb[i+1-W:i+1], oi_vals[-8:])
             if ok:
                 if diag is not None: diag["signals"] += 1
-                pending = dict(entry=d["entry"], sl=d["sl"], tp1=d["tp1"], ttl=ENTRY_TTL_BARS)
+                pending = dict(entry=d["entry"], sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
+                                atr=d["atr"], ttl=ENTRY_TTL_BARS)
             elif diag is not None:
                 lbl = _bt_reason(d)
                 diag["reasons"][lbl] = diag["reasons"].get(lbl, 0) + 1
@@ -941,7 +975,8 @@ def tg_loop(st):
                             "/debug — почему сигналов нет: топ причин отказа по чек-листу\n"
                             "/backtest [дней] [монет] [ключ=знач ...] — прогон по истории + воронка + график.\n"
                             "   Калибровка порогов (живой бот не трогается): spike= quiet= qbars= wick= atr= oi= rsi=\n"
-                            "   Пример: /backtest 30 60 spike=2.0 quiet=2.2 \u00b7 или пресет: /backtest 30 60 soft\n"
+                            "   ATR-риск (частичная фиксация): slmult= (SL) tp1mult= (TP1 50%) tp2mult= (TP2 50%) trailmult= (трейлинг после TP1)\n"
+                            "   Пример: /backtest 30 60 spike=1.5 quiet=2.5 qbars=5 slmult=1.5 tp1mult=2.0 tp2mult=4.5 \u00b7 или пресет: /backtest 30 60 soft\n"
                             "/pause — пауза (новые сигналы не ищутся, позиция ведётся)\n"
                             "/resume — возобновить сканирование\n"
                             "/help — эта справка")
