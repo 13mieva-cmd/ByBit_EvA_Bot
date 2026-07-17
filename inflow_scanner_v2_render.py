@@ -236,61 +236,60 @@ def atr(h, l, c, period=14):
 
 # ============================== СИГНАЛ — ВАРИАНТ Б (революционный) ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Гибрид: ослабленная структура + сильный акцент на деньги"""
+    """Финальная сбалансированная версия — гибрид"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # 1. Структура (ослабленная)
+    # 1. Структура (разумный минимум)
     green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
     strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
     if green_count < 2 or not strong_momentum:
-        return False, "слабая структура (минимум 2 зелёные + пробой high)"
+        return False, "слабая структура (минимум 2 зелёные + momentum)"
 
-    # 2. Затишье + всплеск (сбалансировано)
+    # 2. Затишье + всплеск
     base = v[i1 - VOL_MA_LEN:i1]
-    if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
+    if len(base) < VOL_MA_LEN: return False, "мало базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
     
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW + 2: return False, f"не было затишья ({noisy} шумн.)"
+    if noisy > QUIET_ALLOW + 2: return False, f"шум в затишье ({noisy})"
     
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
     # 3. Фитиль
     rng3 = h[i3] - l[i3]
-    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.38:
-        return False, "длинный фитиль 3-й свечи"
+    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.40:
+        return False, "длинный фитиль"
 
-    # 4. CVD (деньги)
+    # 4. CVD
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
     if sum(deltas) <= 0 or deltas[-1] <= 0:
-        return False, "CVD: слабые покупки"
+        return False, "CVD слабый"
 
     # 5. OI
-    oi_ok = False; oi_chg = 0.0
+    oi_ok = False
     if len(oi) >= 5:
-        oi_before = oi[-5]
-        oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
-        oi_ok = oi_chg >= OI_MIN_GROW
-    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
+        oi_chg = (oi[-1] / oi[-5] - 1) if oi[-5] > 0 else 0
+        oi_ok = oi_chg >= OI_MIN_GROW and all(oi[i] >= oi[i-1]*0.992 for i in range(-3,0))
+    if not oi_ok: return False, "OI слабый"
 
-    # 6. EMA + RSI + Уровень (оставляем)
+    # 6. EMA
     e21 = ema_series(c, EMA_FAST)[-1]
-    e50 = ema_series(c, EMA_SLOW)[-1]
-    if c[i3] <= e21: return False, "нет аптренда EMA"
+    if c[i3] <= e21: return False, "нет аптренда"
 
+    # 7. RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
-    if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
+    if r > RSI_MAX: return False, f"RSI перегрет"
 
+    # 8. Уровень
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
     if c[i3] <= level: return False, "уровень не пробит"
 
+    # Расчёт входа
     impulse = h[i3] - l[i1]
-    if impulse <= 0: return False, "нет импульса"
-
     entry = h[i3] - FIB_RETRACE * impulse
     sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
@@ -299,10 +298,10 @@ def detect_signal(o, h, l, c, v, tb, oi):
     tp1 = entry + (entry - sl) * TP1_RR
 
     return True, dict(
-        spike=spike, deltas=deltas, oi_chg=oi_chg, rsi=r,
-        e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i3],
-        entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
-        wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3],
+        spike=spike, deltas=deltas, oi_chg=oi_chg if 'oi_chg' in locals() else 0, rsi=r,
+        e21=e21, e50=ema_series(c, EMA_SLOW)[-1], level=level, 
+        low1=l[i1], high3=h[i3], entry=entry, sl=sl, tp1=tp1, 
+        risk_pct=risk_pct, wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3]
     )
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
