@@ -234,22 +234,14 @@ def atr(h, l, c, period=14):
         a = (a * (period - 1) + x) / period
     return a
 
-# ============================== СИГНАЛ (обновлённая версия) ==============================
+# ============================== СИГНАЛ — ВАРИАНТ Б (революционный) ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Полный чек-лист с сильно ослабленной структурой"""
+    """Новая логика: фокус на деньгах и импульсе, а не на идеальной свечной структуре."""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # ==================== СИЛЬНО ОСЛАБЛЕННАЯ СТРУКТУРА ====================
-    green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
-    strong_momentum = (c[i3] > o[i3] * 1.001 or c[i2] > o[i2] * 1.001)
-
-    if green_count < 1 or not strong_momentum:
-        return False, "слабый импульс (нужен хотя бы 1 зелёный + рост цены)"
-    # =====================================================================
-
-    # 2) Затишье + всплеск (ещё мягче)
+    # 1. Затишье + мощный всплеск объёма
     base = v[i1 - VOL_MA_LEN:i1]
     if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
@@ -259,50 +251,47 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if noisy > QUIET_ALLOW + 3: return False, f"не было затишья ({noisy} шумн.)"
     
     spike = v[i1] / vma
-    if spike < VOL_SPIKE_MIN - 0.5: return False, f"слабый всплеск x{spike:.1f}"
+    if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
-    # 3) Фитиль
-    rng3 = h[i3] - l[i3]
-    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.45:
-        return False, f"фитиль {((h[i3] - c[i3])/rng3*100):.0f}% >45%"
-
-    # 4) ATR
-    a = atr(h[:i3], l[:i3], c[:i3], ATR_LEN)
-    if a > 0 and (h[i3] - l[i3]) > BAR3_ATR_MAX * 1.2 * a:
-        return False, "слишком большая свеча (параболик)"
-
-    # 5) CVD
+    # 2. CVD — агрессивные покупки
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
-    if not any(d > 0 for d in deltas): return False, "дельта не растёт"
+    if CVD_MODE == "sum":
+        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0
+    else:
+        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0   # минимум последняя свеча с покупками
+    if not cvd_ok: return False, "CVD: слабые покупки"
 
-    # 6) OI
+    # 3. OI — новые деньги
     oi_ok = False; oi_chg = 0.0
     if len(oi) >= 5:
         oi_before = oi[-5]
         oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
-        oi_ok = oi_chg >= OI_MIN_GROW * 0.8   # чуть мягче
+        oi_ok = oi_chg >= OI_MIN_GROW and all(oi[i] >= oi[i-1] * 0.99 for i in range(-3, 0))
     if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
 
-    # 7) EMA тренд
+    # 4. Пробой уровня
+    level = max(h[i1 - LEVEL_LOOKBACK:i1])
+    if c[i3] <= level and c[i2] <= level: 
+        return False, "уровень не пробит"
+
+    # 5. Тренд EMA (мягче)
     e21 = ema_series(c, EMA_FAST)[-1]
     e50 = ema_series(c, EMA_SLOW)[-1]
-    if not (c[i3] > e21): return False, "нет аптренда EMA"
+    if c[i3] <= e21: return False, "нет аптренда EMA"
 
-    # 8) RSI
+    # 6. RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
     if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 9) Пробой уровня
-    level = max(h[i1 - LEVEL_LOOKBACK:i1])
-    if c[i3] <= level: return False, "уровень не пробит"
-
+    # 7. Размер импульса (защита от шума)
     impulse = h[i3] - l[i1]
-    if impulse <= 0: return False, "нет импульса"
+    if impulse / l[i1] < 0.003: return False, "импульс слишком маленький"
 
+    # Расчёт входа
     entry = h[i3] - FIB_RETRACE * impulse
     sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
-
+    
     risk_pct = (entry - sl) / entry
     tp1 = entry + (entry - sl) * TP1_RR
 
@@ -310,7 +299,8 @@ def detect_signal(o, h, l, c, v, tb, oi):
         spike=spike, deltas=deltas, oi_chg=oi_chg, rsi=r,
         e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i3],
         entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
-        wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3],
+        wick=(h[i3]-c[i3])/(h[i3]-l[i3]) if (h[i3]-l[i3]) > 0 else 0,
+        close3=c[i3],
     )
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
