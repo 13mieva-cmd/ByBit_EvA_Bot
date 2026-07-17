@@ -235,39 +235,41 @@ def atr(h, l, c, period=14):
     return a
 
 # ============================== СИГНАЛ (по спеке) ==============================
+# ============================== СИГНАЛ (по спеке) ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Полный чек-лист спеки на ЗАКРЫТЫХ свечах. Импульс = свечи -3,-2,-1
-    (последняя закрытая = 3-я свеча импульса). Возвращает (ok, details|причина)."""
+    """Полный чек-лист спеки на ЗАКРЫТЫХ свечах. Импульс = свечи -3,-2,-1"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # ==================== НОВАЯ СТРУКТУРА (ослабленная) ====================
-    # Убрали строгое требование 3 зелёных свечей подряд
+    # ==================== ОСЛАБЛЕННАЯ СТРУКТУРА ====================
+    # Убрали строгое требование 3 зелёных свечей
     green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
     strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
 
     if green_count < 2 or not strong_momentum:
         return False, "слабая структура (минимум 2 зелёные + пробой high)"
-    # =====================================================================
+    # ============================================================
 
-    # 2) затишье до импульса + всплеск объёма на 1-й свече
+    # 2) затишье + всплеск объёма (ослаблено)
     base = v[i1 - VOL_MA_LEN:i1]
     if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
+    
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW: return False, f"не было затишья ({noisy} шумн.)"
+    if noisy > QUIET_ALLOW + 2: return False, f"не было затишья ({noisy} шумн.)"
+    
     spike = v[i1] / vma
-    if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
+    if spike < VOL_SPIKE_MIN - 0.3: return False, f"слабый всплеск x{spike:.1f}"
 
-    # 3) фитиль 3-й свечи <= 30% размаха
+    # 3) фитиль 3-й свечи
     rng3 = h[i3] - l[i3]
     if rng3 <= 0: return False, "нулевая 3-я свеча"
     upper_wick = (h[i3] - c[i3]) / rng3
     if upper_wick > WICK_MAX: return False, f"фитиль {upper_wick*100:.0f}%>30%"
 
-    # 4) НИ ОДНА из 3 свечей не параболик
+    # 4) ATR-кап
     a = atr(h[:i3], l[:i3], c[:i3], ATR_LEN)
     if a > 0:
         for idx, lbl in ((i1, "1-я"), (i2, "2-я"), (i3, "3-я")):
