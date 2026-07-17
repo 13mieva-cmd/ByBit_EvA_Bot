@@ -234,88 +234,75 @@ def atr(h, l, c, period=14):
         a = (a * (period - 1) + x) / period
     return a
 
-# ============================== СИГНАЛ (по спеке) ==============================
+# ============================== СИГНАЛ (обновлённая версия) ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Полный чек-лист спеки на ЗАКРЫТЫХ свечах. Импульс = свечи -3,-2,-1"""
+    """Полный чек-лист с сильно ослабленной структурой"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # ==================== ОСЛАБЛЕННАЯ СТРУКТУРА ====================
-    # Убрали строгое требование 3 зелёных свечей
+    # ==================== СИЛЬНО ОСЛАБЛЕННАЯ СТРУКТУРА ====================
     green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
-    strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
+    strong_momentum = (c[i3] > o[i3] * 1.001 or c[i2] > o[i2] * 1.001)
 
-    if green_count < 2 or not strong_momentum:
-        return False, "слабая структура (минимум 2 зелёные + пробой high)"
-    # ============================================================
+    if green_count < 1 or not strong_momentum:
+        return False, "слабый импульс (нужен хотя бы 1 зелёный + рост цены)"
+    # =====================================================================
 
-    # 2) затишье + всплеск объёма (ослаблено)
+    # 2) Затишье + всплеск (ещё мягче)
     base = v[i1 - VOL_MA_LEN:i1]
     if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
     
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW + 2: return False, f"не было затишья ({noisy} шумн.)"
+    if noisy > QUIET_ALLOW + 3: return False, f"не было затишья ({noisy} шумн.)"
     
     spike = v[i1] / vma
-    if spike < VOL_SPIKE_MIN - 0.3: return False, f"слабый всплеск x{spike:.1f}"
+    if spike < VOL_SPIKE_MIN - 0.5: return False, f"слабый всплеск x{spike:.1f}"
 
-    # 3) фитиль 3-й свечи
+    # 3) Фитиль
     rng3 = h[i3] - l[i3]
-    if rng3 <= 0: return False, "нулевая 3-я свеча"
-    upper_wick = (h[i3] - c[i3]) / rng3
-    if upper_wick > WICK_MAX: return False, f"фитиль {upper_wick*100:.0f}%>30%"
+    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.45:
+        return False, f"фитиль {((h[i3] - c[i3])/rng3*100):.0f}% >45%"
 
-    # 4) ATR-кап
+    # 4) ATR
     a = atr(h[:i3], l[:i3], c[:i3], ATR_LEN)
-    if a > 0:
-        for idx, lbl in ((i1, "1-я"), (i2, "2-я"), (i3, "3-я")):
-            rng_i = h[idx] - l[idx]
-            if rng_i > BAR3_ATR_MAX * a: return False, f"{lbl} свеча параболик ({rng_i/a:.1f}x ATR)"
-
-    # 4b) соразмерность тел
-    bodies = [abs(c[idx] - o[idx]) for idx in (i1, i2, i3)]
-    if min(bodies) > 0:
-        ratio = max(bodies) / min(bodies)
-        if ratio > BODY_RATIO_MAX:
-            return False, f"свечи неравномерны (тела различаются в {ratio:.1f}x)"
+    if a > 0 and (h[i3] - l[i3]) > BAR3_ATR_MAX * 1.2 * a:
+        return False, "слишком большая свеча (параболик)"
 
     # 5) CVD
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
-    if CVD_MODE == "sum":
-        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0
-    else:
-        cvd_ok = all(d > 0 for d in deltas)
-    if not cvd_ok: return False, "дельта не растёт"
+    if not any(d > 0 for d in deltas): return False, "дельта не растёт"
 
     # 6) OI
     oi_ok = False; oi_chg = 0.0
     if len(oi) >= 5:
         oi_before = oi[-5]
         oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
-        oi_ok = oi_chg >= OI_MIN_GROW and all(oi[i] >= oi[i-1] * 0.995 for i in range(-3, 0))
+        oi_ok = oi_chg >= OI_MIN_GROW * 0.8   # чуть мягче
     if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
 
-    # 7) тренд EMA
+    # 7) EMA тренд
     e21 = ema_series(c, EMA_FAST)[-1]
     e50 = ema_series(c, EMA_SLOW)[-1]
-    if not (c[i3] > e21 > e50): return False, "нет аптренда EMA"
+    if not (c[i3] > e21): return False, "нет аптренда EMA"
 
     # 8) RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
     if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 9) пробой уровня
+    # 9) Пробой уровня
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
-    if not (c[i2] > level or c[i3] > level): return False, "уровень не пробит"
+    if c[i3] <= level: return False, "уровень не пробит"
 
     impulse = h[i3] - l[i1]
     if impulse <= 0: return False, "нет импульса"
+
     entry = h[i3] - FIB_RETRACE * impulse
     sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
+
     risk_pct = (entry - sl) / entry
     tp1 = entry + (entry - sl) * TP1_RR
 
@@ -323,7 +310,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
         spike=spike, deltas=deltas, oi_chg=oi_chg, rsi=r,
         e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i3],
         entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
-        wick=upper_wick, close3=c[i3],
+        wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3],
     )
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
