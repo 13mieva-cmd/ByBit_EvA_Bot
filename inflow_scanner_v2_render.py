@@ -242,11 +242,14 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # 1) три зелёные подряд
-    green = all(c[i] > o[i] for i in (i1, i2, i3))
-    if not green: return False, "нет 3 зелёных"
-    # бычий импульс: хотя бы одна из 2-й/3-й закрылась выше high предыдущей
-    if not (c[i2] > h[i1] or c[i3] > h[i2]): return False, "нет закрытий выше high"
+    # ==================== НОВАЯ СТРУКТУРА (ослабленная) ====================
+    # Убрали строгое требование 3 зелёных свечей подряд
+    green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
+    strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
+
+    if green_count < 2 or not strong_momentum:
+        return False, "слабая структура (минимум 2 зелёные + пробой high)"
+    # =====================================================================
 
     # 2) затишье до импульса + всплеск объёма на 1-й свече
     base = v[i1 - VOL_MA_LEN:i1]
@@ -264,56 +267,56 @@ def detect_signal(o, h, l, c, v, tb, oi):
     upper_wick = (h[i3] - c[i3]) / rng3
     if upper_wick > WICK_MAX: return False, f"фитиль {upper_wick*100:.0f}%>30%"
 
-    # 4) НИ ОДНА из 3 свечей не параболик (ATR-кап на каждую, не только на 3-ю)
+    # 4) НИ ОДНА из 3 свечей не параболик
     a = atr(h[:i3], l[:i3], c[:i3], ATR_LEN)
     if a > 0:
         for idx, lbl in ((i1, "1-я"), (i2, "2-я"), (i3, "3-я")):
             rng_i = h[idx] - l[idx]
             if rng_i > BAR3_ATR_MAX * a: return False, f"{lbl} свеча параболик ({rng_i/a:.1f}x ATR)"
 
-    # 4b) соразмерность тел: не должно быть "1 гигант + 2 карлика" или наоборот
+    # 4b) соразмерность тел
     bodies = [abs(c[idx] - o[idx]) for idx in (i1, i2, i3)]
     if min(bodies) > 0:
         ratio = max(bodies) / min(bodies)
         if ratio > BODY_RATIO_MAX:
             return False, f"свечи неравномерны (тела различаются в {ratio:.1f}x)"
 
-    # 5) CVD: дельта > 0 на всех трёх свечах (агрессивные покупки)
+    # 5) CVD
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
     if CVD_MODE == "sum":
-        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0     # мягче: суммарный перевес покупок + последняя за нас
+        cvd_ok = sum(deltas) > 0 and deltas[-1] > 0
     else:
-        cvd_ok = all(d > 0 for d in deltas)             # строго: все три (live-дефолт)
+        cvd_ok = all(d > 0 for d in deltas)
     if not cvd_ok: return False, "дельта не растёт"
 
-    # 6) OI: устойчивый рост за импульс (>= +1% и без слома на 3-й)
+    # 6) OI
     oi_ok = False; oi_chg = 0.0
     if len(oi) >= 5:
         oi_before = oi[-5]
         oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
-        # устойчивый: OI растёт на каждом из последних 3 баров (не просел на 3-й свече)
         oi_ok = oi_chg >= OI_MIN_GROW and all(oi[i] >= oi[i-1] * 0.995 for i in range(-3, 0))
     if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
 
-    # 7) тренд: close > EMA21 > EMA50
-    e21 = ema_series(c, EMA_FAST)[-1]; e50 = ema_series(c, EMA_SLOW)[-1]
+    # 7) тренд EMA
+    e21 = ema_series(c, EMA_FAST)[-1]
+    e50 = ema_series(c, EMA_SLOW)[-1]
     if not (c[i3] > e21 > e50): return False, "нет аптренда EMA"
 
-    # 8) RSI < 75
+    # 8) RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
     if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 9) пробой локального уровня (max high за сутки ДО импульса)
+    # 9) пробой уровня
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
     if not (c[i2] > level or c[i3] > level): return False, "уровень не пробит"
 
     impulse = h[i3] - l[i1]
     if impulse <= 0: return False, "нет импульса"
-    entry = h[i3] - FIB_RETRACE * impulse            # лимитка на откате 38.2%
-    sl = l[i1] * (1 - SL_BUFFER)                     # под Low 1-й свечи
+    entry = h[i3] - FIB_RETRACE * impulse
+    sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
     risk_pct = (entry - sl) / entry
-    tp1 = entry + (entry - sl) * TP1_RR              # 1:1
+    tp1 = entry + (entry - sl) * TP1_RR
 
     return True, dict(
         spike=spike, deltas=deltas, oi_chg=oi_chg, rsi=r,
@@ -321,7 +324,6 @@ def detect_signal(o, h, l, c, v, tb, oi):
         entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
         wick=upper_wick, close3=c[i3],
     )
-
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
     return dict(day=str(dt.datetime.now(dt.timezone.utc).date()),
