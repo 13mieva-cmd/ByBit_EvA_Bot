@@ -54,13 +54,13 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.0     # ЭКСТРЕННЫЙ ОТКАТ: жёсткий порог всплеска, без входов на слабом объёме
-QUIET_BARS = 6          # ЭКСТРЕННЫЙ ОТКАТ: строго 8 чистых баров затишья перед импульсом
-QUIET_MAX = 2.0         # жёсткий порог шума в полке накопления
+VOL_SPIKE_MIN = 2.2     # ЭКСТРЕННЫЙ ОТКАТ: жёсткий порог всплеска, без входов на слабом объёме
+QUIET_BARS = 8          # ЭКСТРЕННЫЙ ОТКАТ: строго 8 чистых баров затишья перед импульсом
+QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
-WICK_MAX = 0.25
+WICK_MAX = 0.30
 ATR_LEN = 14
-BAR_ATR_MAX = 2.5       # поднято с 2.5: не боимся истинно сильных импульсов
+BAR_ATR_MAX = 2.5       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
 OI_MIN_GROW = 0.0       # отключено: не рубим спот-пампы, где OI на Bybit отстаёт
 RSI_LEN = 14
 RSI_MAX = 78.0          # поднято с 75: на сильных пампах RSI летит быстро
@@ -68,9 +68,9 @@ CVD_MODE = "all"
 LEVEL_LOOKBACK = 96
 EMA_FAST, EMA_SLOW = 21, 50
 
-# --- вход/выход (ЭКСТРЕННЫЙ ОТКАТ: лимитка на фибо-ретрейсе 23.6%, маркет-вход отключён) ---
-FIB_RETRACE = 0.0    # Limit_Entry = Candle_Close - 0.236*(Candle_Close - Candle_Open)
-ENTRY_TTL_BARS = 1     # если лимитка не исполнилась за 2 свечи -> авто-отмена
+# --- вход/выход (МАРКЕТ на открытии новой свечи сразу после сигнала; лимитка/ретест отключены) ---
+FIB_RETRACE = 0.0      # 0.0: лимитка-ретест на Фибо больше не используется (плохие исполнения на затухающих пампах)
+ENTRY_TTL_BARS = 0     # не используется при маркет-входе (оставлено для совместимости состояния)
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.00055
 
@@ -265,13 +265,12 @@ def bybit_set_leverage(symbol, leverage):
         "buyLeverage": str(leverage), "sellLeverage": str(leverage),
     })
 
-def bybit_limit_buy(symbol, qty, price):
-    """ТРЕБОВАНИЕ: create_market_buy_order УДАЛЁН. Вход только лимитным ордером на фибо-ретрейсе."""
+def bybit_market_long(symbol, qty):
+    """Рыночный LONG сразу на открытии новой свечи после закрытия сигнальной (без лимитки/ретеста)."""
     qty_r = bybit_round_qty(symbol, qty)
-    price_r = bybit_round_price(symbol, price)
     return _bybit_signed("POST", "/v5/order/create", body={
         "category": CATEGORY, "symbol": symbol, "side": "Buy",
-        "orderType": "Limit", "qty": str(qty_r), "price": str(price_r), "timeInForce": "GTC",
+        "orderType": "Market", "qty": str(qty_r), "timeInForce": "IOC",
     })
 
 def bybit_cancel_order(symbol, order_id):
@@ -405,7 +404,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
 
     impulse = h[i1] - l[i1]
     if impulse <= 0: return False, "нет импульса"
-    # Limit_Entry_Price = Candle_Close - 0.236*(Candle_Close - Candle_Open)
+    # FIB_RETRACE=0.0: entry = цена закрытия сигнальной свечи ≈ цена открытия следующей (маркет-вход)
     entry = c[i1] - FIB_RETRACE * (c[i1] - o[i1])
     if a <= 0: return False, "нет ATR для риск-менеджмента"
     sl = entry - ATR_SL_MULT * a           # динамический SL: entry - 1.5*ATR
@@ -519,55 +518,71 @@ def _profit_scenarios(entry, sl, tp1, tp2, qty, atr):
     trail_min = tp1_half + leg(tp1, half, fee_in / 2)      # минимум сразу после переноса в БУ (трейлинг ещё не дал профит)
     return stop_full, tp1_half, be_after_tp1, tp2_full, trail_min
 
-def open_pending(st, sym, d, chat):
-    """ЭКСТРЕННЫЙ ОТКАТ: лимитный вход на фибо-ретрейсе 23.6%, никаких маркет-ордеров.
-    Limit_Entry_Price = Candle_Close - 0.236*(Candle_Close - Candle_Open) уже посчитан в d['entry'].
-    При AUTO_TRADE лимитка реально выставляется на Bybit; TTL-таймаут её отменяет."""
+def open_market_position(st, sym, d, chat):
+    """Маркет-вход на открытии новой свечи сразу после закрытия сигнальной (FIB_RETRACE=0.0).
+    FOMO CAP уже отработал внутри detect_signal (BAR_ATR_MAX=2.5): сигналы на перерастянутых
+    свечах сюда не попадают, поэтому маркет-ордер не покупает абсолютный хай импульса."""
     qty = NOTIONAL / d["entry"]
-    live_order_id = None
-    if AUTO_TRADE:
-        r_lim = bybit_limit_buy(sym, qty, d["entry"])
-        if r_lim.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: лимитка не выставлена на Bybit: {r_lim.get('retMsg')}")
-            return
-        live_order_id = r_lim.get("result", {}).get("orderId")
-
-    st["pendings"][sym] = dict(sym=sym, entry=d["entry"], sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
-                                atr=d["atr"], live_order_id=live_order_id,
-                                low1=d["low1"], high3=d["high3"], ttl=ENTRY_TTL_BARS,
-                                last_bar=None, born=time.time())
-    save_state(st)
+    fee_in = NOTIONAL * FEE_MAKER
     risk_all = open_risk_usd(st)
     risk_usd = NOTIONAL * d["risk_pct"]
     stop_full, tp1_half, be_after_tp1, tp2_full, trail_min = _profit_scenarios(
         d["entry"], d["sl"], d["tp1"], d["tp2"], qty, d["atr"])
     by = bybit_price(sym)
+    entry_px = d["entry"]
+
+    live_note = "PAPER (комиссии учтены)"
+    if AUTO_TRADE:
+        live_note = "LIVE" + (" DEMO" if BYBIT_USE_DEMO else " РЕАЛ") + " (Bybit)"
+        bybit_set_leverage(sym, LEVERAGE)
+        r_order = bybit_market_long(sym, qty)
+        if r_order.get("retCode") != 0:
+            tg_send(chat, f"\u26A0\uFE0F {sym}: ОШИБКА рыночного входа на Bybit: {r_order.get('retMsg')}")
+            return
+        if by: entry_px = by  # фактическая цена исполнения на Bybit, если удалось получить
+        r_stop = bybit_set_stop(sym, sl_price=d["sl"], tp_price=None)
+        if r_stop.get("retCode") != 0:
+            tg_send(chat, f"\u26A0\uFE0F {sym}: SL не выставлен на Bybit: {r_stop.get('retMsg')}")
+        r_tp1 = bybit_reduce_limit(sym, qty / 2, d["tp1"])
+        tp1_order_id = r_tp1.get("result", {}).get("orderId") if r_tp1.get("retCode") == 0 else None
+        if r_tp1.get("retCode") != 0:
+            tg_send(chat, f"\u26A0\uFE0F {sym}: TP1-лимитка не выставлена: {r_tp1.get('retMsg')}")
+    else:
+        tp1_order_id = None
+
+    st["positions"][sym] = dict(sym=sym, entry=entry_px, sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
+                                 atr=d["atr"], qty=qty, qty_init=qty, fee_in=fee_in,
+                                 half_closed=False, be_moved=False, peak=0.0,
+                                 tp1_order_id=tp1_order_id,
+                                 opened=dt.datetime.now().isoformat(timespec="seconds"))
+    st["trades_today"] = st.get("trades_today", 0) + 1
+    save_state(st)
+
     impulse_pct = (d["high3"] / d["low1"] - 1) * 100
     warn = ""
     if risk_usd > DEPOSIT * 0.02:
         warn = (f"\n\u26A0\uFE0F Риск {risk_usd:.0f}$ = {risk_usd/DEPOSIT*100:.1f}% депозита — "
                 f"выше правила 1-2%. Твои параметры (маржа {MARGIN:.0f}$ x{LEVERAGE:.0f}), но на реале это агрессивно.")
     L = [
-        f"\U0001F680 {sym} · СИГНАЛ: импульсный пробой",
-        f"\U0001F4B5 Цена: ${d['close3']:.6g} (Binance)" + (f" \u00b7 ${by:.6g} (Bybit)" if by else ""),
+        f"\U0001F680 {sym} · СИГНАЛ: импульсный пробой \u2014 {live_note}",
+        f"\U0001F4B5 Вход МАРКЕТОМ на открытии новой свечи: ${entry_px:.6g}" + (f" \u00b7 Binance close ${d['close3']:.6g}" if by else ""),
         "",
         "\U0001F9E0 ПОЧЕМУ ВХОЖУ — весь чек-лист (факты):",
         f"\u2705 Затишье было ({QUIET_BARS} баров, строго без исключений), затем ВСПЛЕСК объёма \u00d7{d['spike']:.1f} от MA20 (порог \u2265{VOL_SPIKE_MIN}x)",
         f"\u2705 Импульс: {d['low1']:.6g} \u2192 {d['high3']:.6g} (+{impulse_pct:.1f}%)",
+        f"\u2705 FOMO-кап пройден: свеча \u2264 {BAR_ATR_MAX}\u00d7ATR (не перерастянута)",
         f"\u2705 Фитиль {d['wick']*100:.0f}% (\u226430%) — продавец не гасит",
-        f"\u2705 Свеча в норме ATR (не параболик)",
         f"\u2705 CVD растёт: дельта покупок положительна (+{d['delta']:,.0f})",
         f"\u2705 Тренд: цена > EMA21 (${d['e21']:.6g}) > EMA50 (${d['e50']:.6g})",
         f"\u2705 Пробит суточный уровень ${d['level']:.6g}",
         f"\u2705 RSI {d['rsi']:.0f} (<{RSI_MAX:.0f}) — не перегрет",
         "",
-        "\U0001F4CB ПЛАН СДЕЛКИ (лимитка на фибо-ретрейсе, частичная фиксация TP1/TP2):",
-        f"\U0001F4CC Вход ЛИМИТКОЙ (фибо 23.6% от бара): ${d['entry']:.6g}",
+        "\U0001F4CB ПЛАН СДЕЛКИ (частичная фиксация TP1/TP2):",
         f"\U0001F4E6 Объём: ${NOTIONAL:.0f} = {qty:.4g} {sym.replace('USDT','')} (маржа {MARGIN:.0f}$ \u00d7 плечо {LEVERAGE:.0f})",
         f"\U0001F6D1 Стоп: ${d['sl']:.6g} (entry \u2212 {ATR_SL_MULT}\u00d7ATR, \u2212{d['risk_pct']*100:.2f}%) \u2192 потеря {stop_full:+.2f}$",
         f"\U0001F3AF TP1: ${d['tp1']:.6g} (entry + {ATR_TP1_MULT}\u00d7ATR) \u2192 закрываю 50% \u2192 {tp1_half:+.2f}$ в карман",
         f"\U0001F3AF TP2: ${d['tp2']:.6g} (entry + {ATR_TP2_MULT}\u00d7ATR) \u2192 остаток 50% \u2192 {tp2_full:+.2f}$ суммарно",
-        f"\U0001F513 После TP1: SL остатка \u2192 БУ, трейлинг {ATR_TRAIL_MULT}\u00d7ATR от пика до TP2",
+        f"\U0001F513 Как только TP1 срабатывает: SL остатка \u2192 БУ немедленно (покрывает комиссии), трейлинг {ATR_TRAIL_MULT}\u00d7ATR от пика до TP2",
         "",
         "\U0001F4B0 СЦЕНАРИИ ИТОГА (с комиссиями):",
         f"\u2022 полный стоп-лосс (до TP1): {stop_full:+.2f}$",
@@ -575,7 +590,6 @@ def open_pending(st, sym, d, chat):
         f"\u2022 TP1 + TP2 (полный ход): {tp2_full:+.2f}$",
         f"{warn}",
         "",
-        f"\u23F3 Жду исполнения лимитки {ENTRY_TTL_BARS} свечи. Авто-отмена: закрытие ниже стопа или таймаут TTL.",
         (f"\U0001F517 Суммарный риск занятых слотов: \u2248{risk_all:.2f}$ ({risk_all/DEPOSIT*100:.1f}% депозита) — две лонг-позиции = удвоенная ставка на рынок"
          if slots_used(st) > 1 else None),
         f"\U0001F9EA Слоты: {slots_used(st)}/{MAX_CONCURRENT} заняты \u00b7 сделок сегодня: {st.get('trades_today',0)}",
@@ -583,77 +597,6 @@ def open_pending(st, sym, d, chat):
     ]
     tg_send(chat, "\n".join(x for x in L if x is not None))
     log_signal(sym, d["close3"])
-
-def cancel_pending(st, chat, sym, reason):
-    p = st.get("pendings", {}).pop(sym, None)
-    if not p: return
-    if AUTO_TRADE and p.get("live_order_id"):
-        r = bybit_cancel_order(sym, p["live_order_id"])
-        if r.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: не удалось отменить лимитку на Bybit: {r.get('retMsg')}")
-    tg_send(chat, f"\u274C {sym}: лимитка отменена — {reason}. Слот свободен ({slots_used(st)}/{MAX_CONCURRENT}).")
-    save_state(st)
-
-def fill_pending(st, chat, sym):
-    """Лимитный ордер исполнен. Если AUTO_TRADE включён — сама лимитка уже стоит на Bybit
-    (выставлена в момент open_pending через bybit_limit_buy); здесь просто фиксируем позицию в state
-    и вешаем SL + TP1-лимитку на биржу."""
-    p = st["pendings"].pop(sym)
-    qty = NOTIONAL / p["entry"]
-    fee_in = NOTIONAL * FEE_MAKER
-    st["positions"][sym] = dict(sym=sym, entry=p["entry"], sl=p["sl"], tp1=p["tp1"], tp2=p["tp2"],
-                                 atr=p["atr"],
-                                 qty=qty, qty_init=qty, fee_in=fee_in,
-                                 half_closed=False, be_moved=False, peak=0.0,
-                                 tp1_order_id=None,
-                                 opened=dt.datetime.now().isoformat(timespec="seconds"))
-    st["trades_today"] = st.get("trades_today", 0) + 1
-    save_state(st)
-    stop_full, tp1_half, be_after_tp1, tp2_full, trail_min = _profit_scenarios(
-        p["entry"], p["sl"], p["tp1"], p["tp2"], qty, p["atr"])
-
-    live_note = "PAPER (комиссии учтены)"
-    if AUTO_TRADE:
-        live_note = "LIVE" + (" DEMO" if BYBIT_USE_DEMO else " РЕАЛ") + " (Bybit)"
-        bybit_set_leverage(sym, LEVERAGE)
-        r_stop = bybit_set_stop(sym, sl_price=p["sl"], tp_price=None)
-        if r_stop.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: SL не выставлен на Bybit: {r_stop.get('retMsg')}")
-        r_tp1 = bybit_reduce_limit(sym, qty / 2, p["tp1"])
-        if r_tp1.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: TP1-лимитка не выставлена: {r_tp1.get('retMsg')}")
-        else:
-            st["positions"][sym]["tp1_order_id"] = r_tp1.get("result", {}).get("orderId")
-        save_state(st)
-
-    tg_send(chat,
-            f"\u2705 {p['sym']}: ЛИМИТКА ИСПОЛНЕНА (ретест 23.6% сработал) \u2014 {live_note}\n"
-            f"\U0001F4B5 Цена входа: ${p['entry']:.6g}\n"
-            f"\U0001F4E6 Куплено: {qty:.4g} {p['sym'].replace('USDT','')} на ${NOTIONAL:.0f} "
-            f"(маржа {MARGIN:.0f}$ \u00d7{LEVERAGE:.0f})\n"
-            f"\U0001F6D1 Стоп ${p['sl']:.6g} \u2192 {stop_full:+.2f}$ \u00b7 "
-            f"\U0001F3AF TP1 ${p['tp1']:.6g} \u2192 {tp1_half:+.2f}$ за 50%\n"
-            f"\U0001F3AF TP2 ${p['tp2']:.6g} \u2192 {tp2_full:+.2f}$ суммарно (после переноса остатка в БУ)\n"
-            f"\U0001F4C5 Сделка \u2116{st['trades_today']} сегодня \u00b7 Слоты: {slots_used(st)}/{MAX_CONCURRENT} \u00b7 {live_note}\n"
-            f"Команды: /pos \u00b7 /stats")
-
-def check_pending(st, chat):
-    """Проверка неисполненных лимиток: если цена дошла до entry — филл; если TTL истёк — отмена."""
-    for sym, p in list(st.get("pendings", {}).items()):
-        try:
-            o, h, l, c, v, tb, ct = klines15(sym, limit=3); time.sleep(0.08)
-        except Exception:
-            continue
-        lo, cl = l[-2], c[-2]
-        if cl < p["sl"]:
-            cancel_pending(st, chat, sym, "закрытие ниже стопа до входа (структура сломана)"); continue
-        if lo <= p["entry"]:
-            fill_pending(st, chat, sym); continue
-        p["ttl"] -= 1
-        if p["ttl"] <= 0:
-            cancel_pending(st, chat, sym, f"ретеста не было за {ENTRY_TTL_BARS} свечи (авто-отмена)")
-        else:
-            save_state(st)
 
 def close_part(st, chat, pos, price, part, reason):
     qty_close = pos["qty"] * part
@@ -772,11 +715,9 @@ _reject_stats = {}
 _scan_counter = {"total": 0, "last_reset": time.time()}
 
 def scan_once(st, chat):
-    """КРИТИЧЕСКИЙ ФИКС: строгий guard last_processed_candle_time на символ.
-    Стратегия ОЦЕНИВАЕТСЯ и позиции ОТКРЫВАЮТСЯ ровно ОДИН РАЗ за цикл жизни свечи —
-    только если текущий closed-bar timestamp > last_processed_candle_time[sym].
-    Тик сканера (SCAN_EVERY_SEC=5с) не даёт мид-свечных входов: до смены bar_id функция
-    detect_signal() для этого символа просто не вызывается."""
+    """Guard last_processed_candle_time на символ: оценка стратегии и МАРКЕТ-вход происходят
+    ровно ОДИН РАЗ за цикл жизни свечи, точно на открытии новой свечи сразу после закрытия
+    сигнальной (bar_id сменился = предыдущая свеча закрылась). Мид-свечные входы исключены."""
     if BT_RUNNING["on"]:
         return
     ok_allowed, why = trading_allowed(st)
@@ -808,7 +749,7 @@ def scan_once(st, chat):
             continue
         allowed, why = trading_allowed(st)
         if not allowed: return
-        open_pending(st, sym, d, chat)   # ЛИМИТКА на фибо-ретрейсе, не маркет
+        open_market_position(st, sym, d, chat)   # МАРКЕТ на открытии новой свечи (лимитка/ретест отключены)
         busy.add(sym)
         if slots_used(st) >= MAX_CONCURRENT:
             return
@@ -983,11 +924,12 @@ def _bt_reason(msg):
     return "прочее"
 
 def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
-    """Симуляция лимитного входа на фибо-ретрейсе 23.6% (FIB_RETRACE=0.236), TTL=2 свечи:
+    """Симуляция маркет-входа на открытии новой свечи сразу после сигнальной (FIB_RETRACE=0.0):
+    FOMO CAP (BAR_ATR_MAX=2.5) уже отсекает перерастянутые свечи внутри detect_signal.
     TP1=entry+2*ATR (закрыть 50%, SL остатка -> БУ), TP2=entry+4.5*ATR (закрыть остаток),
     между TP1 и TP2 трейлинг 1.5*ATR от пика."""
     W = LEVEL_LOOKBACK + 40
-    positions = []; pending = None; pos = None
+    positions = []; pos = None
     j = 0; oi_vals = []
     for i in range(W, len(c)):
         while j < len(oi_ts) and oi_ts[j][0] <= ct[i]:
@@ -1016,20 +958,7 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
                 if bar_l <= pos["sl"]:
                     _bt_leg(pos, pos["sl"], 1.0)
                     pos["close_ts"] = ct[i]; positions.append(pos); pos = None
-        elif pending:
-            if bar_c < pending["sl"]:
-                pending = None
-            elif bar_l <= pending["entry"]:
-                qty = NOTIONAL / pending["entry"]
-                pos = dict(sym=sym, entry=pending["entry"], sl=pending["sl"], tp1=pending["tp1"],
-                           tp2=pending["tp2"], atr=pending["atr"],
-                           qty=qty, qty_init=qty, fee_in=NOTIONAL * FEE_MAKER,
-                           half=False, peak=0.0, pnl=0.0, open_ts=ct[i])
-                pending = None
-            else:
-                pending["ttl"] -= 1
-                if pending["ttl"] <= 0: pending = None
-        if pos is None and pending is None:
+        if pos is None:
             if len(oi_vals) < 5:
                 if diag is not None: diag["no_oi"] += 1
                 continue
@@ -1038,8 +967,10 @@ def bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts, diag=None):
                                    c[i+1-W:i+1], v[i+1-W:i+1], tb[i+1-W:i+1], oi_vals[-8:])
             if ok:
                 if diag is not None: diag["signals"] += 1
-                pending = dict(entry=d["entry"], sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
-                                atr=d["atr"], ttl=ENTRY_TTL_BARS)
+                qty = NOTIONAL / d["entry"]
+                pos = dict(sym=sym, entry=d["entry"], sl=d["sl"], tp1=d["tp1"], tp2=d["tp2"],
+                           atr=d["atr"], qty=qty, qty_init=qty, fee_in=NOTIONAL * FEE_MAKER,
+                           half=False, peak=0.0, pnl=0.0, open_ts=ct[i])
             elif diag is not None:
                 lbl = _bt_reason(d)
                 diag["reasons"][lbl] = diag["reasons"].get(lbl, 0) + 1
@@ -1206,7 +1137,6 @@ def main():
             now = time.time()
             if now - last_manage >= MANAGE_EVERY_SEC:
                 last_manage = now
-                check_pending(st, chat)
                 manage_position(st, chat)
             if now - last_scan >= SCAN_EVERY_SEC:
                 last_scan = now
