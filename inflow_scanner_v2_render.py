@@ -48,7 +48,7 @@ MARGIN     = float(os.environ.get("MARGIN_USD", 50))
 LEVERAGE   = float(os.environ.get("LEVERAGE", 10))
 NOTIONAL   = MARGIN * LEVERAGE                 # объём позиции, $ (по спеке 50*10=500)
 
-MAX_CONCURRENT     = int(os.environ.get("MAX_CONCURRENT", 2))   # позиций ОДНОВРЕМЕННО (слоты)
+MAX_CONCURRENT     = int(os.environ.get("MAX_CONCURRENT", 1))   # позиций ОДНОВРЕМЕННО (слоты)
 MAX_DAILY_TRADES   = int(os.environ.get("MAX_DAILY_TRADES", 0))  # 0 = дневного лимита НЕТ (слоты пополняются)
 
 # --- сигнал (спека) ---
