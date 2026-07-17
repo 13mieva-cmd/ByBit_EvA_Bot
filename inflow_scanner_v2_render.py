@@ -236,60 +236,61 @@ def atr(h, l, c, period=14):
 
 # ============================== СИГНАЛ — ВАРИАНТ Б (революционный) ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Финальная сбалансированная версия — гибрид"""
+    """Гибрид: ослабленная структура + сильный акцент на деньги"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # 1. Структура (разумный минимум)
+    # 1. Структура (ослабленная)
     green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
     strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
     if green_count < 2 or not strong_momentum:
-        return False, "слабая структура (минимум 2 зелёные + momentum)"
+        return False, "слабая структура (минимум 2 зелёные + пробой high)"
 
-    # 2. Затишье + всплеск
+    # 2. Затишье + всплеск (сбалансировано)
     base = v[i1 - VOL_MA_LEN:i1]
-    if len(base) < VOL_MA_LEN: return False, "мало базы"
+    if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
     
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW + 2: return False, f"шум в затишье ({noisy})"
+    if noisy > QUIET_ALLOW + 2: return False, f"не было затишья ({noisy} шумн.)"
     
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
     # 3. Фитиль
     rng3 = h[i3] - l[i3]
-    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.40:
-        return False, "длинный фитиль"
+    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > 0.38:
+        return False, "длинный фитиль 3-й свечи"
 
-    # 4. CVD
+    # 4. CVD (деньги)
     deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
     if sum(deltas) <= 0 or deltas[-1] <= 0:
-        return False, "CVD слабый"
+        return False, "CVD: слабые покупки"
 
     # 5. OI
-    oi_ok = False
+    oi_ok = False; oi_chg = 0.0
     if len(oi) >= 5:
-        oi_chg = (oi[-1] / oi[-5] - 1) if oi[-5] > 0 else 0
-        oi_ok = oi_chg >= OI_MIN_GROW and all(oi[i] >= oi[i-1]*0.992 for i in range(-3,0))
-    if not oi_ok: return False, "OI слабый"
+        oi_before = oi[-5]
+        oi_chg = (oi[-1] / oi_before - 1) if oi_before > 0 else 0
+        oi_ok = oi_chg >= OI_MIN_GROW
+    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%)"
 
-    # 6. EMA
+    # 6. EMA + RSI + Уровень (оставляем)
     e21 = ema_series(c, EMA_FAST)[-1]
-    if c[i3] <= e21: return False, "нет аптренда"
+    e50 = ema_series(c, EMA_SLOW)[-1]
+    if c[i3] <= e21: return False, "нет аптренда EMA"
 
-    # 7. RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
-    if r > RSI_MAX: return False, f"RSI перегрет"
+    if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 8. Уровень
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
     if c[i3] <= level: return False, "уровень не пробит"
 
-    # Расчёт входа
     impulse = h[i3] - l[i1]
+    if impulse <= 0: return False, "нет импульса"
+
     entry = h[i3] - FIB_RETRACE * impulse
     sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
@@ -298,10 +299,10 @@ def detect_signal(o, h, l, c, v, tb, oi):
     tp1 = entry + (entry - sl) * TP1_RR
 
     return True, dict(
-        spike=spike, deltas=deltas, oi_chg=oi_chg if 'oi_chg' in locals() else 0, rsi=r,
-        e21=e21, e50=ema_series(c, EMA_SLOW)[-1], level=level, 
-        low1=l[i1], high3=h[i3], entry=entry, sl=sl, tp1=tp1, 
-        risk_pct=risk_pct, wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3]
+        spike=spike, deltas=deltas, oi_chg=oi_chg, rsi=r,
+        e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i3],
+        entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct,
+        wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3],
     )
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
@@ -857,6 +858,138 @@ def bt_portfolio(all_pos, deposit):
     for t in taken: eq.append(eq[-1] + t["pnl"])
     return taken, eq
 
+
+# ============================== WALK-FORWARD / КРОСС-ВАЛИДАЦИЯ ==============================
+# Сетка параметров для перебора на ТЮНИНГ-группе. Небольшая и осмысленная (не тысячи комбо —
+# это само по себе защита от подгонки: чем больше комбинаций перебираешь, тем выше шанс,
+# что лучшая — это просто везение).
+WF_GRID = {
+    "VOL_SPIKE_MIN":  [2.0, 2.5, 3.0],
+    "QUIET_MAX":      [1.8, 2.2],
+    "TRAIL_CALLBACK": [0.004, 0.008, 0.015],   # ключевая гипотеза: тугой трейлинг режет победителей
+    "CVD_MODE":       ["all", "sum"],
+}
+
+def _wf_eval(cache, coins, params):
+    """Гоняет ОДИН набор параметров по списку монет из кэша. Возвращает метрики портфеля."""
+    saved = {}
+    for g, val in params.items():
+        saved[g] = globals()[g]; globals()[g] = val
+    try:
+        all_pos = []
+        for sym in coins:
+            data = cache.get(sym)
+            if not data: continue
+            o, h, l, c, v, tb, ct, oi_ts = data
+            all_pos += bt_simulate_coin(sym, o, h, l, c, v, tb, ct, oi_ts)
+        taken, eq = bt_portfolio(all_pos, DEPOSIT)
+    finally:
+        for g, val in saved.items(): globals()[g] = val
+    n = len(taken)
+    if n == 0:
+        return dict(n=0, pnl=0.0, wr=0.0, expectancy=0.0, eq=[DEPOSIT])
+    pnl = eq[-1] - DEPOSIT
+    wins = sum(1 for t in taken if t["pnl"] > 0)
+    return dict(n=n, pnl=pnl, wr=wins / n * 100, expectancy=pnl / n, eq=eq)
+
+def _wf_grid_iter():
+    import itertools
+    keys = list(WF_GRID)
+    for combo in itertools.product(*[WF_GRID[k] for k in keys]):
+        yield dict(zip(keys, combo))
+
+def run_walkforward(chat, days=30, ncoins=60):
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        days = max(7, min(days, 30)); ncoins = max(10, min(ncoins, 60))
+        n_combos = len(list(_wf_grid_iter()))
+        tg_send(chat, f"\U0001F9EE <b>WALK-FORWARD запущен</b>: {days} дн \u00d7 {ncoins} монет.\n"
+                      f"Делю монеты пополам: <b>A</b> (тюнинг) / <b>B</b> (проверка, тюнинг её НЕ видит).\n"
+                      f"Перебор {n_combos} наборов параметров на A, лучший \u2192 на нетронутой B.\n"
+                      f"Живой скан на паузе. Качаю историю (это дольше обычного бэктеста)\u2026")
+        # 1) качаем данные ОДИН раз, кэшируем
+        coins = universe()[:ncoins]
+        cache = {}
+        for k, sym in enumerate(coins, 1):
+            try:
+                o, h, l, c, v, tb, ct = bt_klines(sym, days)
+                if len(c) < LEVEL_LOOKBACK + 60: continue
+                oi_ts = bt_oi(sym, days)
+                if len(oi_ts) < 20: continue
+                cache[sym] = (o[:-1], h[:-1], l[:-1], c[:-1], v[:-1], tb[:-1], ct[:-1], oi_ts)
+            except Exception as e:
+                print(f"wf {sym} err:", e)
+            if k % 15 == 0:
+                tg_send(chat, f"\u2699\uFE0F Качаю: {k}/{len(coins)} монет\u2026")
+        loaded = list(cache.keys())
+        if len(loaded) < 8:
+            tg_send(chat, f"\u274C Мало данных ({len(loaded)} монет) — увеличь окно/монеты."); return
+        # 2) детерминированное разбиение: чётный индекс -> A, нечётный -> B
+        group_a = [s for i, s in enumerate(loaded) if i % 2 == 0]
+        group_b = [s for i, s in enumerate(loaded) if i % 2 == 1]
+        tg_send(chat, f"\U0001F4CA Разбил: A={len(group_a)} монет (тюнинг), B={len(group_b)} монет (проверка). "
+                      f"Перебираю {n_combos} наборов на A\u2026")
+        # 3) перебор на A — выбираем лучший по expectancy (средний PnL на сделку), но с мин. числом сделок
+        best = None
+        for params in _wf_grid_iter():
+            m = _wf_eval(cache, group_a, params)
+            if m["n"] < 8:            # слишком мало сделок на A -> ненадёжно, пропускаем
+                continue
+            score = m["expectancy"]
+            if best is None or score > best["score"]:
+                best = dict(score=score, params=params, a=m)
+        if not best:
+            tg_send(chat, "\U0001F4ED Ни один набор не дал \u22658 сделок на группе A — выборка мала. "
+                          "Попробуй /walkforward 30 60 или ослабь пресетом."); return
+        # 4) ГЛАВНОЕ: лучший набор с A гоним на НЕТРОНУТОЙ B
+        mb = _wf_eval(cache, group_b, best["params"])
+        pa = best["a"]
+        pstr = " ".join(f"{k.split('_')[0].lower()}={v}" for k, v in best["params"].items())
+        verdict = _wf_verdict(pa, mb)
+        txt = (f"\U0001F9EE <b>WALK-FORWARD ИТОГ</b>\n"
+               f"Лучший набор на A: <code>{pstr}</code>\n"
+               f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+               f"<b>A (тюнинг, {len(group_a)} монет):</b> сделок {pa['n']}, "
+               f"плюс {pa['wr']:.0f}%, PnL {pa['pnl']:+.1f}$, ср/сделка {pa['expectancy']:+.2f}$\n"
+               f"<b>B (проверка, {len(group_b)} монет):</b> сделок {mb['n']}, "
+               f"плюс {mb['wr']:.0f}%, PnL {mb['pnl']:+.1f}$, ср/сделка {mb['expectancy']:+.2f}$\n"
+               f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+               f"{verdict}")
+        tg_send(chat, txt)
+        if HAS_MPL and (pa["eq"] or mb["eq"]):
+            try:
+                plt.figure(figsize=(10, 5))
+                plt.plot(pa["eq"], label=f"A тюнинг ({pa['n']})", linewidth=1.6)
+                plt.plot(mb["eq"], label=f"B проверка ({mb['n']})", linewidth=1.6)
+                plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.5)
+                plt.title("Walk-forward: подгонка (A) vs честная проверка (B)")
+                plt.xlabel("Сделки"); plt.ylabel("Капитал $"); plt.legend(); plt.grid(True, alpha=0.4)
+                p = "/tmp/wf.png"; plt.savefig(p, dpi=110, bbox_inches="tight"); plt.close()
+                tg_photo(chat, p, caption="Если синяя (A) вверх, а оранжевая (B) вниз — это подгонка, не edge.")
+            except Exception as e:
+                print("wf chart err:", e)
+    finally:
+        BT_RUNNING["on"] = False
+
+def _wf_verdict(a, b):
+    """Честный вердикт: выжил ли edge на невиданной группе B."""
+    if b["n"] < 5:
+        return ("\u2696\uFE0F <b>НЕОПРЕДЕЛЁННО.</b> На проверочной группе всего "
+                f"{b['n']} сделок — мало для вывода. Нужна бОльшая выборка (больше монет/дней).")
+    if b["expectancy"] > 0 and a["expectancy"] > 0:
+        return ("\u2705 <b>EDGE ВЫЖИЛ на невиданных данных.</b> Прибыль на группе B, которую подбор "
+                "не видел — это уже не подгонка. Осторожный оптимизм: можно фиксировать набор в боте "
+                "и копить форвардный /stats. НО помни: выборка мала, финальный судья — живой paper.")
+    if a["expectancy"] > 0 and b["expectancy"] <= 0:
+        return ("\u274C <b>ЭТО БЫЛА ПОДГОНКА.</b> На A (где тюнили) плюс, на B (невиданной) минус — "
+                "классический оверфит. Набор заучил прошлое группы A, а не нашёл преимущество. "
+                "Торговать это нельзя — на форварде поведёт себя как B, т.е. в минус. "
+                "Честный вывод: у стратегии в этом виде нет edge. Меняем не пороги, а саму идею.")
+    return ("\U0001F53B <b>Нет преимущества.</b> Даже на тюнинг-группе A набор не в плюсе — "
+            "искать нечего. Паттерн в этом виде рынок не отрабатывает.")
+
 def run_backtest(chat, days=14, ncoins=30, overrides=None):
     if BT_RUNNING["on"]:
         tg_send(chat, "\u23F3 Бэктест уже идёт — дождись окончания."); return
@@ -961,6 +1094,7 @@ def tg_loop(st):
                         "/backtest [дней] [монет] [ключ=знач ...] — прогон по истории + воронка + график.\n"
                         "   Калибровка порогов (живой бот не трогается): spike= quiet= qbars= wick= atr= body= oi= rsi=\n"
                         "   Пример: /backtest 30 60 spike=2.0 quiet=2.2 \u00b7 или пресет: /backtest 30 60 soft\n"
+                        "/walkforward [дней] [монет] — ЧЕСТНАЯ проверка на edge: тюнинг на половине монет, проверка на другой (детектор подгонки)\n"
                         "/pause — пауза (новые сигналы не ищутся, позиция ведётся)\n"
                         "/resume — возобновить сканирование\n"
                         "/help — эта справка")
@@ -982,6 +1116,12 @@ def tg_loop(st):
                     tg_send(cid, pos_text(st))
                 elif text.startswith("/stats"):
                     tg_send(cid, stats_text())
+                elif text.startswith("/walkforward") or text.startswith("/wf"):
+                    parts = text.split()
+                    nums = [p for p in parts if p.isdigit()]
+                    wd = int(nums[0]) if len(nums) > 0 else 30
+                    wc = int(nums[1]) if len(nums) > 1 else 60
+                    threading.Thread(target=run_walkforward, args=(cid, wd, wc), daemon=True).start()
                 elif text.startswith("/backtest"):
                     bd, bc, ov = _parse_bt_args(text)
                     threading.Thread(target=run_backtest, args=(cid, bd, bc, ov), daemon=True).start()
