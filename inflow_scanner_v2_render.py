@@ -56,7 +56,7 @@ TF = "15m"
 VOL_MA_LEN = 20
 VOL_SPIKE_MIN = 1.8     # снижено с 2.5: ловим импульс в зародыше, не на хаях
 QUIET_BARS = 6          # снижено с 12: достаточно полки накопления для крипты
-QUIET_MAX = 2.5         # расширено с 1.8: объём чуть "дышит" в полке
+QUIET_MAX = 2.2         # расширено с 1.8: объём чуть "дышит" в полке
 QUIET_ALLOW = 0         # разрешаем 1 шумный бар внутри полки затишья
 WICK_MAX = 0.30
 ATR_LEN = 14
@@ -69,8 +69,8 @@ LEVEL_LOOKBACK = 96
 EMA_FAST, EMA_SLOW = 21, 50
 
 # --- вход/выход (спека) ---
-FIB_RETRACE = 0.382
-ENTRY_TTL_BARS = 4     # снижено с 8: если за 4 бара не налили - импульс скис
+FIB_RETRACE = 0.0
+ENTRY_TTL_BARS = 1     # снижено с 8: если за 4 бара не налили - импульс скис
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.00055
 
@@ -83,8 +83,8 @@ ATR_TRAIL_MULT = 1.5   # после TP1: SL остатка -> БУ, трейли
 # --- вселенная ---
 MAX_COINS = 300
 MIN_QUOTE_VOL24 = 5_000_000
-SCAN_EVERY_SEC = 90
-MANAGE_EVERY_SEC = 20
+SCAN_EVERY_SEC = 5
+MANAGE_EVERY_SEC = 5
 
 # --- файлы (на volume) ---
 def ensure_dirs():
