@@ -1,2 +1,3 @@
 requests
 matplotlib
+aiohttp>=3.9
