@@ -348,97 +348,57 @@ def atr(h, l, c, period=14):
 
 # ============================== СИГНАЛ (по спеке, БЕЗ "3 зелёных") ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Импульсная свеча -1 (последняя закрытая). Возвращает (ok, details|причина)."""
+    """Минималистичная версия для теста — только самые важные фильтры"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
-    i1 = n - 1  # импульсная свеча
+    i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # 1) импульсная свеча зелёная и пробивает high предыдущей
-    if not (c[i1] > o[i1]): return False, "импульсная свеча не зелёная"
-    if not (c[i1] > h[i1 - 1]): return False, "нет пробоя high пред. свечи"
-
-    # 2) затишье до импульса + всплеск объёма на импульсной свече
+    # 1. Всплеск объёма (самое важное)
     base = v[i1 - VOL_MA_LEN:i1]
-    if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
+    if len(base) < VOL_MA_LEN: return False, "мало базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
-    noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW: return False, f"не было затишья ({noisy} шумн.)"
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
-    # 3) фитиль импульсной свечи <= 30% размаха
-    rng1 = h[i1] - l[i1]
-    if rng1 <= 0: return False, "нулевая импульсная свеча"
-    upper_wick = (h[i1] - c[i1]) / rng1
-    if upper_wick > WICK_MAX: return False, f"фитиль {upper_wick*100:.0f}%>30%"
+    # 2. Минимум движения цены
+    impulse = h[i3] - l[i1]
+    if impulse / l[i1] < 0.004: return False, "импульс слишком маленький"
 
-    # 4) импульсная свеча не параболик (ATR-кап)
-    a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
-    if a > 0:
-        if rng1 > BAR_ATR_MAX * a: return False, f"свеча параболик ({rng1/a:.1f}x ATR)"
+    # 3. CVD (деньги)
+    deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
+    if sum(deltas) <= 0: return False, "CVD отрицательный"
 
-    # 5) CVD: дельта > 0 на импульсной свече (агрессивные покупки)
-    delta = 2 * tb[i1] - v[i1]
-    if delta <= 0: return False, "дельта не растёт"
+    # 4. OI
+    oi_ok = False
+    if len(oi) >= 4:
+        oi_chg = (oi[-1] / oi[-4] - 1) if oi[-4] > 0 else 0
+        oi_ok = oi_chg >= OI_MIN_GROW * 0.7   # мягче
+    if not oi_ok: return False, "OI слабый"
 
-    # 6) OI-ПОДТВЕРЖДЕНИЕ: рост Open Interest СТРОГО на сигнальной свече (Current vs Previous)
-    # (Current_OI - Previous_OI) / Previous_OI < OI_MIN_GROW (2%) -> сигнал отбрасывается мгновенно
-    oi_ok = False; oi_chg = 0.0
-    if len(oi) >= 2 and oi[-2] > 0:
-        oi_chg = (oi[-1] - oi[-2]) / oi[-2]
-        oi_ok = oi_chg >= OI_MIN_GROW
-    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%, нужно \u2265{OI_MIN_GROW*100:.0f}%)"
+    # 5. Пробой уровня + EMA
+    level = max(h[i1 - LEVEL_LOOKBACK:i1])
+    if c[i3] <= level: return False, "уровень не пробит"
 
-    # 6b) SMART MONEY (взято из prop-логики): оба потока согласны одновременно.
-    # OI и CVD оба уже проверены выше — эта проверка избыточна как фильтр,
-    # но фиксирует явное "двойное подтверждение денег" для карточки/score.
-    smart_money = (delta > 0) and (oi_chg > 0)
+    e21 = ema_series(c, EMA_FAST)[-1]
+    if c[i3] <= e21: return False, "нет аптренда EMA"
 
-    # 7) тренд: close > EMA21 > EMA50
-    e21 = ema_series(c, EMA_FAST)[-1]; e50 = ema_series(c, EMA_SLOW)[-1]
-    if not (c[i1] > e21 > e50): return False, "нет аптренда EMA"
-
-    # 8) RSI < 75
+    # 6. RSI
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
     if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 9) пробой локального уровня (max high за сутки ДО импульса)
-    level = max(h[i1 - LEVEL_LOOKBACK:i1])
-    if not (c[i1] > level): return False, "уровень не пробит"
-
-    # === SCORE-РЕЙТИНГ КАЧЕСТВА (взято из prop-логики) ===
-    # Все обязательные фильтры пройдены (иначе был бы return выше). Здесь собираем
-    # "качественный score" — насколько сильный сигнал в рамках прошедших. Идёт в карточку.
-    score, reasons = 0, []
-    score += 2; reasons.append(f"Volume x{spike:.1f}")
-    score += 2; reasons.append("Breakout уровня")
-    score += 2; reasons.append("Smart money (OI+CVD)")
-    score += 1; reasons.append(f"RSI {r:.0f}<75")
-    # Бонус: явно сильный всплеск
-    if spike >= 3.5: score += 1; reasons.append("Спайк x3.5+")
-    # Бонус: чистая свеча (короткий фитиль)
-    if upper_wick <= 0.15: score += 1; reasons.append("Фитиль <15%")
-    # Бонус: OI растёт заметно
-    if oi_chg >= 0.03: score += 1; reasons.append(f"OI +{oi_chg*100:.1f}%")
-
-    impulse = h[i1] - l[i1]
-    if impulse <= 0: return False, "нет импульса"
-    # FIB_RETRACE=0.0: entry = цена закрытия сигнальной свечи ≈ цена открытия следующей (маркет-вход)
-    entry = c[i1] - FIB_RETRACE * (c[i1] - o[i1])
-    if a <= 0: return False, "нет ATR для риск-менеджмента"
-    sl = entry - ATR_SL_MULT * a           # динамический SL: entry - 1.5*ATR
+    # Расчёт входа
+    entry = h[i3] - FIB_RETRACE * impulse
+    sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
+
     risk_pct = (entry - sl) / entry
-    tp1 = entry + ATR_TP1_MULT * a         # TP1: entry + 2.0*ATR -> закрыть 50%
-    tp2 = entry + ATR_TP2_MULT * a         # TP2: entry + 4.5*ATR -> закрыть остаток
+    tp1 = entry + (entry - sl) * TP1_RR
 
     return True, dict(
-        spike=spike, delta=delta, oi_chg=oi_chg, rsi=r,
-        e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
-        entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
-        wick=upper_wick, close3=c[i1], smart_money=smart_money,
-        score=score, reasons=reasons,
+        spike=spike, deltas=deltas, oi_chg=oi_chg if 'oi_chg' in locals() else 0, rsi=r,
+        e21=e21, level=level, low1=l[i1], high3=h[i3],
+        entry=entry, sl=sl, tp1=tp1, risk_pct=risk_pct, close3=c[i3]
     )
 
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
