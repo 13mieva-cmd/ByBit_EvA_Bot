@@ -1,3 +1,4 @@
 requests
+pandas
 matplotlib
-aiohttp>=3.9
+aiohttp
