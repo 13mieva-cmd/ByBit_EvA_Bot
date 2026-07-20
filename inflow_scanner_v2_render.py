@@ -2811,7 +2811,8 @@ def run_livecheck(chat, sym="BTCUSDT"):
 # SCORED BACKTEST + KILL-SWITCH + WALK-FORWARD 20d/10d
 # ============================================================================
 def bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts, threshold=None,
-                       weights=None, capital=None, kill_dd=None, diag=None, seed=None):
+                       weights=None, capital=None, kill_dd=None, diag=None, seed=None,
+                       use_regime=False, use_kelly=False, collect_only=False):
     """Прогон scored-детектора с реалистичным исполнением, score-сайзингом и kill-switch."""
     import random as _r
     rng = _r.Random(seed) if seed is not None else _r
@@ -2854,15 +2855,33 @@ def bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts, threshold=None,
         # --- поиск входа ---
         if pos is None and len(oi_vals) >= 2:
             if diag is not None: diag["evals"] += 1
+            if use_regime:
+                reg = market_regime(c, i)
+                if reg != "trend":
+                    if diag is not None:
+                        diag["reasons"][f"режим рынка: {reg}"] = diag["reasons"].get(f"режим рынка: {reg}", 0) + 1
+                    continue
             ok, d = detect_signal_scored(o[i+1-W_:i+1], h[i+1-W_:i+1], l[i+1-W_:i+1],
                                          c[i+1-W_:i+1], v[i+1-W_:i+1], tb[i+1-W_:i+1],
                                          oi_vals[-8:], threshold=threshold, weights=weights)
             if ok:
                 if diag is not None: diag["signals"] += 1
+                if collect_only:
+                    # режим сбора кандидатов для TOP-N: сделку не открываем
+                    trades.append(dict(candidate=True, symbol=sym, ts=ct[i], i=i,
+                                       score=d["score"], entry=d["entry"], sl=d["sl"],
+                                       tp1=d["tp1"]))
+                    continue
                 entry = apply_slippage(d["entry"], "long", rng)
                 stop_dist = entry - d["sl"]
                 if stop_dist > 0:
-                    risk_usd = size_from_score(capital, d["score"])   # объём ~ силе сигнала
+                    if use_kelly:
+                        frac = size_kelly_lite(d["score"])
+                        if frac <= 0:
+                            continue
+                        risk_usd = capital * frac
+                    else:
+                        risk_usd = size_from_score(capital, d["score"])
                     qty = risk_usd / stop_dist
                     qty = min(qty, NOTIONAL / entry)                  # потолок плеча
                     pos = dict(entry=entry, sl=d["sl"], tp1=d["tp1"], qty=qty,
@@ -3320,7 +3339,214 @@ def run_adaptive(chat, days=30, ncoins=60, adapt_every=500):
         BT_RUNNING["on"] = False
 
 
-def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest"):
+
+# ============================================================================
+# SCORE BINNING / REGIME FILTER / KELLY-LITE / TOP-N RANKING
+# ============================================================================
+def score_binning(trades, bins=(3, 4, 5, 6, 7, 8)):
+    """Ключевая диагностика: разбиваем сделки по силе сигнала и смотрим,
+    есть ли прибыль в ХВОСТЕ распределения (score > X)."""
+    out = []
+    for i in range(len(bins) - 1):
+        low, high = bins[i], bins[i + 1]
+        tb = [t for t in trades if low <= t.get("score", 0) < high]
+        if not tb:
+            out.append(dict(low=low, high=high, n=0, wr=0.0, pnl=0.0, avg=0.0))
+            continue
+        wins = sum(1 for t in tb if t["pnl"] > 0)
+        pnl = sum(t["pnl"] for t in tb)
+        out.append(dict(low=low, high=high, n=len(tb), wr=wins / len(tb),
+                        pnl=pnl, avg=pnl / len(tb)))
+    return out
+
+
+def binning_report(trades, bins=(3, 4, 5, 6, 7, 8)):
+    rows = score_binning(trades, bins)
+    L = ["\U0001F4CA <b>SCORE BINNING</b> — где живёт прибыль:",
+         "<code>score      сделок  win%    PnL$     ср/сделку</code>"]
+    best = None
+    for r in rows:
+        if r["n"] == 0:
+            L.append(f"<code>{r['low']}-{r['high']}        0       —        —          —</code>")
+            continue
+        L.append(f"<code>{r['low']}-{r['high']}    {r['n']:6d}  {r['wr']*100:5.1f}  "
+                 f"{r['pnl']:+9.1f}  {r['avg']:+8.3f}</code>")
+        if r["n"] >= 20 and (best is None or r["avg"] > best["avg"]):
+            best = r
+    # ищем ЛУЧШИЙ порог: максимум среднего PnL на сделку при достаточной выборке
+    cum = None
+    for r in rows:
+        if r["n"] == 0: continue
+        agg_n = sum(x["n"] for x in rows if x["low"] >= r["low"])
+        agg_pnl = sum(x["pnl"] for x in rows if x["low"] >= r["low"])
+        if agg_n >= 30 and agg_pnl > 0:
+            avg = agg_pnl / agg_n
+            if cum is None or avg > cum[3]:
+                cum = (r["low"], agg_n, agg_pnl, avg)
+    if cum:
+        L.append(f"\n\U0001F3AF Лучший порог: score \u2265 <b>{cum[0]}</b> \u2014 "
+                 f"{cum[1]} сделок, PnL {cum[2]:+.1f}$ ({cum[3]:+.3f}$/сделку) "
+                 f"\u2014 <b>кандидат в alpha threshold</b>")
+        L.append("<i>\u26A0\uFE0F Найдено НА ЭТИХ ЖЕ данных. Обязательно проверь на невиданных: "
+                 "/scoredwf 30 60 — иначе это подгонка.</i>")
+    else:
+        L.append("\n\u274C Нет порога, выше которого совокупный PnL положителен "
+                 "(при \u226530 сделках). Альфы в хвосте не видно.")
+    return "\n".join(L)
+
+
+def market_regime(closes, i, vol_win=50, trend_win=50,
+                  dead_vol=0.01, chop_trend=0.02):
+    """dead — волатильность мертва, chop — нет направления, trend — торгуем."""
+    if i < max(vol_win, trend_win) + 1:
+        return "dead"
+    rets = [(closes[k] / closes[k-1] - 1.0) for k in range(i - vol_win + 1, i + 1) if closes[k-1] > 0]
+    if len(rets) < 2:
+        return "dead"
+    m = sum(rets) / len(rets)
+    vol = math.sqrt(sum((x - m) ** 2 for x in rets) / (len(rets) - 1))
+    trend = closes[i] / closes[i - trend_win] - 1.0 if closes[i - trend_win] > 0 else 0.0
+    if vol < dead_vol:
+        return "dead"
+    if abs(trend) < chop_trend:
+        return "chop"
+    return "trend"
+
+
+def size_kelly_lite(score, max_score=None):
+    """Kelly-lite: доля капитала растёт ступенями с уверенностью.
+    score нормируется в 0..1 от max_score."""
+    max_score = max_score or SCORE_MAX
+    s = score / max_score if max_score else 0.0
+    if s < 0.55: return 0.0
+    if s > 0.70: return 0.03
+    if s > 0.60: return 0.02
+    return 0.01
+
+
+def select_top_n(candidates, top_n=20, per_day=True, bar_ms=900000):
+    """TOP-N ranking: вместо 'торгуем всё, что прошло фильтр' берём лучшие идеи.
+    per_day=True -> топ-N в каждые сутки, иначе топ-N за весь период."""
+    if not per_day:
+        return sorted(candidates, key=lambda x: -x["score"])[:top_n]
+    by_day = {}
+    for cnd in candidates:
+        day = cnd["ts"] // (24 * 3600 * 1000)
+        by_day.setdefault(day, []).append(cnd)
+    out = []
+    for day, lst in by_day.items():
+        out += sorted(lst, key=lambda x: -x["score"])[:top_n]
+    return sorted(out, key=lambda x: x["ts"])
+
+
+
+def run_topn(chat, days=30, ncoins=60, threshold=3.0, top_n=20,
+             use_regime=False, use_kelly=True):
+    """TOP-N RANKING: собираем ВСЕ сигналы по всем монетам, ранжируем по score,
+    торгуем только лучшие N за сутки — 'лучшие идеи дня' вместо 'всё подряд'."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        days = max(7, min(days, 30)); ncoins = max(1, min(ncoins, 60))
+        tg_send(chat, f"\U0001F3C6 <b>TOP-N RANKING</b>: {days} дн \u00d7 {ncoins} монет\n"
+                      f"Порог отбора кандидатов: {threshold} \u00b7 берём <b>топ-{top_n} в сутки</b>\n"
+                      + (f"\U0001F30A Regime-фильтр: только 'trend'\n" if use_regime else "")
+                      + (f"\U0001F4B0 Kelly-lite сайзинг\n" if use_kelly else "")
+                      + f"Живой скан на паузе. Качаю историю\u2026")
+        cached = _bt_prefetch(days, ncoins)
+        if not cached:
+            tg_send(chat, "\u274C Не удалось загрузить данные."); return
+
+        # 1) собираем кандидатов по всем монетам
+        cands = []
+        bars = {}
+        diag = dict(evals=0, signals=0, reasons={}, killed=False)
+        for k, (sym, o, h, l, c, v, tb, ct, oi_ts) in enumerate(cached, 1):
+            got, _, _ = bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts,
+                                           threshold=threshold, diag=diag, seed=11,
+                                           use_regime=use_regime, collect_only=True)
+            cands += got
+            bars[sym] = (o, h, l, c, ct)
+            if k % 15 == 0:
+                tg_send(chat, f"\u2699\uFE0F {k}/{len(cached)} \u00b7 кандидатов {len(cands)}")
+        if not cands:
+            tg_send(chat, f"\U0001F4ED Кандидатов нет при пороге {threshold}."); return
+
+        # 2) отбираем лучшие N в сутки
+        chosen = select_top_n(cands, top_n=top_n, per_day=True)
+        tg_send(chat, f"\U0001F4E5 Кандидатов: {len(cands):,} \u2192 отобрано лучших: {len(chosen):,} "
+                      f"(топ-{top_n}/сутки)")
+
+        # 3) торгуем только отобранные
+        import random as _r
+        rng = _r.Random(23)
+        capital = DEPOSIT; peak = DEPOSIT
+        trades = []
+        for cnd in chosen:
+            sym = cnd["symbol"]
+            o, h, l, c, ct = bars[sym]
+            i = cnd["i"]
+            entry = apply_slippage(cnd["entry"], "long", rng)
+            dist = entry - cnd["sl"]
+            if dist <= 0: continue
+            frac = size_kelly_lite(cnd["score"]) if use_kelly else 0.01
+            if frac <= 0: continue
+            qty = min(capital * frac / dist, NOTIONAL / entry)
+            exit_px = None; reason = None
+            for j2 in range(i + 1, min(i + 21, len(c))):
+                if l[j2] <= cnd["sl"]: exit_px, reason = cnd["sl"], "SL"; break
+                if h[j2] >= cnd["tp1"]: exit_px, reason = cnd["tp1"], "TP1"; break
+            if exit_px is None:
+                j2 = min(i + 20, len(c) - 1); exit_px, reason = c[j2], "TIME"
+            fill = apply_slippage(exit_px, "short", rng)
+            pnl = (fill - entry) * qty - (entry + fill) * qty * FEE_TAKER
+            capital += pnl; peak = max(peak, capital)
+            trades.append(dict(symbol=sym, pnl=pnl, reason=reason, score=cnd["score"],
+                               close_ts=ct[j2]))
+            if peak > 0 and (peak - capital) / peak > KILL_SWITCH_DD:
+                tg_send(chat, f"\U0001F6D1 Kill-switch: просадка > {KILL_SWITCH_DD*100:.0f}%, стоп на {len(trades)} сделке")
+                break
+
+        n = len(trades)
+        if n == 0:
+            tg_send(chat, "\U0001F4ED Ни одной сделки после отбора."); return
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        total = sum(t["pnl"] for t in trades)
+        eq = [DEPOSIT]
+        for t in sorted(trades, key=lambda x: x["close_ts"]): eq.append(eq[-1] + t["pnl"])
+        pk = DEPOSIT; dd = 0.0
+        for x in eq:
+            pk = max(pk, x); dd = max(dd, (pk - x) / pk)
+        avg_sc = sum(t["score"] for t in trades) / n
+        tg_send(chat, "\n".join([
+            f"\U0001F3C6 <b>TOP-N ИТОГ</b> (топ-{top_n}/сутки, порог {threshold})",
+            f"Кандидатов: {len(cands):,} \u2192 сделок: <b>{n}</b> "
+            f"(отсеяно {(1-n/max(len(cands),1))*100:.1f}%)",
+            f"В плюсе: {wins} ({wins/n*100:.0f}%) \u00b7 средний score {avg_sc:.2f}/{SCORE_MAX:.1f}",
+            f"PnL: <b>{total:+.2f}$</b> ({total/DEPOSIT*100:+.1f}%) \u00b7 макс.DD {dd*100:.1f}%",
+            f"{'\u2705 Выборка достаточна' if n >= 100 else '\u26A0\uFE0F Выборка мала (' + str(n) + ' < 100)'}",
+        ]))
+        try:
+            tg_send(chat, binning_report(trades))
+        except Exception as e:
+            print("binning err:", e)
+        if HAS_MPL:
+            try:
+                plt.figure(figsize=(10, 5)); plt.plot(eq, linewidth=1.4)
+                plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.5)
+                plt.title(f"TOP-{top_n}/сутки · {n} сделок")
+                plt.xlabel("Сделки"); plt.ylabel("Капитал $"); plt.grid(True, alpha=0.4)
+                p_ = "/tmp/topn.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                tg_photo(chat, p_, caption="TOP-N equity")
+            except Exception as e:
+                print("topn chart err:", e)
+    finally:
+        BT_RUNNING["on"] = False
+
+
+def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest",
+               use_regime=False, use_kelly=False, top_n=0):
     """/scored — бэктест scored-детектора; /scoredwf — walk-forward 20d/10d."""
     if BT_RUNNING["on"]:
         tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
@@ -3335,7 +3561,10 @@ def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest"):
                       f"\u2699\uFE0F Ослаблено: breakout \u00d7{BREAKOUT_TOLERANCE}, volume \u2265{VOL_RATIO_MIN_SCORED}, OI=tanh(slope\u00d73)\n"
                       f"\U0001F4B8 Реализм: спред {SPREAD_PCT*100:.2f}% + слиппедж {SLIP_MIN*100:.2f}-{SLIP_MAX*100:.2f}% + комиссии\n"
                       f"\U0001F6D1 Kill-switch: просадка > {KILL_SWITCH_DD*100:.0f}%\n"
-                      f"Живой скан на паузе. Качаю историю\u2026")
+                      + (f"\U0001F30A Regime-фильтр: торгуем только 'trend'\n" if use_regime else "")
+                      + (f"\U0001F4B0 Kelly-lite сайзинг (0/1/2/3% по силе сигнала)\n" if use_kelly else "")
+                      + (f"\U0001F3C6 TOP-{top_n} лучших сигналов в сутки\n" if top_n else "")
+                      + f"Живой скан на паузе. Качаю историю\u2026")
         cached = _bt_prefetch(days, ncoins)
         if not cached:
             tg_send(chat, "\u274C Не удалось загрузить данные."); return
@@ -3346,7 +3575,8 @@ def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest"):
             diag = dict(evals=0, signals=0, reasons={}, killed=False)
             for k, (sym, o, h, l, c, v, tb, ct, oi_ts) in enumerate(cached, 1):
                 tr, pnl, killed = bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts,
-                                                     threshold=thr, diag=diag, seed=11)
+                                                     threshold=thr, diag=diag, seed=11,
+                                                     use_regime=use_regime, use_kelly=use_kelly)
                 all_tr += tr; total += pnl
                 if killed: killed_syms.append(sym)
                 if k % 15 == 0:
@@ -3380,6 +3610,11 @@ def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest"):
                 for nm, cnt in top:
                     L.append(f"\u2022 {nm}: {cnt:,} ({cnt/max(diag['evals'],1)*100:.1f}%)")
             tg_send(chat, "\n".join(L))
+            # BINNING — где именно живёт прибыль
+            try:
+                tg_send(chat, binning_report(all_tr))
+            except Exception as e:
+                print("binning err:", e)
             if HAS_MPL:
                 try:
                     plt.figure(figsize=(10, 5)); plt.plot(eq, linewidth=1.4)
@@ -3811,6 +4046,15 @@ def tg_loop(st):
                     ad = int(nums[0]) if len(nums) > 0 else 30
                     ac = int(nums[1]) if len(nums) > 1 else 60
                     threading.Thread(target=run_adaptive, args=(cid, ad, ac), daemon=True).start()
+                elif text.startswith("/topn"):
+                    parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
+                    td = int(float(nums[0])) if len(nums) > 0 else 30
+                    tc = int(float(nums[1])) if len(nums) > 1 else 60
+                    tthr = float(nums[2]) if len(nums) > 2 else 3.0
+                    tn = int(float(nums[3])) if len(nums) > 3 else 20
+                    ureg = "regime" in text.lower()
+                    threading.Thread(target=run_topn,
+                                     args=(cid, td, tc, tthr, tn, ureg, True), daemon=True).start()
                 elif text.startswith("/scoredwf"):
                     parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
                     sd = int(float(nums[0])) if len(nums) > 0 else 30
@@ -3821,7 +4065,11 @@ def tg_loop(st):
                     sd = int(float(nums[0])) if len(nums) > 0 else 30
                     sc = int(float(nums[1])) if len(nums) > 1 else 60
                     sthr = float(nums[2]) if len(nums) > 2 else None
-                    threading.Thread(target=run_scored, args=(cid, sd, sc, sthr, "backtest"), daemon=True).start()
+                    lower = text.lower()
+                    threading.Thread(target=run_scored,
+                                     args=(cid, sd, sc, sthr, "backtest",
+                                           "regime" in lower, "kelly" in lower, 0),
+                                     daemon=True).start()
                 elif text.startswith("/livecheck"):
                     parts = text.split()
                     lsym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
