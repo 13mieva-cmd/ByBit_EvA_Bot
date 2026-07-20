@@ -440,6 +440,119 @@ def atr(h, l, c, period=14):
     return a
 
 # ============================== СИГНАЛ (по спеке, БЕЗ "3 зелёных") ==============================
+
+# ============================================================================
+# SCORED DETECTOR — фильтры переведены в баллы (шаг 1 плана)
+# ============================================================================
+SCORE_WEIGHTS = {
+    "breakout": float(os.environ.get("W_BREAKOUT", "2.0")),
+    "volume":   float(os.environ.get("W_VOLUME",   "2.0")),
+    "oi":       float(os.environ.get("W_OI",       "1.5")),
+    "cvd":      float(os.environ.get("W_CVD",      "1.5")),
+    "trend":    float(os.environ.get("W_TREND",    "1.0")),
+}
+SCORE_MAX = sum(SCORE_WEIGHTS.values())
+SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", "4.0"))
+BREAKOUT_TOLERANCE = float(os.environ.get("BREAKOUT_TOLERANCE", "0.995"))  # close > high_N * 0.995
+VOL_RATIO_MIN_SCORED = float(os.environ.get("VOL_RATIO_MIN_SCORED", "1.5"))
+
+# Kill-switch по просадке (шаг: DD > 10% -> стоп торговли)
+KILL_SWITCH_DD = float(os.environ.get("KILL_SWITCH_DD", "0.10"))
+
+# Проскальзывание (шаг 3 плана) — ровно по присланной формуле
+SLIP_MIN = float(os.environ.get("SLIP_MIN", "0.0005"))
+SLIP_MAX = float(os.environ.get("SLIP_MAX", "0.002"))
+SPREAD_PCT = float(os.environ.get("SPREAD_PCT", "0.0004"))
+
+
+def apply_slippage(price, side="long", rng=None):
+    """slippage = price * uniform(0.0005, 0.002); spread = price * 0.0004
+    entry = price + spread + slippage   (для лонга; для выхода — минус)."""
+    import random as _r
+    r = rng or _r
+    slippage = price * r.uniform(SLIP_MIN, SLIP_MAX)
+    spread = price * SPREAD_PCT
+    return price + spread + slippage if side == "long" else price - spread - slippage
+
+
+def size_from_score(capital, score, max_score=None, base_risk=0.01):
+    """size = capital * 0.01 * (score / max_score) — чем сильнее сигнал, тем больше объём."""
+    max_score = max_score or SCORE_MAX
+    frac = max(0.0, min(score / max_score, 1.0)) if max_score else 0.0
+    return capital * base_risk * frac
+
+
+def detect_signal_scored(o, h, l, c, v, tb, oi, threshold=None, weights=None):
+    """SCORING вместо бинарных фильтров.
+    Ослаблено по плану: breakout с допуском 0.995, volume >= 1.5, OI как tanh(slope*3).
+    Жёсткими остаются только защитные условия (фитиль, ATR-кап, RSI) — они не про частоту,
+    а про качество входа."""
+    W = weights or SCORE_WEIGHTS
+    thr = SCORE_THRESHOLD if threshold is None else threshold
+    n = len(c)
+    if n < LEVEL_LOOKBACK + 30:
+        return False, "мало истории"
+    i1 = n - 1
+
+    # --- защитные условия (остаются бинарными) ---
+    if c[i1] <= o[i1]:
+        return False, "свеча не зелёная"
+    rng1 = h[i1] - l[i1]
+    if rng1 <= 0:
+        return False, "нулевая свеча"
+    upper_wick = (h[i1] - c[i1]) / rng1
+    if upper_wick > WICK_MAX:
+        return False, f"фитиль {upper_wick*100:.0f}%>30%"
+    a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
+    if a > 0 and rng1 > BAR_ATR_MAX * a:
+        return False, f"свеча параболик ({rng1/a:.1f}x ATR)"
+    r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
+    if r > RSI_MAX:
+        return False, f"RSI {r:.0f} перегрет"
+
+    # --- факторы в баллы ---
+    parts = {}
+    level = max(h[i1 - LEVEL_LOOKBACK:i1])
+    # 1) BREAKOUT с допуском: close > high_N * 0.995 (было строго close > high_N)
+    br_ratio = c[i1] / (level * BREAKOUT_TOLERANCE) if level > 0 else 0.0
+    parts["breakout"] = W["breakout"] * max(0.0, min((br_ratio - 1.0) / 0.01, 1.0)) if br_ratio > 1.0 else 0.0
+    # 2) VOLUME: порог 1.5, дальше растёт до 3x
+    base = v[i1 - VOL_MA_LEN:i1]
+    vma = (sum(base) / len(base)) if base else 0.0
+    vol_ratio = (v[i1] / vma) if vma > 0 else 0.0
+    parts["volume"] = W["volume"] * max(0.0, min((vol_ratio - VOL_RATIO_MIN_SCORED) / 1.5, 1.0))
+    # 3) OI как SLOPE через tanh (не binary)
+    oi_chg = 0.0
+    if len(oi) >= 2 and oi[-2] > 0:
+        oi_chg = (oi[-1] - oi[-2]) / oi[-2]
+    parts["oi"] = W["oi"] * max(0.0, math.tanh(oi_chg * 3))
+    # 4) CVD как непрерывная доля
+    delta = 2 * tb[i1] - v[i1]
+    cvd_norm = delta / (v[i1] + 1e-9) if v[i1] > 0 else 0.0
+    parts["cvd"] = W["cvd"] * max(0.0, math.tanh(cvd_norm * 2))
+    # 5) TREND
+    e21 = ema_series(c, EMA_FAST)[-1]
+    e50 = ema_series(c, EMA_SLOW)[-1]
+    parts["trend"] = W["trend"] if (c[i1] > e21 > e50) else 0.0
+
+    score = sum(parts.values())
+    if score < thr:
+        return False, f"score {score:.2f} < {thr:.2f}"
+
+    entry = c[i1]
+    sl = entry - ATR_SL_MULT * a if a > 0 else entry * 0.995
+    if sl >= entry:
+        return False, "стоп выше входа"
+    tp1 = entry + ATR_TP1_MULT * a if a > 0 else entry * 1.01
+    tp2 = entry + ATR_TP2_MULT * a if a > 0 else entry * 1.02
+    return True, dict(
+        score=score, parts=parts, spike=vol_ratio, delta=delta, oi_chg=oi_chg,
+        rsi=r, e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2, atr=a,
+        risk_pct=(entry - sl) / entry, wick=upper_wick, close3=c[i1],
+    )
+
+
 def detect_signal(o, h, l, c, v, tb, oi):
     """Импульсная свеча -1 (последняя закрытая). Возвращает (ok, details|причина)."""
     n = len(c)
@@ -2693,6 +2806,628 @@ def run_livecheck(chat, sym="BTCUSDT"):
     L.append("\n<i>Ордера не отправлялись. Для включения реальных сделок нужен AUTO_TRADE=1.</i>")
     tg_send(chat, "\n".join(L))
 
+
+# ============================================================================
+# SCORED BACKTEST + KILL-SWITCH + WALK-FORWARD 20d/10d
+# ============================================================================
+def bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts, threshold=None,
+                       weights=None, capital=None, kill_dd=None, diag=None, seed=None):
+    """Прогон scored-детектора с реалистичным исполнением, score-сайзингом и kill-switch."""
+    import random as _r
+    rng = _r.Random(seed) if seed is not None else _r
+    kill_dd = KILL_SWITCH_DD if kill_dd is None else kill_dd
+    capital = DEPOSIT if capital is None else capital
+    start_capital = capital
+    peak = capital
+    killed = False
+    W_ = LEVEL_LOOKBACK + 40
+    trades = []
+    pos = None
+    j = 0
+    oi_vals = []
+    for i in range(W_, len(c)):
+        while j < len(oi_ts) and oi_ts[j][0] <= ct[i]:
+            oi_vals.append(oi_ts[j][1]); j += 1
+        # --- ведение позиции ---
+        if pos:
+            exit_px = None; reason = None
+            if l[i] <= pos["sl"]:                      # пессимизм: стоп раньше тейка
+                exit_px, reason = pos["sl"], "SL"
+            elif h[i] >= pos["tp1"]:
+                exit_px, reason = pos["tp1"], "TP1"
+            elif i - pos["i"] >= 20:
+                exit_px, reason = c[i], "TIME"
+            if exit_px is not None:
+                fill = apply_slippage(exit_px, "short", rng)
+                pnl = (fill - pos["entry"]) * pos["qty"] - (pos["entry"] + fill) * pos["qty"] * FEE_TAKER
+                capital += pnl
+                peak = max(peak, capital)
+                trades.append(dict(symbol=sym, pnl=pnl, reason=reason, score=pos["score"],
+                                   qty=pos["qty"], open_ts=ct[pos["i"]], close_ts=ct[i]))
+                pos = None
+                # KILL-SWITCH: просадка от пика больше порога -> торговля стоп
+                dd = (peak - capital) / peak if peak > 0 else 0.0
+                if dd > kill_dd:
+                    killed = True
+                    if diag is not None: diag["killed"] = True
+                    break
+        # --- поиск входа ---
+        if pos is None and len(oi_vals) >= 2:
+            if diag is not None: diag["evals"] += 1
+            ok, d = detect_signal_scored(o[i+1-W_:i+1], h[i+1-W_:i+1], l[i+1-W_:i+1],
+                                         c[i+1-W_:i+1], v[i+1-W_:i+1], tb[i+1-W_:i+1],
+                                         oi_vals[-8:], threshold=threshold, weights=weights)
+            if ok:
+                if diag is not None: diag["signals"] += 1
+                entry = apply_slippage(d["entry"], "long", rng)
+                stop_dist = entry - d["sl"]
+                if stop_dist > 0:
+                    risk_usd = size_from_score(capital, d["score"])   # объём ~ силе сигнала
+                    qty = risk_usd / stop_dist
+                    qty = min(qty, NOTIONAL / entry)                  # потолок плеча
+                    pos = dict(entry=entry, sl=d["sl"], tp1=d["tp1"], qty=qty,
+                               i=i, score=d["score"])
+            elif diag is not None:
+                lbl = "score ниже порога" if str(d).startswith("score") else _bt_reason(d)
+                diag["reasons"][lbl] = diag["reasons"].get(lbl, 0) + 1
+    return trades, capital - start_capital, killed
+
+
+def walk_forward_days(cached, train_days=20, test_days=10, thr_grid=(3.0, 3.5, 4.0, 4.5, 5.0)):
+    """Walk-forward по ВРЕМЕНИ: train 20 дней -> test 10 дней -> сдвиг (шаг 4 плана).
+    На train подбирается порог score, на test он проверяется вслепую."""
+    bars_train = int(train_days * 96)
+    bars_test = int(test_days * 96)
+    windows = []
+    for sym, o, h, l, c, v, tb, ct, oi_ts in cached:
+        start = 0
+        while start + bars_train + bars_test <= len(c):
+            sl_ = slice(start, start + bars_train)
+            te_ = slice(start + bars_train, start + bars_train + bars_test)
+            oi_tr = [x for x in oi_ts if ct[sl_.start] <= x[0] <= ct[sl_.stop - 1]]
+            oi_te = [x for x in oi_ts if ct[te_.start] <= x[0] <= ct[te_.stop - 1]]
+            best_thr, best_pnl = None, float("-inf")
+            for thr in thr_grid:
+                _, pnl_tr, _ = bt_simulate_scored(sym, o[sl_], h[sl_], l[sl_], c[sl_],
+                                                  v[sl_], tb[sl_], ct[sl_], oi_tr,
+                                                  threshold=thr, seed=42)
+                if pnl_tr > best_pnl:
+                    best_pnl, best_thr = pnl_tr, thr
+            tr_te, pnl_te, killed = bt_simulate_scored(sym, o[te_], h[te_], l[te_], c[te_],
+                                                       v[te_], tb[te_], ct[te_], oi_te,
+                                                       threshold=best_thr, seed=7)
+            windows.append(dict(symbol=sym, start=start, thr=best_thr,
+                                train_pnl=best_pnl, test_pnl=pnl_te,
+                                test_trades=len(tr_te), killed=killed, trades=tr_te))
+            start += bars_test
+    return windows
+
+
+
+# ============================================================================
+# ADAPTIVE FUNNEL — сам ослабляет фильтры, которые режут больше всего
+# ============================================================================
+class AdaptiveFunnel:
+    def __init__(self):
+        self.stats = {"breakout": 0, "volume": 0, "oi": 0, "cvd": 0}
+        self.thresholds = {
+            "breakout_mult": 1.0,
+            "volume_mult": 2.0,
+            "oi_min": 0.0,
+            "cvd_min": 0.0,
+        }
+        self.total_checks = 1
+        self.history = []
+
+    def register_fail(self, reason):
+        if reason in self.stats:
+            self.stats[reason] += 1
+        self.total_checks += 1
+
+    def register_pass(self):
+        self.total_checks += 1
+
+    def adapt(self):
+        changed = {}
+        for k in self.stats:
+            fail_rate = self.stats[k] / self.total_checks
+            if fail_rate > 0.5:
+                if k == "breakout":
+                    self.thresholds["breakout_mult"] *= 0.995
+                elif k == "volume":
+                    self.thresholds["volume_mult"] *= 0.98
+                elif k == "oi":
+                    self.thresholds["oi_min"] *= 0.9
+                elif k == "cvd":
+                    self.thresholds["cvd_min"] *= 0.9
+                changed[k] = fail_rate
+        if changed:
+            self.history.append(dict(checks=self.total_checks, changed=changed,
+                                     thresholds=dict(self.thresholds)))
+        return changed
+
+    def get(self):
+        return self.thresholds
+
+    def report(self):
+        L = [f"\U0001F504 <b>ADAPTIVE FUNNEL</b> (проверок {self.total_checks:,})"]
+        for k, cnt in sorted(self.stats.items(), key=lambda x: -x[1]):
+            rate = cnt / self.total_checks * 100
+            flag = " \u2190 ослабляется" if rate > 50 else ""
+            L.append(f"\u2022 {k}: {cnt:,} отказов ({rate:.1f}%){flag}")
+        L.append("\n\u2699\uFE0F Текущие пороги:")
+        for k, v in self.thresholds.items():
+            L.append(f"\u2022 {k}: {v:.5f}")
+        L.append(f"\n\U0001F4DC Адаптаций было: {len(self.history)}")
+        return "\n".join(L)
+
+
+def detect_signal_adaptive(o, h, l, c, v, tb, oi, funnel):
+    """Детектор, использующий пороги из AdaptiveFunnel. Каждый отказ регистрируется,
+    чтобы воронка знала, какой фильтр самый дорогой."""
+    th = funnel.get()
+    n = len(c)
+    if n < LEVEL_LOOKBACK + 30:
+        return False, "мало истории"
+    i1 = n - 1
+    if c[i1] <= o[i1]:
+        funnel.register_fail("candle"); return False, "свеча не зелёная"
+    rng1 = h[i1] - l[i1]
+    if rng1 <= 0:
+        return False, "нулевая свеча"
+    a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
+
+    # 1) BREAKOUT с адаптивным множителем
+    level = max(h[i1 - LEVEL_LOOKBACK:i1])
+    if not (c[i1] > level * th["breakout_mult"]):
+        funnel.register_fail("breakout")
+        return False, "нет пробоя"
+    # 2) VOLUME с адаптивным порогом
+    base = v[i1 - VOL_MA_LEN:i1]
+    vma = (sum(base) / len(base)) if base else 0.0
+    vol_ratio = (v[i1] / vma) if vma > 0 else 0.0
+    if vol_ratio < th["volume_mult"]:
+        funnel.register_fail("volume")
+        return False, f"объём x{vol_ratio:.2f} < {th['volume_mult']:.2f}"
+    # 3) OI с адаптивным минимумом
+    oi_chg = 0.0
+    if len(oi) >= 2 and oi[-2] > 0:
+        oi_chg = (oi[-1] - oi[-2]) / oi[-2]
+    if oi_chg < th["oi_min"]:
+        funnel.register_fail("oi")
+        return False, f"OI {oi_chg*100:+.2f}% < {th['oi_min']*100:.2f}%"
+    # 4) CVD с адаптивным минимумом
+    delta = 2 * tb[i1] - v[i1]
+    cvd_norm = delta / (v[i1] + 1e-9) if v[i1] > 0 else 0.0
+    if cvd_norm < th["cvd_min"]:
+        funnel.register_fail("cvd")
+        return False, f"CVD {cvd_norm:.3f} < {th['cvd_min']:.3f}"
+
+    funnel.register_pass()
+    entry = c[i1]
+    sl = entry - ATR_SL_MULT * a if a > 0 else entry * 0.995
+    if sl >= entry:
+        return False, "стоп выше входа"
+    return True, dict(entry=entry, sl=sl,
+                      tp1=entry + ATR_TP1_MULT * a if a > 0 else entry * 1.01,
+                      tp2=entry + ATR_TP2_MULT * a if a > 0 else entry * 1.02,
+                      atr=a, spike=vol_ratio, oi_chg=oi_chg, delta=delta,
+                      level=level, close3=c[i1], low1=l[i1], high3=h[i1],
+                      risk_pct=(entry - sl) / entry, wick=(h[i1]-c[i1])/rng1,
+                      rsi=rsi(c[-(RSI_LEN*6):], RSI_LEN), e21=0.0, e50=0.0)
+
+
+# ============================================================================
+# ML RANKING — XGBoost (fallback: sklearn GradientBoosting)
+# ============================================================================
+ML_FEATURES = ["vol_ratio", "oi_change", "return", "volatility", "cvd_slope"]
+ML_THRESHOLD = float(os.environ.get("ML_THRESHOLD", "0.6"))
+ML_HORIZON = int(os.environ.get("ML_HORIZON", "5"))
+ML_TARGET_RET = float(os.environ.get("ML_TARGET_RET", "0.003"))
+
+def _make_classifier():
+    """XGBoost если есть, иначе sklearn GradientBoosting с теми же гиперпараметрами."""
+    try:
+        from xgboost import XGBClassifier
+        return XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05,
+                             eval_metric="logloss"), "XGBoost"
+    except Exception:
+        pass
+    try:
+        from sklearn.ensemble import GradientBoostingClassifier
+        return GradientBoostingClassifier(n_estimators=100, max_depth=4,
+                                          learning_rate=0.05), "sklearn GB"
+    except Exception:
+        return None, None
+
+
+def build_features(c, v, oi_series):
+    """vol_ratio, oi_change, return, volatility, delta/cvd, cvd_slope — на РЕАЛЬНЫХ рядах."""
+    n = len(c)
+    rows = []
+    cvd = 0.0
+    prev_cvd = 0.0
+    for i in range(n):
+        if i < 21:
+            rows.append(None); cvd_prev = cvd; continue
+        vma = sum(v[i-20:i]) / 20
+        vol_ratio = v[i] / vma if vma > 0 else 0.0
+        oi_change = (oi_series[i] - oi_series[i-1]) if i < len(oi_series) and oi_series[i-1] else 0.0
+        ret = c[i] / c[i-1] - 1.0 if c[i-1] > 0 else 0.0
+        rets = [(c[k] / c[k-1] - 1.0) for k in range(i-19, i+1) if c[k-1] > 0]
+        m = sum(rets) / len(rets) if rets else 0.0
+        var = sum((x-m)**2 for x in rets) / (len(rets)-1) if len(rets) > 1 else 0.0
+        volatility = math.sqrt(var)
+        delta = (c[i] - c[i-1]) * v[i]
+        prev_cvd = cvd
+        cvd += delta
+        rows.append(dict(vol_ratio=vol_ratio, oi_change=oi_change, **{"return": ret},
+                         volatility=volatility, delta=delta, cvd=cvd,
+                         cvd_slope=cvd - prev_cvd, close=c[i], idx=i))
+    return rows
+
+
+def create_target(rows, closes, horizon=None, target_ret=None):
+    """target = 1, если через horizon баров цена выше на target_ret."""
+    horizon = ML_HORIZON if horizon is None else horizon
+    target_ret = ML_TARGET_RET if target_ret is None else target_ret
+    out = []
+    for r in rows:
+        if r is None: continue
+        i = r["idx"]
+        if i + horizon >= len(closes): continue
+        future_return = closes[i + horizon] / closes[i] - 1.0
+        r2 = dict(r); r2["target"] = 1 if future_return > target_ret else 0
+        r2["future_return"] = future_return
+        out.append(r2)
+    return out
+
+
+def train_model(dataset):
+    """Обучение на списке строк с target. Возвращает (model, name)."""
+    model, name = _make_classifier()
+    if model is None:
+        return None, None
+    X = [[r[f] for f in ML_FEATURES] for r in dataset]
+    y = [r["target"] for r in dataset]
+    if len(set(y)) < 2:
+        return None, None
+    model.fit(X, y)
+    return model, name
+
+
+def ml_score(model, row):
+    """Вероятность класса 1 = ranking score."""
+    if model is None: return 0.0
+    feats = [[row[f] for f in ML_FEATURES]]
+    try:
+        return float(model.predict_proba(feats)[0][1])
+    except Exception:
+        return 0.0
+
+
+def size_from_confidence(balance, score, base=0.01):
+    """Больше уверенность -> больше позиция. size = base * (1 + (score-0.5)*2)"""
+    size = base * (1 + (score - 0.5) * 2)
+    return balance * max(0.0, size)
+
+
+
+def run_ml(chat, days=30, ncoins=30, thr=None, train_frac=0.7):
+    """/ml — обучает ML-ранкер на РАННЕЙ части истории, торгует на ПОЗДНЕЙ (out-of-sample).
+    Разделение строго по ВРЕМЕНИ: перемешивать финансовые ряды нельзя — это утечка будущего."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        days = max(7, min(days, 30)); ncoins = max(1, min(ncoins, 60))
+        thr = ML_THRESHOLD if thr is None else thr
+        _, clf_name = _make_classifier()
+        if clf_name is None:
+            tg_send(chat, "\u274C Нет ни xgboost, ни sklearn. Добавь в requirements.txt: xgboost scikit-learn"); return
+        tg_send(chat, f"\U0001F916 <b>ML RANKING</b>: {days} дн \u00d7 {ncoins} монет\n"
+                      f"\u2699\uFE0F Модель: {clf_name} \u00b7 фичи: {', '.join(ML_FEATURES)}\n"
+                      f"\U0001F3AF Target: рост > {ML_TARGET_RET*100:.2f}% за {ML_HORIZON} баров \u00b7 порог входа {thr}\n"
+                      f"\u23F1 Сплит по ВРЕМЕНИ: первые {train_frac*100:.0f}% — обучение, "
+                      f"последние {(1-train_frac)*100:.0f}% — торговля вслепую\n"
+                      f"\U0001F4B8 Сайзинг: от уверенности модели \u00b7 слиппедж+спред+комиссии учтены\n"
+                      f"Живой скан на паузе. Качаю историю\u2026")
+        cached = _bt_prefetch(days, ncoins)
+        if not cached:
+            tg_send(chat, "\u274C Не удалось загрузить данные."); return
+        tg_send(chat, f"\U0001F4E6 {len(cached)} монет. Считаю фичи\u2026")
+
+        train_rows, test_sets = [], []
+        for sym, o, h, l, c, v, tb, ct, oi_ts in cached:
+            oi_al = []
+            j = 0; cur = 0.0
+            for i in range(len(c)):
+                while j < len(oi_ts) and oi_ts[j][0] <= ct[i]:
+                    cur = oi_ts[j][1]; j += 1
+                oi_al.append(cur)
+            rows = build_features(c, v, oi_al)
+            ds = create_target(rows, c)
+            if len(ds) < 100: continue
+            split = int(len(ds) * train_frac)
+            train_rows += ds[:split]                      # РАННЯЯ часть -> обучение
+            test_sets.append((sym, ds[split:], c, h, l, ct))   # ПОЗДНЯЯ -> торговля
+        if len(train_rows) < 200:
+            tg_send(chat, f"\u274C Мало данных для обучения ({len(train_rows)} строк)."); return
+
+        pos_rate = sum(r["target"] for r in train_rows) / len(train_rows)
+        tg_send(chat, f"\U0001F9E0 Обучаю на {len(train_rows):,} примерах "
+                      f"(положительных {pos_rate*100:.1f}%)\u2026")
+        model, name = train_model(train_rows)
+        if model is None:
+            tg_send(chat, "\u274C Не удалось обучить (один класс в target)."); return
+
+        # важность фич
+        imp_txt = ""
+        try:
+            imps = list(getattr(model, "feature_importances_", []))
+            if imps:
+                pairs = sorted(zip(ML_FEATURES, imps), key=lambda x: -x[1])
+                imp_txt = "\n\U0001F50E <b>Важность фич:</b>\n" + "\n".join(
+                    f"\u2022 {k}: {vv*100:.1f}%" for k, vv in pairs)
+        except Exception:
+            pass
+
+        # торговля на невиданной части
+        import random as _r
+        rng = _r.Random(13)
+        trades = []; capital = DEPOSIT; peak = DEPOSIT; killed = 0
+        scored_cnt = 0
+        for sym, ds, c, h, l, ct in test_sets:
+            pos = None
+            for r in ds:
+                i = r["idx"]
+                if pos:
+                    exit_px = None; reason = None
+                    if l[i] <= pos["sl"]: exit_px, reason = pos["sl"], "SL"
+                    elif h[i] >= pos["tp1"]: exit_px, reason = pos["tp1"], "TP1"
+                    elif i - pos["i"] >= 20: exit_px, reason = c[i], "TIME"
+                    if exit_px is not None:
+                        fill = apply_slippage(exit_px, "short", rng)
+                        pnl = ((fill - pos["entry"]) * pos["qty"]
+                               - (pos["entry"] + fill) * pos["qty"] * FEE_TAKER)
+                        capital += pnl; peak = max(peak, capital)
+                        trades.append(dict(symbol=sym, pnl=pnl, reason=reason,
+                                           score=pos["score"], close_ts=ct[i]))
+                        pos = None
+                        if peak > 0 and (peak - capital) / peak > KILL_SWITCH_DD:
+                            killed += 1; break
+                if pos is None:
+                    s = ml_score(model, r)
+                    scored_cnt += 1
+                    if s > thr:
+                        entry = apply_slippage(r["close"], "long", rng)
+                        a = atr(h[:i], l[:i], c[:i], ATR_LEN)
+                        sl = entry - ATR_SL_MULT * a if a > 0 else entry * 0.995
+                        dist = entry - sl
+                        if dist > 0:
+                            risk_usd = size_from_confidence(capital, s)
+                            qty = min(risk_usd / dist, NOTIONAL / entry)
+                            pos = dict(entry=entry, sl=sl,
+                                       tp1=entry + ATR_TP1_MULT * a if a > 0 else entry*1.01,
+                                       qty=qty, i=i, score=s)
+
+        n = len(trades)
+        if n == 0:
+            tg_send(chat, f"\U0001F4ED Модель обучена ({name}), но при пороге {thr} "
+                          f"ни один из {scored_cnt:,} баров не прошёл. Понизь порог: /ml {days} {ncoins} 0.5"
+                          + imp_txt)
+            return
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        total = sum(t["pnl"] for t in trades)
+        eq = [DEPOSIT]
+        for t in sorted(trades, key=lambda x: x["close_ts"]): eq.append(eq[-1] + t["pnl"])
+        pk = DEPOSIT; dd = 0.0
+        for x in eq:
+            pk = max(pk, x); dd = max(dd, (pk - x) / pk)
+        avg_conf = sum(t["score"] for t in trades) / n
+        verdict = ("\u2705 <b>ПЛЮС на невиданных данных</b> — модель училась только на ранней части."
+                   if total > 0 else
+                   "\u274C <b>Минус на невиданных данных</b> — ML не нашёл закономерности.")
+        tg_send(chat, "\n".join([
+            f"\U0001F916 <b>ML ИТОГ</b> ({name}, порог {thr})",
+            f"Обучение: {len(train_rows):,} примеров \u00b7 оценено баров: {scored_cnt:,}",
+            f"Сделок: <b>{n}</b> \u00b7 в плюсе: {wins} ({wins/n*100:.0f}%)",
+            f"PnL: <b>{total:+.2f}$</b> ({total/DEPOSIT*100:+.1f}%) \u00b7 макс.DD {dd*100:.1f}%",
+            f"Средняя уверенность входа: {avg_conf:.3f}",
+            (f"\U0001F6D1 Kill-switch срабатывал: {killed} раз" if killed else ""),
+            f"{'\u2705 Выборка достаточна' if n >= 100 else '\u26A0\uFE0F Выборка мала (' + str(n) + ' < 100)'}",
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501", verdict]) + imp_txt)
+        if HAS_MPL:
+            try:
+                plt.figure(figsize=(10, 5)); plt.plot(eq, linewidth=1.4)
+                plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.5)
+                plt.title(f"ML ranking ({name}) · {n} сделок · порог {thr}")
+                plt.xlabel("Сделки"); plt.ylabel("Капитал $"); plt.grid(True, alpha=0.4)
+                p_ = "/tmp/ml_eq.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                tg_photo(chat, p_, caption="ML equity на невиданной части истории")
+            except Exception as e:
+                print("ml chart err:", e)
+    finally:
+        BT_RUNNING["on"] = False
+
+
+def run_adaptive(chat, days=30, ncoins=60, adapt_every=500):
+    """/adaptive — воронка сама ослабляет самые дорогие фильтры по ходу прогона."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        days = max(7, min(days, 30)); ncoins = max(1, min(ncoins, 60))
+        funnel = AdaptiveFunnel()
+        tg_send(chat, f"\U0001F504 <b>ADAPTIVE FUNNEL</b>: {days} дн \u00d7 {ncoins} монет\n"
+                      f"Стартовые пороги: {funnel.get()}\n"
+                      f"Фильтр, который режет >50% проверок, ослабляется каждые {adapt_every} баров.\n"
+                      f"Живой скан на паузе. Качаю историю\u2026")
+        cached = _bt_prefetch(days, ncoins)
+        if not cached:
+            tg_send(chat, "\u274C Не удалось загрузить данные."); return
+        import random as _r
+        rng = _r.Random(21)
+        trades = []; capital = DEPOSIT; peak = DEPOSIT
+        checks = 0
+        W_ = LEVEL_LOOKBACK + 40
+        for k, (sym, o, h, l, c, v, tb, ct, oi_ts) in enumerate(cached, 1):
+            pos = None; j = 0; oi_vals = []
+            for i in range(W_, len(c)):
+                while j < len(oi_ts) and oi_ts[j][0] <= ct[i]:
+                    oi_vals.append(oi_ts[j][1]); j += 1
+                if pos:
+                    exit_px = None; reason = None
+                    if l[i] <= pos["sl"]: exit_px, reason = pos["sl"], "SL"
+                    elif h[i] >= pos["tp1"]: exit_px, reason = pos["tp1"], "TP1"
+                    elif i - pos["i"] >= 20: exit_px, reason = c[i], "TIME"
+                    if exit_px is not None:
+                        fill = apply_slippage(exit_px, "short", rng)
+                        pnl = ((fill - pos["entry"]) * pos["qty"]
+                               - (pos["entry"] + fill) * pos["qty"] * FEE_TAKER)
+                        capital += pnl; peak = max(peak, capital)
+                        trades.append(dict(symbol=sym, pnl=pnl, reason=reason, close_ts=ct[i]))
+                        pos = None
+                if pos is None and len(oi_vals) >= 2:
+                    checks += 1
+                    ok, d = detect_signal_adaptive(o[i+1-W_:i+1], h[i+1-W_:i+1], l[i+1-W_:i+1],
+                                                   c[i+1-W_:i+1], v[i+1-W_:i+1], tb[i+1-W_:i+1],
+                                                   oi_vals[-8:], funnel)
+                    if ok:
+                        entry = apply_slippage(d["entry"], "long", rng)
+                        dist = entry - d["sl"]
+                        if dist > 0:
+                            qty = min((capital * 0.01) / dist, NOTIONAL / entry)
+                            pos = dict(entry=entry, sl=d["sl"], tp1=d["tp1"], qty=qty, i=i)
+                    if checks % adapt_every == 0:
+                        funnel.adapt()
+            if k % 15 == 0:
+                tg_send(chat, f"\u2699\uFE0F {k}/{len(cached)} \u00b7 сделок {len(trades)} \u00b7 "
+                              f"порог объёма сейчас {funnel.get()['volume_mult']:.3f}")
+        n = len(trades)
+        L = [f"\U0001F504 <b>ADAPTIVE ИТОГ</b>"]
+        if n:
+            wins = sum(1 for t in trades if t["pnl"] > 0)
+            total = sum(t["pnl"] for t in trades)
+            L += [f"Сделок: <b>{n}</b> \u00b7 в плюсе {wins} ({wins/n*100:.0f}%)",
+                  f"PnL: <b>{total:+.2f}$</b> ({total/DEPOSIT*100:+.1f}%)"]
+        else:
+            L.append("Сделок нет даже после адаптации.")
+        L.append("")
+        L.append(funnel.report())
+        tg_send(chat, "\n".join(L))
+    finally:
+        BT_RUNNING["on"] = False
+
+
+def run_scored(chat, days=30, ncoins=60, threshold=None, mode="backtest"):
+    """/scored — бэктест scored-детектора; /scoredwf — walk-forward 20d/10d."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        days = max(7, min(days, 30)); ncoins = max(1, min(ncoins, 60))
+        thr = SCORE_THRESHOLD if threshold is None else threshold
+        head = ("\U0001F3AF <b>SCORED BACKTEST</b>" if mode == "backtest"
+                else "\U0001F501 <b>SCORED WALK-FORWARD</b> (train 20д \u2192 test 10д, roll)")
+        tg_send(chat, f"{head}: {days} дн \u00d7 {ncoins} монет\n"
+                      f"\u2699\uFE0F Веса: {SCORE_WEIGHTS} \u00b7 макс.score={SCORE_MAX:.1f} \u00b7 порог={thr}\n"
+                      f"\u2699\uFE0F Ослаблено: breakout \u00d7{BREAKOUT_TOLERANCE}, volume \u2265{VOL_RATIO_MIN_SCORED}, OI=tanh(slope\u00d73)\n"
+                      f"\U0001F4B8 Реализм: спред {SPREAD_PCT*100:.2f}% + слиппедж {SLIP_MIN*100:.2f}-{SLIP_MAX*100:.2f}% + комиссии\n"
+                      f"\U0001F6D1 Kill-switch: просадка > {KILL_SWITCH_DD*100:.0f}%\n"
+                      f"Живой скан на паузе. Качаю историю\u2026")
+        cached = _bt_prefetch(days, ncoins)
+        if not cached:
+            tg_send(chat, "\u274C Не удалось загрузить данные."); return
+        tg_send(chat, f"\U0001F4E6 {len(cached)} монет загружено.")
+
+        if mode == "backtest":
+            all_tr = []; total = 0.0; killed_syms = []
+            diag = dict(evals=0, signals=0, reasons={}, killed=False)
+            for k, (sym, o, h, l, c, v, tb, ct, oi_ts) in enumerate(cached, 1):
+                tr, pnl, killed = bt_simulate_scored(sym, o, h, l, c, v, tb, ct, oi_ts,
+                                                     threshold=thr, diag=diag, seed=11)
+                all_tr += tr; total += pnl
+                if killed: killed_syms.append(sym)
+                if k % 15 == 0:
+                    tg_send(chat, f"\u2699\uFE0F {k}/{len(cached)} \u00b7 сделок {len(all_tr)}")
+            n = len(all_tr)
+            if n == 0:
+                tg_send(chat, f"\U0001F4ED Ни одной сделки при пороге {thr}. "
+                              f"Проверок: {diag['evals']:,}. Понизь порог: /scored {days} {ncoins} 3.0")
+                return
+            wins = sum(1 for t in all_tr if t["pnl"] > 0)
+            eq = [DEPOSIT]
+            for t in sorted(all_tr, key=lambda x: x["close_ts"]): eq.append(eq[-1] + t["pnl"])
+            peak = DEPOSIT; dd = 0.0
+            for x in eq:
+                peak = max(peak, x); dd = max(dd, (peak - x) / peak)
+            conv = diag["signals"] / diag["evals"] * 100 if diag["evals"] else 0
+            avg_score = sum(t["score"] for t in all_tr) / n
+            L = [f"\U0001F3AF <b>SCORED ИТОГ</b> (порог {thr})",
+                 f"Проверок: {diag['evals']:,} \u2192 сигналов: {diag['signals']:,} "
+                 f"(конверсия {conv:.3f}%, было 0.007%)",
+                 f"Сделок: <b>{n}</b> \u00b7 в плюсе: {wins} ({wins/n*100:.0f}%)",
+                 f"PnL: <b>{total:+.2f}$</b> ({total/DEPOSIT*100:+.1f}% депо) \u00b7 макс.DD {dd*100:.1f}%",
+                 f"Средний score сделки: {avg_score:.2f}/{SCORE_MAX:.1f}"]
+            if killed_syms:
+                L.append(f"\U0001F6D1 Kill-switch сработал на {len(killed_syms)} монетах "
+                         f"(просадка >{KILL_SWITCH_DD*100:.0f}%): {', '.join(killed_syms[:5])}")
+            L.append(f"\n{'\u2705 Выборка достаточна' if n >= 100 else '\u26A0\uFE0F Выборка мала (' + str(n) + ' < 100) — цифрам верить рано'}")
+            if diag["reasons"]:
+                top = sorted(diag["reasons"].items(), key=lambda x: -x[1])[:5]
+                L.append("\n\U0001F52C Что рубит:")
+                for nm, cnt in top:
+                    L.append(f"\u2022 {nm}: {cnt:,} ({cnt/max(diag['evals'],1)*100:.1f}%)")
+            tg_send(chat, "\n".join(L))
+            if HAS_MPL:
+                try:
+                    plt.figure(figsize=(10, 5)); plt.plot(eq, linewidth=1.4)
+                    plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.5)
+                    plt.title(f"Scored · {n} сделок · порог {thr}")
+                    plt.xlabel("Сделки"); plt.ylabel("Капитал $"); plt.grid(True, alpha=0.4)
+                    p_ = "/tmp/scored.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                    tg_photo(chat, p_, caption="Scored equity (спред+слиппедж+комиссии учтены)")
+                except Exception as e:
+                    print("scored chart err:", e)
+        else:
+            wins_ = walk_forward_days(cached, 20, 10)
+            if not wins_:
+                tg_send(chat, "\U0001F4ED Не набралось окон train20/test10 — нужно \u226530 дней."); return
+            n_w = len(wins_)
+            tr_pos = sum(1 for w in wins_ if w["train_pnl"] > 0)
+            te_pos = sum(1 for w in wins_ if w["test_pnl"] > 0)
+            avg_tr = sum(w["train_pnl"] for w in wins_) / n_w
+            avg_te = sum(w["test_pnl"] for w in wins_) / n_w
+            tot_trades = sum(w["test_trades"] for w in wins_)
+            if avg_tr > 0 and avg_te > 0:
+                verdict = "\u2705 <b>EDGE ВЫЖИЛ</b> на невиданных окнах."
+            elif avg_tr > 0 >= avg_te:
+                verdict = "\u274C <b>ПОДГОНКА.</b> Порог заучил train, на test минус."
+            else:
+                verdict = "\U0001F53B <b>Нет преимущества</b> даже на train."
+            tg_send(chat, "\n".join([
+                "\U0001F501 <b>SCORED WALK-FORWARD ИТОГ</b> (train 20д \u2192 test 10д)",
+                f"Окон: {n_w} \u00b7 сделок на test: {tot_trades}",
+                f"TRAIN: плюсовых {tr_pos}/{n_w}, средний PnL {avg_tr:+.2f}$",
+                f"TEST:  плюсовых {te_pos}/{n_w}, средний PnL {avg_te:+.2f}$",
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501", verdict]))
+            if HAS_MPL:
+                try:
+                    plt.figure(figsize=(10, 5))
+                    plt.plot([w["train_pnl"] for w in wins_], label="train", linewidth=1.4)
+                    plt.plot([w["test_pnl"] for w in wins_], label="test (вслепую)", linewidth=1.4)
+                    plt.axhline(0, color="gray", linestyle="--", alpha=0.6)
+                    plt.title("Scored walk-forward: train 20д vs test 10д")
+                    plt.xlabel("Окно"); plt.ylabel("PnL $"); plt.legend(); plt.grid(True, alpha=0.4)
+                    p_ = "/tmp/scored_wf.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                    tg_photo(chat, p_, caption="train выше нуля, test ниже = подгонка порога")
+                except Exception as e:
+                    print("scored wf chart err:", e)
+    finally:
+        BT_RUNNING["on"] = False
+
+
 def run_alpha(chat, days=30, ncoins=20, train_window=500, test_window=200):
     """Команда /alpha — скользящий walk-forward AlphaModel + факторная атрибуция."""
     if BT_RUNNING["on"]:
@@ -2938,6 +3673,87 @@ def run_backtest(chat, days=14, ncoins=30, overrides=None):
         _bt_restore(saved)
         BT_RUNNING["on"] = False
 
+
+def _help_text():
+    """Полная справка по всем командам бота."""
+    return "\n".join([
+        "\U0001F4D6 <b>EVA v4 — ВСЕ КОМАНДЫ</b>",
+        "",
+        "\U0001F7E2 <b>УПРАВЛЕНИЕ</b>",
+        "/start — запуск, сводка параметров и режима",
+        "/pos — открытые позиции: цена, PnL, стадия, занятая маржа",
+        "/stats — статистика закрытых сделок: win rate, средний R, PnL $ и %",
+        "/pause — пауза: новые сигналы не ищутся (открытые позиции ведутся)",
+        "/resume — возобновить сканирование",
+        "/help — эта справка",
+        "",
+        "\U0001F50D <b>ДИАГНОСТИКА</b>",
+        "/debug — почему нет сигналов: топ причин отказа по чек-листу прямо сейчас",
+        "/livecheck [монета] — проверка LIVE-слоя: ключи, эндпоинт (demo/реал), баланс,",
+        "   шаг лота, тест-расчёт объёма, позиции на бирже. Ордера НЕ шлёт",
+        "/selfcheck — самопроверка движка на синтетике, без сети и реальных данных",
+        "",
+        "\U0001F9EA <b>БЭКТЕСТЫ</b>",
+        "/backtest [дней] [монет] [ключ=знач] — основной прогон + воронка отсева + график",
+        "   пороги: spike= quiet= qbars= wick= atr= oi= rsi=",
+        "   выходы: slmult= tp1mult= tp2mult= trailmult=",
+        "   пресет: /backtest 30 60 soft",
+        "/scored [дней] [монет] [порог] — SCORING вместо бинарных фильтров:",
+        "   score = веса\u00d7(breakout+volume+oi+cvd+trend), вход при score > порога.",
+        "   Ослаблено: breakout \u00d70.995, volume \u22651.5, OI=tanh(slope\u00d73)",
+        "/optimize [дней] [монет] [tp] [sl] — grid search vol_thr\u00d7oi_thr + хитмап",
+        "/gridsearch [дней] [монет] — перебор volume\u00d7lookback\u00d7oi + хитмапы PF/return + CSV",
+        "/crosscheck — сравнение сигналов по BTC/ETH/SOL/BNB (PF, return, winrate, sharpe)",
+        "",
+        "\U0001F501 <b>ПРОВЕРКА НА ПОДГОНКУ</b>",
+        "/scoredwf [дней] [монет] — walk-forward: train 20д \u2192 test 10д \u2192 сдвиг.",
+        "   Порог подбирается на train, проверяется на невиданном test",
+        "/alpha [дней] [монет] [train] [test] — факторная модель + скользящий walk-forward,",
+        "   факторная атрибуция (какой фактор реально давал PnL) + сравнение с 2-факторной",
+        "",
+        "\U0001F916 <b>АДАПТАЦИЯ И ML</b>",
+        "/adaptive [дней] [монет] — воронка сама ослабляет фильтры, которые режут >50%",
+        "/ml [дней] [монет] [порог] — ML-ранкер (XGBoost): обучение на ранних 70% истории,",
+        "   торговля на поздних 30% вслепую. Показывает важность фич",
+        "",
+        "\u2699\uFE0F <b>РЕЖИМ СЕЙЧАС</b>",
+        f"\u2022 Исполнение: {'LIVE ' + ('DEMO' if BYBIT_USE_DEMO else 'РЕАЛ') if AUTO_TRADE else 'PAPER (виртуальные сделки)'}",
+        f"\u2022 Слотов: {MAX_CONCURRENT} \u00b7 объём {NOTIONAL:.0f}$ (маржа {MARGIN:.0f}$ \u00d7{LEVERAGE:.0f})",
+        f"\u2022 Сайзинг: {'от риска ' + str(RISK_PCT_TRADE*100) + '%' if RISK_SIZING else 'фиксированный'}",
+        f"\u2022 Kill-switch: просадка > {KILL_SWITCH_DD*100:.0f}%",
+    ])
+
+
+def setup_bot_commands():
+    """Регистрирует меню команд в Telegram (кнопка / рядом с полем ввода)."""
+    cmds = [
+        ("start", "Запуск и сводка"),
+        ("pos", "Открытые позиции и PnL"),
+        ("stats", "Статистика сделок"),
+        ("debug", "Почему нет сигналов"),
+        ("livecheck", "Проверка LIVE-слоя (без ордеров)"),
+        ("backtest", "Бэктест + воронка отсева"),
+        ("scored", "Scoring вместо бинарных фильтров"),
+        ("scoredwf", "Walk-forward train20д/test10д"),
+        ("alpha", "Факторная модель + атрибуция"),
+        ("adaptive", "Самоослабляющаяся воронка"),
+        ("ml", "ML-ранкер XGBoost"),
+        ("optimize", "Grid search + хитмап"),
+        ("gridsearch", "Перебор параметров + CSV"),
+        ("crosscheck", "Сравнение по BTC/ETH/SOL/BNB"),
+        ("selfcheck", "Самопроверка движка"),
+        ("pause", "Пауза сканирования"),
+        ("resume", "Возобновить"),
+        ("help", "Все команды"),
+    ]
+    try:
+        payload = json.dumps([{"command": c, "description": d} for c, d in cmds])
+        tg("setMyCommands", commands=payload)
+        print(f"Telegram: зарегистрировано {len(cmds)} команд в меню")
+    except Exception as e:
+        print("setMyCommands err:", e)
+
+
 def tg_loop(st):
     offset = 0
     while True:
@@ -2953,30 +3769,25 @@ def tg_loop(st):
                 if not cid: continue
                 save_chat(cid)
                 if text.startswith("/help"):
-                    tg_send(cid,
-                            "\U0001F4D6 Команды EVA v4:\n"
-                            "/start — запуск и краткая сводка\n"
-                            "/pos — текущая позиция/лимитка: цена, PnL, стадия\n"
-                            "/stats — PAPER-статистика: win rate, средний R, PnL $ и %\n"
-                            "/debug — почему сигналов нет: топ причин отказа по чек-листу\n"
-                            "/backtest [дней] [монет] [ключ=знач ...] — прогон по истории + воронка + график.\n"
-                            "   Калибровка порогов (живой бот не трогается): spike= quiet= qbars= wick= atr= oi= rsi=\n"
-                            "   ATR-риск (частичная фиксация): slmult= (SL) tp1mult= (TP1 50%) tp2mult= (TP2 50%) trailmult= (трейлинг после TP1)\n"
-                            "   Пример: /backtest 30 60 spike=1.5 quiet=2.5 qbars=5 slmult=1.5 tp1mult=2.0 tp2mult=4.5 \u00b7 или пресет: /backtest 30 60 soft\n"
-                            "/gridsearch [дней] [монет] — перебор volume_threshold\u00d7break_lookback\u00d7oi_strength, хитмапы PF+return, stability score, CSV\n"
-                            "/selfcheck — синтетическая проверка grid_search/heatmap/stability (без сети, без реальных данных)\n"
-                            "/crosscheck — сравнение сигналов по BTC/ETH/SOL/BNB на реальных данных (PF/return/winrate/sharpe)\n"
-                            "/pause — пауза (новые сигналы не ищутся, позиция ведётся)\n"
-                            "/resume — возобновить сканирование\n"
-                            "/help — эта справка")
+                    tg_send(cid, _help_text())
                 elif text.startswith("/start"):
                     st["paused"] = False; save_state(st)
-                    tg_send(cid, "\U0001F916 EVA v4 — импульсный бот (PAPER)\n"
-                                 "Данные: Binance \u00b7 Цены: Bybit \u00b7 Исполнение: виртуальное с честным учётом\n"
-                                 f"Лимиты: до {MAX_CONCURRENT} позиций одновременно (скользящие слоты) \u00b7 "
-                                 f"{'дневной предохранитель ' + str(MAX_DAILY_TRADES) if MAX_DAILY_TRADES>0 else 'без дневного лимита'} \u00b7 "
-                                 f"Объём ${NOTIONAL:.0f} (маржа {MARGIN:.0f}$ x{LEVERAGE:.0f})\n"
-                                 "Команды: /pos \u00b7 /stats \u00b7 /backtest \u00b7 /pause \u00b7 /resume \u00b7 /help")
+                    mode_txt = ("LIVE " + ("DEMO" if BYBIT_USE_DEMO else "\u26A0\uFE0F РЕАЛ")) if AUTO_TRADE else "PAPER"
+                    tg_send(cid, "\n".join([
+                        "\U0001F916 <b>EVA v4 — импульсный бот</b>",
+                        f"Режим: <b>{mode_txt}</b> \u00b7 Данные: Binance \u00b7 Цены/ордера: Bybit",
+                        f"Слотов: {MAX_CONCURRENT} \u00b7 объём {NOTIONAL:.0f}$ "
+                        f"(маржа {MARGIN:.0f}$ \u00d7{LEVERAGE:.0f}) \u00b7 депозит {DEPOSIT:.0f}$",
+                        "",
+                        "\U0001F4CC <b>Быстрый старт:</b>",
+                        "/pos — что открыто \u00b7 /stats — результаты",
+                        "/debug — почему нет сигналов",
+                        "/backtest 30 60 — прогон по истории",
+                        "/scoredwf 30 60 — честная проверка на подгонку",
+                        "",
+                        "\U0001F4D6 <b>/help — полный список всех команд с описанием</b>",
+                    ]))
+
                 elif text.startswith("/pause"):
                     st["paused"] = True; save_state(st)
                     tg_send(cid, "\u23F8 Пауза: новые сигналы не ищу (открытая позиция ведётся).")
@@ -2989,6 +3800,28 @@ def tg_loop(st):
                     tg_send(cid, stats_text())
                 elif text.startswith("/debug"):
                     tg_send(cid, debug_text())
+                elif text.startswith("/ml"):
+                    parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
+                    md = int(float(nums[0])) if len(nums) > 0 else 30
+                    mc = int(float(nums[1])) if len(nums) > 1 else 30
+                    mthr = float(nums[2]) if len(nums) > 2 else None
+                    threading.Thread(target=run_ml, args=(cid, md, mc, mthr), daemon=True).start()
+                elif text.startswith("/adaptive"):
+                    parts = text.split(); nums = [p for p in parts if p.isdigit()]
+                    ad = int(nums[0]) if len(nums) > 0 else 30
+                    ac = int(nums[1]) if len(nums) > 1 else 60
+                    threading.Thread(target=run_adaptive, args=(cid, ad, ac), daemon=True).start()
+                elif text.startswith("/scoredwf"):
+                    parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
+                    sd = int(float(nums[0])) if len(nums) > 0 else 30
+                    sc = int(float(nums[1])) if len(nums) > 1 else 60
+                    threading.Thread(target=run_scored, args=(cid, sd, sc, None, "wf"), daemon=True).start()
+                elif text.startswith("/scored"):
+                    parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
+                    sd = int(float(nums[0])) if len(nums) > 0 else 30
+                    sc = int(float(nums[1])) if len(nums) > 1 else 60
+                    sthr = float(nums[2]) if len(nums) > 2 else None
+                    threading.Thread(target=run_scored, args=(cid, sd, sc, sthr, "backtest"), daemon=True).start()
                 elif text.startswith("/livecheck"):
                     parts = text.split()
                     lsym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
@@ -3028,6 +3861,7 @@ def main():
     st = load_state()
     chat = load_chat()
     print("EVA v4 запущен (PAPER, без условия 3 зелёных). chat:", "есть" if chat else "нет")
+    setup_bot_commands()          # меню команд в Telegram (кнопка "/")
     threading.Thread(target=tg_loop, args=(st,), daemon=True).start()
     threading.Thread(target=prop_loop, daemon=True).start()  # PROP-стратегия: полностью параллельный независимый цикл
     last_scan = last_manage = 0
