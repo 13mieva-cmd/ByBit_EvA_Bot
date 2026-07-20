@@ -3451,6 +3451,17 @@ SNIPER_EMA_F   = int(os.environ.get("SNIPER_EMA_F", "9"))
 SNIPER_EMA_S   = int(os.environ.get("SNIPER_EMA_S", "21"))
 SNIPER_SMA     = int(os.environ.get("SNIPER_SMA", "200"))
 SNIPER_TF      = os.environ.get("SNIPER_TF", "1h")           # 1h / 4h
+
+# Пресеты вселенных для ADX Sniper.
+# ВАЖНО про издержки: модель слиппеджа (0.05-0.20%) честна для ликвидных монет.
+# На тонких альткоинах реальный спред/проскальзывание ВЫШЕ -> бэктест завысит результат.
+SNIPER_UNIVERSES = {
+    "major": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"],
+    "mid":   ["ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
+              "ATOMUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT"],
+    "alt":   ["DOGEUSDT", "TRXUSDT", "MATICUSDT", "FILUSDT", "INJUSDT",
+              "SUIUSDT", "TIAUSDT", "SEIUSDT", "RUNEUSDT", "GALAUSDT"],
+}
 SNIPER_SL_ATR  = float(os.environ.get("SNIPER_SL_ATR", "1.5"))
 SNIPER_TP1_ATR = float(os.environ.get("SNIPER_TP1_ATR", "2.0"))
 SNIPER_TRAIL   = float(os.environ.get("SNIPER_TRAIL", "2.0"))
@@ -3600,13 +3611,17 @@ def sniper_klines(symbol, interval="1h", months=12):
 
 
 def bt_sniper_coin(sym, o, h, l, c, ct, capital=None, diag=None, seed=None,
-                   adx_min=None, use_trail=True):
+                   adx_min=None, use_trail=True,
+                   use_tp1=True, tp1_mult=None, trail_mult=None, sl_mult=None):
     """Бэктест ADX Sniper по одной монете. TP1 50% + трейлинг остатка."""
     import random as _r
     rng = _r.Random(seed) if seed is not None else _r
-    global ADX_MIN
-    saved_min = ADX_MIN
-    if adx_min is not None: ADX_MIN = adx_min
+    global ADX_MIN, SNIPER_TP1_ATR, SNIPER_TRAIL, SNIPER_SL_ATR
+    saved = (ADX_MIN, SNIPER_TP1_ATR, SNIPER_TRAIL, SNIPER_SL_ATR)
+    if adx_min is not None:   ADX_MIN = adx_min
+    if tp1_mult is not None:  SNIPER_TP1_ATR = tp1_mult
+    if trail_mult is not None: SNIPER_TRAIL = trail_mult
+    if sl_mult is not None:   SNIPER_SL_ATR = sl_mult
     try:
         capital = DEPOSIT if capital is None else capital
         start_cap = capital
@@ -3625,7 +3640,7 @@ def bt_sniper_coin(sym, o, h, l, c, ct, capital=None, diag=None, seed=None,
                 exit_px = None; reason = None
                 if l[i] <= pos["sl"]:
                     exit_px, reason = pos["sl"], ("СТОП" if not pos["half"] else "ТРЕЙЛ/БУ")
-                elif not pos["half"] and h[i] >= pos["tp1"]:
+                elif use_tp1 and not pos["half"] and h[i] >= pos["tp1"]:
                     # TP1: фиксируем 50%, остаток -> БУ + трейлинг
                     fill = apply_slippage(pos["tp1"], "short", rng)
                     q = pos["qty"] * 0.5
@@ -3635,12 +3650,13 @@ def bt_sniper_coin(sym, o, h, l, c, ct, capital=None, diag=None, seed=None,
                                        adx=pos["score"], close_ts=ct[i], part=0.5))
                     pos["qty"] -= q; pos["half"] = True
                     pos["sl"] = pos["entry"]; pos["peak"] = h[i]
-                elif pos["half"]:
+                elif pos["half"] or not use_tp1:
+                    # без TP1 трейлинг ведёт позицию с самого входа (победители не обрезаются)
                     pos["peak"] = max(pos["peak"], h[i])
                     if use_trail:
                         trail = pos["peak"] - SNIPER_TRAIL * pos["atr"]
-                        if l[i] <= trail:
-                            exit_px, reason = max(trail, pos["sl"]), "ТРЕЙЛ"
+                        if l[i] <= trail and trail > pos["sl"]:
+                            exit_px, reason = trail, "ТРЕЙЛ"
                 if exit_px is not None:
                     fill = apply_slippage(exit_px, "short", rng)
                     pnl = ((fill - pos["entry"]) * pos["qty"]
@@ -3671,8 +3687,126 @@ def bt_sniper_coin(sym, o, h, l, c, ct, capital=None, diag=None, seed=None,
                     diag["reasons"][key] = diag["reasons"].get(key, 0) + 1
         return trades, capital - start_cap
     finally:
-        ADX_MIN = saved_min
+        ADX_MIN, SNIPER_TP1_ATR, SNIPER_TRAIL, SNIPER_SL_ATR = saved
 
+
+
+
+# ============================================================================
+# СРАВНЕНИЕ СТРУКТУР ВЫХОДА — проверка гипотезы "проблема не во входе, а в выходе"
+# ============================================================================
+EXIT_VARIANTS = [
+    # (название, use_tp1, tp1_mult, trail_mult, sl_mult)
+    ("текущий: TP1 2ATR 50% + трейл 2ATR", True,  2.0, 2.0, 1.5),
+    ("без TP1: только трейл 2ATR",          False, 2.0, 2.0, 1.5),
+    ("без TP1: трейл 3ATR (шире)",          False, 2.0, 3.0, 1.5),
+    ("без TP1: трейл 4ATR (очень широкий)", False, 2.0, 4.0, 1.5),
+    ("TP1 подальше: 4ATR 50% + трейл 3ATR", True,  4.0, 3.0, 1.5),
+    ("TP1 3ATR + трейл 3ATR",               True,  3.0, 3.0, 1.5),
+    ("стоп ближе: SL 1.0ATR + трейл 3ATR",  False, 2.0, 3.0, 1.0),
+]
+
+
+def run_exit_compare(chat, months=12, symbols=None, interval=None, adx_min=None):
+    """/exits — гоняет ОДИН И ТОТ ЖЕ вход через разные структуры выхода.
+    Вход не меняется вообще: чистая проверка, вытягивает ли асимметрия выхода."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        months = max(1, min(months, 36))
+        interval = interval or SNIPER_TF
+        if isinstance(symbols, str):
+            if symbols == "all":
+                syms = (SNIPER_UNIVERSES["major"] + SNIPER_UNIVERSES["mid"]
+                        + SNIPER_UNIVERSES["alt"])
+            else:
+                syms = SNIPER_UNIVERSES.get(symbols, SNIPER_UNIVERSES["major"])
+        else:
+            syms = symbols or SNIPER_UNIVERSES["major"]
+        amin = ADX_MIN if adx_min is None else adx_min
+        tg_send(chat, f"\U0001F513 <b>СРАВНЕНИЕ ВЫХОДОВ</b>: {months} мес \u00b7 {interval} \u00b7 "
+                      f"{len(syms)} монет \u00b7 ADX>{amin}\n"
+                      f"Вход ОДИН И ТОТ ЖЕ во всех вариантах — меняется только выход.\n"
+                      f"Вариантов: {len(EXIT_VARIANTS)}. Качаю историю\u2026")
+        data = {}
+        for sym in syms:
+            try:
+                o, h, l, c, v, ct = sniper_klines(sym, interval, months)
+                if len(c) >= SNIPER_SMA + 100:
+                    data[sym] = (o, h, l, c, ct)
+            except Exception as e:
+                print(f"exits {sym} err:", e)
+        if not data:
+            tg_send(chat, "\u274C Данные не загрузились."); return
+        tg_send(chat, f"\U0001F4E6 {len(data)} монет. Гоняю {len(EXIT_VARIANTS)} вариантов выхода\u2026")
+
+        results = []
+        for name, use_tp1, tp1m, trm, slm in EXIT_VARIANTS:
+            all_tr = []; total = 0.0
+            for sym, (o, h, l, c, ct) in data.items():
+                tr, pnl = bt_sniper_coin(sym, o, h, l, c, ct, seed=17, adx_min=amin,
+                                         use_tp1=use_tp1, tp1_mult=tp1m,
+                                         trail_mult=trm, sl_mult=slm)
+                all_tr += tr; total += pnl
+            n = len(all_tr)
+            if n == 0:
+                results.append(dict(name=name, n=0, wr=0, pf=0, pnl=0, dd=0, R=0)); continue
+            wins = [t["pnl"] for t in all_tr if t["pnl"] > 0]
+            losses = [t["pnl"] for t in all_tr if t["pnl"] <= 0]
+            gw = sum(wins); gl = -sum(losses)
+            pf = (gw / gl) if gl > 0 else float("inf")
+            avg_w = (gw / len(wins)) if wins else 0.0
+            avg_l = (gl / len(losses)) if losses else 0.0
+            R = (avg_w / avg_l) if avg_l > 0 else 0.0
+            eq = [DEPOSIT]
+            for t in sorted(all_tr, key=lambda x: x["close_ts"]): eq.append(eq[-1] + t["pnl"])
+            pk = DEPOSIT; dd = 0.0
+            for x in eq:
+                pk = max(pk, x); dd = max(dd, (pk - x) / pk)
+            results.append(dict(name=name, n=n, wr=len(wins) / n, pf=pf,
+                                pnl=total, dd=dd, R=R, eq=eq))
+            tg_send(chat, f"\u2699\uFE0F {name}: {n} закр., WR {len(wins)/n*100:.0f}%, "
+                          f"PF {pf:.2f}, {total:+.0f}$")
+
+        results.sort(key=lambda r: -r["pnl"])
+        L = ["\U0001F513 <b>СРАВНЕНИЕ СТРУКТУР ВЫХОДА</b>",
+             "<i>Вход идентичен везде — разница только в том, как выходим.</i>", ""]
+        for r in results:
+            if r["n"] == 0:
+                L.append(f"\u2022 {r['name']}: сделок нет"); continue
+            mark = "\u2705" if r["pnl"] > 0 else "\u274C"
+            L.append(f"{mark} <b>{r['name']}</b>")
+            L.append(f"   {r['n']} закр. \u00b7 WR {r['wr']*100:.0f}% \u00b7 R {r['R']:.2f} \u00b7 "
+                     f"PF {r['pf']:.2f} \u00b7 {r['pnl']:+.0f}$ \u00b7 DD {r['dd']*100:.0f}%")
+        best = results[0]
+        L.append("")
+        if best["pnl"] > 0:
+            L.append(f"\U0001F3C6 Лучший: <b>{best['name']}</b> ({best['pnl']:+.0f}$, PF {best['pf']:.2f})")
+            L.append("<i>\u26A0\uFE0F Найдено НА ЭТИХ данных. Проверь на невиданных: /sniperwf</i>")
+            L.append("<i>И помни: биннинг показал, что ADX не предсказывает исход — "
+                     "плюс идёт от асимметрии выхода, а не от качества сигнала. "
+                     "Такое держится на трендовости рынка и может исчезнуть в боковике.</i>")
+        else:
+            L.append("\u274C <b>Ни одна структура выхода не вывела в плюс.</b>")
+            L.append("<i>Значит дело не в обрезке победителей — вход не даёт преимущества.</i>")
+        tg_send(chat, "\n".join(L))
+        if HAS_MPL and any(r["n"] for r in results):
+            try:
+                plt.figure(figsize=(11, 6))
+                for r in results[:5]:
+                    if r["n"]:
+                        plt.plot(r["eq"], linewidth=1.3, label=f"{r['name'][:28]} ({r['pnl']:+.0f}$)")
+                plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.6)
+                plt.title("Один вход, разные выходы")
+                plt.xlabel("Закрытия"); plt.ylabel("Капитал $")
+                plt.legend(fontsize=7); plt.grid(True, alpha=0.4)
+                p_ = "/tmp/exits.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                tg_photo(chat, p_, caption="Сравнение структур выхода на одном и том же входе")
+            except Exception as e:
+                print("exits chart err:", e)
+    finally:
+        BT_RUNNING["on"] = False
 
 
 def run_sniper(chat, months=12, symbols=None, interval=None, adx_min=None, mode="backtest"):
@@ -3684,7 +3818,19 @@ def run_sniper(chat, months=12, symbols=None, interval=None, adx_min=None, mode=
     try:
         months = max(1, min(months, 36))
         interval = interval or SNIPER_TF
-        syms = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        if isinstance(symbols, str):
+            if symbols == "wide":
+                try:
+                    syms = universe()[:30]      # топ-30 по обороту (пересечение Binance/Bybit)
+                except Exception:
+                    syms = SNIPER_UNIVERSES["major"]
+            elif symbols == "all":
+                syms = (SNIPER_UNIVERSES["major"] + SNIPER_UNIVERSES["mid"]
+                        + SNIPER_UNIVERSES["alt"])
+            else:
+                syms = SNIPER_UNIVERSES.get(symbols, SNIPER_UNIVERSES["major"])
+        else:
+            syms = symbols or SNIPER_UNIVERSES["major"]
         amin = ADX_MIN if adx_min is None else adx_min
         head = ("\U0001F3AF <b>ADX SNIPER</b>" if mode == "backtest"
                 else "\U0001F501 <b>ADX SNIPER WALK-FORWARD</b>")
@@ -3746,6 +3892,21 @@ def run_sniper(chat, months=12, symbols=None, interval=None, adx_min=None, mode=
                  "",
                  ("\u2705 Выборка достаточна" if n >= 100 else
                   f"\u26A0\uFE0F Выборка мала ({n} < 100) — цифрам верить рано")]
+            # разбивка по монетам — видно, весь ли результат держится на одной
+            by_sym = {}
+            for t in all_tr:
+                s = by_sym.setdefault(t["symbol"], {"n": 0, "pnl": 0.0, "w": 0})
+                s["n"] += 1; s["pnl"] += t["pnl"]
+                if t["pnl"] > 0: s["w"] += 1
+            L.append("\n\U0001F4C8 <b>По монетам:</b>")
+            for s_, st_ in sorted(by_sym.items(), key=lambda x: -x[1]["pnl"]):
+                L.append(f"\u2022 {s_}: {st_['n']} закр., {st_['w']/st_['n']*100:.0f}% плюс, "
+                         f"{st_['pnl']:+.1f}$")
+            if len(by_sym) > 1:
+                top_pnl = max(st_["pnl"] for st_ in by_sym.values())
+                if total > 0 and top_pnl > total * 0.6:
+                    L.append(f"\u26A0\uFE0F Одна монета даёт {top_pnl/total*100:.0f}% всей прибыли "
+                             f"— результат держится на ней, а не на стратегии")
             L.append("\n\U0001F4CB Заявлено в описании: WR 75-80%, PF ~8, DD ~7%")
             L.append(f"\U0001F4CA Фактически:            WR {wins/n*100:.0f}%, PF {pf:.2f}, DD {dd*100:.1f}%")
             tg_send(chat, "\n".join(L))
@@ -4410,6 +4571,20 @@ def tg_loop(st):
                     ad = int(nums[0]) if len(nums) > 0 else 30
                     ac = int(nums[1]) if len(nums) > 1 else 60
                     threading.Thread(target=run_adaptive, args=(cid, ad, ac), daemon=True).start()
+                elif text.startswith("/exits"):
+                    parts = text.split(); nums = [p for p in parts if p.isdigit()]
+                    mo = int(nums[0]) if nums else 12
+                    lower = text.lower()
+                    iv = "4h" if "4h" in lower else ("15m" if "15m" in lower else "1h")
+                    uni = None; am = None
+                    for p in parts:
+                        pl = p.lower()
+                        if pl in ("major","mid","alt","all"): uni = pl
+                        elif pl.startswith("adx="):
+                            try: am = float(p.split("=")[1])
+                            except Exception: pass
+                    threading.Thread(target=run_exit_compare,
+                                     args=(cid, mo, uni, iv, am), daemon=True).start()
                 elif text.startswith("/sniperwf"):
                     parts = text.split(); nums = [p for p in parts if p.isdigit()]
                     mo = int(nums[0]) if nums else 12
@@ -4419,14 +4594,20 @@ def tg_loop(st):
                 elif text.startswith("/sniper"):
                     parts = text.split(); nums = [p for p in parts if p.isdigit()]
                     mo = int(nums[0]) if nums else 12
-                    iv = "4h" if "4h" in text.lower() else ("15m" if "15m" in text.lower() else "1h")
-                    am = None
+                    lower = text.lower()
+                    iv = "4h" if "4h" in lower else ("15m" if "15m" in lower else "1h")
+                    am = None; uni = None
                     for p in parts:
-                        if p.lower().startswith("adx="):
+                        pl = p.lower()
+                        if pl.startswith("adx="):
                             try: am = float(p.split("=")[1])
                             except Exception: pass
+                        elif pl in ("major", "mid", "alt", "all", "wide"):
+                            uni = pl
+                        elif pl.endswith("usdt"):
+                            uni = (uni if isinstance(uni, list) else []) + [p.upper()]
                     threading.Thread(target=run_sniper,
-                                     args=(cid, mo, None, iv, am, "backtest"), daemon=True).start()
+                                     args=(cid, mo, uni, iv, am, "backtest"), daemon=True).start()
                 elif text.startswith("/topn"):
                     parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
                     td = int(float(nums[0])) if len(nums) > 0 else 30
