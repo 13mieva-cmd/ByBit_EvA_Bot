@@ -3440,6 +3440,370 @@ def select_top_n(candidates, top_n=20, per_day=True, bar_ms=900000):
 
 
 
+
+# ============================================================================
+# ADX SNIPER — новая стратегия (тренд-сила + точный вход)
+# ============================================================================
+ADX_LEN        = int(os.environ.get("ADX_LEN", "14"))
+ADX_MIN        = float(os.environ.get("ADX_MIN", "25"))      # порог силы тренда
+ADX_RISING     = os.environ.get("ADX_RISING", "1") == "1"    # требовать рост ADX
+SNIPER_EMA_F   = int(os.environ.get("SNIPER_EMA_F", "9"))
+SNIPER_EMA_S   = int(os.environ.get("SNIPER_EMA_S", "21"))
+SNIPER_SMA     = int(os.environ.get("SNIPER_SMA", "200"))
+SNIPER_TF      = os.environ.get("SNIPER_TF", "1h")           # 1h / 4h
+SNIPER_SL_ATR  = float(os.environ.get("SNIPER_SL_ATR", "1.5"))
+SNIPER_TP1_ATR = float(os.environ.get("SNIPER_TP1_ATR", "2.0"))
+SNIPER_TRAIL   = float(os.environ.get("SNIPER_TRAIL", "2.0"))
+SNIPER_RSI_MAX = float(os.environ.get("SNIPER_RSI_MAX", "85"))  # 0 = фильтр выключен.
+# ВНИМАНИЕ: RSI-фильтр конфликтует с ADX по смыслу — ADX>25 требует СИЛЬНЫЙ тренд,
+# а в сильном тренде RSI по определению высокий. Слишком низкий RSI_MAX убивает
+# все сигналы стратегии. Проверено: при RSI_MAX=80 на трендовом ряду 348 из 395
+# проверок отклонялись именно по RSI.
+
+
+def sma(vals, period):
+    """Простая скользящая: список значений (None пока не хватает истории)."""
+    out = []
+    run = 0.0
+    for i, x in enumerate(vals):
+        run += x
+        if i >= period:
+            run -= vals[i - period]
+        out.append(run / period if i >= period - 1 else None)
+    return out
+
+
+def dmi_adx(h, l, c, period=14):
+    """ADX / +DI / -DI по Уайлдеру.
+    Возвращает (adx[], plus_di[], minus_di[]) — списки длиной len(c), None где нет данных.
+
+    Формулы:
+      +DM = high-prevHigh, если > (prevLow-low) и > 0, иначе 0
+      -DM = prevLow-low,   если > (high-prevHigh) и > 0, иначе 0
+      TR  = max(h-l, |h-prevC|, |l-prevC|)
+      сглаживание Уайлдера: S = S - S/period + current
+      +DI = 100 * smoothed(+DM) / smoothed(TR)
+      DX  = 100 * |+DI - -DI| / (+DI + -DI)
+      ADX = сглаженное среднее DX
+    """
+    n = len(c)
+    adx = [None] * n; pdi = [None] * n; mdi = [None] * n
+    if n < period * 2 + 1:
+        return adx, pdi, mdi
+    plus_dm, minus_dm, tr = [0.0], [0.0], [0.0]
+    for i in range(1, n):
+        up = h[i] - h[i - 1]
+        dn = l[i - 1] - l[i]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+        tr.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
+    # первичные суммы Уайлдера
+    s_tr = sum(tr[1:period + 1])
+    s_pdm = sum(plus_dm[1:period + 1])
+    s_mdm = sum(minus_dm[1:period + 1])
+    dx_list = []
+    for i in range(period, n):
+        if i > period:
+            s_tr = s_tr - s_tr / period + tr[i]
+            s_pdm = s_pdm - s_pdm / period + plus_dm[i]
+            s_mdm = s_mdm - s_mdm / period + minus_dm[i]
+        if s_tr > 0:
+            p = 100.0 * s_pdm / s_tr
+            m = 100.0 * s_mdm / s_tr
+        else:
+            p = m = 0.0
+        pdi[i] = p; mdi[i] = m
+        dx = 100.0 * abs(p - m) / (p + m) if (p + m) > 0 else 0.0
+        dx_list.append((i, dx))
+        # ADX = сглаженное DX, стартует после period значений DX
+        if len(dx_list) == period:
+            adx_val = sum(d for _, d in dx_list) / period
+            adx[i] = adx_val
+        elif len(dx_list) > period:
+            prev = adx[i - 1]
+            if prev is not None:
+                adx[i] = (prev * (period - 1) + dx) / period
+    return adx, pdi, mdi
+
+
+
+def detect_adx_sniper(o, h, l, c, i, adx, pdi, mdi, ema_f, ema_s, sma200, atr_val):
+    """ADX Sniper LONG на баре i (все индикаторы предрассчитаны).
+    Правила:
+      1) ADX > ADX_MIN (сильный тренд) и растёт
+      2) +DI > -DI (бычье направление)
+      3) EMA быстрая > EMA медленной
+      4) цена > SMA200 (глобальный тренд)
+      5) свеча бычья (подтверждение)
+      6) RSI не в экстремуме
+    Возвращает (ok, dict|причина)."""
+    if adx[i] is None or pdi[i] is None or sma200[i] is None or atr_val <= 0:
+        return False, "нет данных индикаторов"
+    # 1) сила тренда
+    if adx[i] <= ADX_MIN:
+        return False, f"ADX {adx[i]:.1f} <= {ADX_MIN}"
+    if ADX_RISING:
+        prev = adx[i-1] if i > 0 else None
+        if prev is None or adx[i] <= prev:
+            return False, "ADX не растёт"
+    # 2) направление
+    if pdi[i] <= mdi[i]:
+        return False, f"+DI {pdi[i]:.1f} <= -DI {mdi[i]:.1f}"
+    # 3) EMA
+    if ema_f[i] is None or ema_s[i] is None or not (ema_f[i] > ema_s[i]):
+        return False, "EMA быстрая <= медленной"
+    # 4) глобальный тренд
+    if not (c[i] > sma200[i]):
+        return False, "цена ниже SMA200"
+    # 5) подтверждающая свеча
+    if c[i] <= o[i]:
+        return False, "свеча не бычья"
+    # 6) не в экстремуме
+    r = rsi(c[max(0, i-RSI_LEN*6):i+1], RSI_LEN)
+    if SNIPER_RSI_MAX > 0 and r > SNIPER_RSI_MAX:
+        return False, f"RSI {r:.0f} перегрет"
+
+    entry = c[i]
+    sl = entry - SNIPER_SL_ATR * atr_val
+    if sl >= entry:
+        return False, "стоп выше входа"
+    return True, dict(entry=entry, sl=sl,
+                      tp1=entry + SNIPER_TP1_ATR * atr_val,
+                      atr=atr_val, adx=adx[i], pdi=pdi[i], mdi=mdi[i],
+                      ema_f=ema_f[i], ema_s=ema_s[i], sma200=sma200[i],
+                      rsi=r, score=adx[i],   # score = сила тренда (для биннинга)
+                      risk_pct=(entry - sl) / entry, close3=c[i])
+
+
+def sniper_klines(symbol, interval="1h", months=12):
+    """Длинная история свечей (OI не нужен -> ограничение 30 дней снимается).
+    Постранично, до нужного количества баров."""
+    per_day = {"15m": 96, "1h": 24, "4h": 6}.get(interval, 24)
+    need = int(months * 30 * per_day) + 300
+    out = []; end = None
+    while len(out) < need:
+        url = f"{BINANCE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=1500"
+        if end: url += f"&endTime={end}"
+        try:
+            d = http_json(url); time.sleep(0.15)
+        except Exception as e:
+            print(f"sniper_klines {symbol}: {e}"); break
+        if not d: break
+        out = d + out
+        end = int(d[0][0]) - 1
+        if len(d) < 1500: break
+    out = out[-need:]
+    o = [float(x[1]) for x in out]; h = [float(x[2]) for x in out]
+    l = [float(x[3]) for x in out]; c = [float(x[4]) for x in out]
+    v = [float(x[5]) for x in out]; ct = [int(x[6]) for x in out]
+    return o, h, l, c, v, ct
+
+
+def bt_sniper_coin(sym, o, h, l, c, ct, capital=None, diag=None, seed=None,
+                   adx_min=None, use_trail=True):
+    """Бэктест ADX Sniper по одной монете. TP1 50% + трейлинг остатка."""
+    import random as _r
+    rng = _r.Random(seed) if seed is not None else _r
+    global ADX_MIN
+    saved_min = ADX_MIN
+    if adx_min is not None: ADX_MIN = adx_min
+    try:
+        capital = DEPOSIT if capital is None else capital
+        start_cap = capital
+        n = len(c)
+        adx, pdi, mdi = dmi_adx(h, l, c, ADX_LEN)
+        ema_f = [None]*n; ema_s = [None]*n
+        ef = ema_series(c, SNIPER_EMA_F); es = ema_series(c, SNIPER_EMA_S)
+        for k in range(n):
+            ema_f[k] = ef[k] if k >= SNIPER_EMA_F else None
+            ema_s[k] = es[k] if k >= SNIPER_EMA_S else None
+        s200 = sma(c, SNIPER_SMA)
+        trades = []; pos = None
+        warm = max(SNIPER_SMA, ADX_LEN*3) + 5
+        for i in range(warm, n):
+            if pos:
+                exit_px = None; reason = None
+                if l[i] <= pos["sl"]:
+                    exit_px, reason = pos["sl"], ("СТОП" if not pos["half"] else "ТРЕЙЛ/БУ")
+                elif not pos["half"] and h[i] >= pos["tp1"]:
+                    # TP1: фиксируем 50%, остаток -> БУ + трейлинг
+                    fill = apply_slippage(pos["tp1"], "short", rng)
+                    q = pos["qty"] * 0.5
+                    pnl = (fill - pos["entry"]) * q - (pos["entry"] + fill) * q * FEE_TAKER
+                    capital += pnl
+                    trades.append(dict(symbol=sym, pnl=pnl, reason="TP1", score=pos["score"],
+                                       adx=pos["score"], close_ts=ct[i], part=0.5))
+                    pos["qty"] -= q; pos["half"] = True
+                    pos["sl"] = pos["entry"]; pos["peak"] = h[i]
+                elif pos["half"]:
+                    pos["peak"] = max(pos["peak"], h[i])
+                    if use_trail:
+                        trail = pos["peak"] - SNIPER_TRAIL * pos["atr"]
+                        if l[i] <= trail:
+                            exit_px, reason = max(trail, pos["sl"]), "ТРЕЙЛ"
+                if exit_px is not None:
+                    fill = apply_slippage(exit_px, "short", rng)
+                    pnl = ((fill - pos["entry"]) * pos["qty"]
+                           - (pos["entry"] + fill) * pos["qty"] * FEE_TAKER)
+                    capital += pnl
+                    trades.append(dict(symbol=sym, pnl=pnl, reason=reason, score=pos["score"],
+                                       adx=pos["score"], close_ts=ct[i], part=1.0))
+                    pos = None
+            if pos is None:
+                if diag is not None: diag["evals"] += 1
+                a_val = atr(h[:i], l[:i], c[:i], ATR_LEN)
+                ok, d = detect_adx_sniper(o, h, l, c, i, adx, pdi, mdi,
+                                          ema_f, ema_s, s200, a_val)
+                if ok:
+                    if diag is not None: diag["signals"] += 1
+                    entry = apply_slippage(d["entry"], "long", rng)
+                    dist = entry - d["sl"]
+                    if dist > 0:
+                        risk_usd = capital * RISK_PCT_TRADE
+                        qty = min(risk_usd / dist, NOTIONAL / entry)
+                        pos = dict(entry=entry, sl=d["sl"], tp1=d["tp1"], qty=qty,
+                                   atr=d["atr"], half=False, peak=entry,
+                                   i=i, score=d["adx"])
+                elif diag is not None:
+                    key = str(d).split("(")[0].strip()
+                    for pat in ("ADX", "+DI", "EMA", "SMA200", "не бычья", "RSI", "нет данных"):
+                        if pat in str(d): key = pat; break
+                    diag["reasons"][key] = diag["reasons"].get(key, 0) + 1
+        return trades, capital - start_cap
+    finally:
+        ADX_MIN = saved_min
+
+
+
+def run_sniper(chat, months=12, symbols=None, interval=None, adx_min=None, mode="backtest"):
+    """/sniper — бэктест ADX Sniper на ДЛИННОЙ истории + биннинг по силе ADX.
+       /sniperwf — walk-forward: подбор ADX-порога на train, проверка на test."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Идёт другой прогон — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        months = max(1, min(months, 36))
+        interval = interval or SNIPER_TF
+        syms = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        amin = ADX_MIN if adx_min is None else adx_min
+        head = ("\U0001F3AF <b>ADX SNIPER</b>" if mode == "backtest"
+                else "\U0001F501 <b>ADX SNIPER WALK-FORWARD</b>")
+        tg_send(chat, f"{head}: {months} мес \u00b7 {interval} \u00b7 {len(syms)} монет\n"
+                      f"\u2699\uFE0F ADX({ADX_LEN}) > {amin}"
+                      + (" и растёт" if ADX_RISING else "")
+                      + f" \u00b7 +DI>-DI \u00b7 EMA{SNIPER_EMA_F}>EMA{SNIPER_EMA_S} \u00b7 цена>SMA{SNIPER_SMA}\n"
+                      f"\U0001F6D1 SL {SNIPER_SL_ATR}\u00d7ATR \u00b7 TP1 {SNIPER_TP1_ATR}\u00d7ATR (50%) \u00b7 "
+                      f"трейлинг {SNIPER_TRAIL}\u00d7ATR\n"
+                      f"\U0001F4B8 Спред+слиппедж+комиссии учтены \u00b7 риск {RISK_PCT_TRADE*100:.0f}%/сделку\n"
+                      + (f"\u2699\uFE0F RSI-фильтр: <{SNIPER_RSI_MAX:.0f}\n" if SNIPER_RSI_MAX > 0
+                         else "\u2699\uFE0F RSI-фильтр отключён (конфликтует с ADX)\n")
+                      + f"Живой скан на паузе. Качаю историю ({months} мес)\u2026")
+        data = {}
+        for k, sym in enumerate(syms, 1):
+            try:
+                o, h, l, c, v, ct = sniper_klines(sym, interval, months)
+                if len(c) < SNIPER_SMA + 100:
+                    tg_send(chat, f"\u26A0\uFE0F {sym}: мало истории ({len(c)} баров), пропуск"); continue
+                data[sym] = (o, h, l, c, ct)
+                tg_send(chat, f"\u2699\uFE0F {sym}: {len(c):,} баров загружено")
+            except Exception as e:
+                print(f"sniper {sym} err:", e)
+        if not data:
+            tg_send(chat, "\u274C Данные не загрузились."); return
+
+        if mode == "backtest":
+            all_tr = []; total = 0.0
+            diag = dict(evals=0, signals=0, reasons={})
+            for sym, (o, h, l, c, ct) in data.items():
+                tr, pnl = bt_sniper_coin(sym, o, h, l, c, ct, diag=diag, seed=17, adx_min=amin)
+                all_tr += tr; total += pnl
+            n = len(all_tr)
+            if n == 0:
+                top = sorted(diag["reasons"].items(), key=lambda x: -x[1])[:6]
+                L = [f"\U0001F4ED Сигналов нет. Проверок: {diag['evals']:,}", "\nЧто рубит:"]
+                for nm, cnt in top:
+                    L.append(f"\u2022 {nm}: {cnt:,} ({cnt/max(diag['evals'],1)*100:.1f}%)")
+                L.append(f"\nПопробуй мягче: /sniper {months} adx=20")
+                tg_send(chat, "\n".join(L)); return
+            # закрытые сделки = только полные выходы (part=1.0) + частичные TP1
+            wins = sum(1 for t in all_tr if t["pnl"] > 0)
+            eq = [DEPOSIT]
+            for t in sorted(all_tr, key=lambda x: x["close_ts"]): eq.append(eq[-1] + t["pnl"])
+            pk = DEPOSIT; dd = 0.0
+            for x in eq:
+                pk = max(pk, x); dd = max(dd, (pk - x) / pk)
+            gross_w = sum(t["pnl"] for t in all_tr if t["pnl"] > 0)
+            gross_l = -sum(t["pnl"] for t in all_tr if t["pnl"] < 0)
+            pf = (gross_w / gross_l) if gross_l > 0 else float("inf")
+            per_year = n / max(months / 12.0, 1e-9) / max(len(data), 1)
+            avg_adx = sum(t["adx"] for t in all_tr) / n
+            L = [f"\U0001F3AF <b>ADX SNIPER ИТОГ</b> ({interval}, ADX>{amin}, {months} мес)",
+                 f"Проверок: {diag['evals']:,} \u2192 сигналов: {diag['signals']:,}",
+                 f"Закрытий: <b>{n}</b> \u00b7 в плюсе: {wins} ({wins/n*100:.0f}%)",
+                 f"PnL: <b>{total:+.2f}$</b> ({total/DEPOSIT*100:+.1f}%) \u00b7 макс.DD {dd*100:.1f}%",
+                 f"Profit Factor: <b>{pf:.2f}</b> \u00b7 средний ADX входа {avg_adx:.1f}",
+                 f"Частота: ~{per_year:.1f} закрытий в год на монету",
+                 "",
+                 ("\u2705 Выборка достаточна" if n >= 100 else
+                  f"\u26A0\uFE0F Выборка мала ({n} < 100) — цифрам верить рано")]
+            L.append("\n\U0001F4CB Заявлено в описании: WR 75-80%, PF ~8, DD ~7%")
+            L.append(f"\U0001F4CA Фактически:            WR {wins/n*100:.0f}%, PF {pf:.2f}, DD {dd*100:.1f}%")
+            tg_send(chat, "\n".join(L))
+            # биннинг по силе ADX
+            try:
+                tg_send(chat, binning_report(all_tr, bins=(20, 25, 30, 40, 50, 100)))
+            except Exception as e:
+                print("sniper binning err:", e)
+            if HAS_MPL:
+                try:
+                    plt.figure(figsize=(10, 5)); plt.plot(eq, linewidth=1.4)
+                    plt.axhline(DEPOSIT, color="gray", linestyle="--", alpha=0.5)
+                    plt.title(f"ADX Sniper · {interval} · {n} закрытий · PF {pf:.2f}")
+                    plt.xlabel("Закрытия"); plt.ylabel("Капитал $"); plt.grid(True, alpha=0.4)
+                    p_ = "/tmp/sniper.png"; plt.savefig(p_, dpi=110, bbox_inches="tight"); plt.close()
+                    tg_photo(chat, p_, caption="ADX Sniper equity (издержки учтены)")
+                except Exception as e:
+                    print("sniper chart err:", e)
+        else:
+            # WALK-FORWARD по времени: train 60% -> test 40%, подбор ADX-порога
+            grid = [20, 22, 25, 28, 30, 35]
+            wins_ = []
+            for sym, (o, h, l, c, ct) in data.items():
+                split = int(len(c) * 0.6)
+                best_thr, best_pnl = None, float("-inf")
+                for thr in grid:
+                    _, pnl_tr = bt_sniper_coin(sym, o[:split], h[:split], l[:split],
+                                               c[:split], ct[:split], seed=42, adx_min=thr)
+                    if pnl_tr > best_pnl: best_pnl, best_thr = pnl_tr, thr
+                tr_te, pnl_te = bt_sniper_coin(sym, o[split:], h[split:], l[split:],
+                                               c[split:], ct[split:], seed=7, adx_min=best_thr)
+                wins_.append(dict(symbol=sym, thr=best_thr, train=best_pnl,
+                                  test=pnl_te, n_test=len(tr_te)))
+            n_w = len(wins_)
+            avg_tr = sum(w["train"] for w in wins_) / n_w
+            avg_te = sum(w["test"] for w in wins_) / n_w
+            tot_te = sum(w["n_test"] for w in wins_)
+            if avg_tr > 0 and avg_te > 0:
+                verdict = "\u2705 <b>EDGE ВЫЖИЛ</b> на невиданной части истории."
+            elif avg_tr > 0 >= avg_te:
+                verdict = "\u274C <b>ПОДГОНКА.</b> Порог ADX заучил train, на test минус."
+            else:
+                verdict = "\U0001F53B <b>Нет преимущества</b> даже на train."
+            L = ["\U0001F501 <b>ADX SNIPER WALK-FORWARD</b> (train 60% \u2192 test 40%)",
+                 f"Монет: {n_w} \u00b7 сделок на test: {tot_te}",
+                 f"TRAIN: средний PnL {avg_tr:+.2f}$",
+                 f"TEST:  средний PnL {avg_te:+.2f}$",
+                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+            for w in wins_:
+                L.append(f"\u2022 {w['symbol']}: ADX>{w['thr']} \u2192 train {w['train']:+.1f}$, "
+                         f"test {w['test']:+.1f}$ ({w['n_test']} сделок)")
+            L.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+            L.append(verdict)
+            tg_send(chat, "\n".join(L))
+    finally:
+        BT_RUNNING["on"] = False
+
+
 def run_topn(chat, days=30, ncoins=60, threshold=3.0, top_n=20,
              use_regime=False, use_kelly=True):
     """TOP-N RANKING: собираем ВСЕ сигналы по всем монетам, ранжируем по score,
@@ -4046,6 +4410,23 @@ def tg_loop(st):
                     ad = int(nums[0]) if len(nums) > 0 else 30
                     ac = int(nums[1]) if len(nums) > 1 else 60
                     threading.Thread(target=run_adaptive, args=(cid, ad, ac), daemon=True).start()
+                elif text.startswith("/sniperwf"):
+                    parts = text.split(); nums = [p for p in parts if p.isdigit()]
+                    mo = int(nums[0]) if nums else 12
+                    iv = "4h" if "4h" in text.lower() else ("15m" if "15m" in text.lower() else "1h")
+                    threading.Thread(target=run_sniper,
+                                     args=(cid, mo, None, iv, None, "wf"), daemon=True).start()
+                elif text.startswith("/sniper"):
+                    parts = text.split(); nums = [p for p in parts if p.isdigit()]
+                    mo = int(nums[0]) if nums else 12
+                    iv = "4h" if "4h" in text.lower() else ("15m" if "15m" in text.lower() else "1h")
+                    am = None
+                    for p in parts:
+                        if p.lower().startswith("adx="):
+                            try: am = float(p.split("=")[1])
+                            except Exception: pass
+                    threading.Thread(target=run_sniper,
+                                     args=(cid, mo, None, iv, am, "backtest"), daemon=True).start()
                 elif text.startswith("/topn"):
                     parts = text.split(); nums = [p for p in parts if p.replace(".","").isdigit()]
                     td = int(float(nums[0])) if len(nums) > 0 else 30
