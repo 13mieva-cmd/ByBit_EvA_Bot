@@ -1,6 +1,0 @@
-requests
-pandas
-matplotlib
-aiohttp
-xgboost
-scikit-learn
