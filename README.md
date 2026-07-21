@@ -1,1 +1,0 @@
-# ByBit_EvA_Bot
