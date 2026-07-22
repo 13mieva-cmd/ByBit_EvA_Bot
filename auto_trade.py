@@ -19,6 +19,8 @@ from config import (
     BTC_FILTER_15M_PUMP_MAX, BTC_FILTER_1H_VOLATILITY_MAX,
     TELEGRAM_CHAT_ID,
     LEVERAGE, DEPOSIT_USD,
+    AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT,
+    AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB,
 )
 from trader import BybitTrader
 
@@ -228,6 +230,10 @@ class AutoTrader:
                 signal_type=sig_type,
                 stars=signal["stars"],
             )
+            _t0 = self.state.active_positions.get(symbol)
+            if _t0 is not None:
+                _t0["trailing_active"] = False
+                self.state._save()
             await self.notify(
                 f"✅ <b>{base}</b> позиция открыта ({sig_type})\n\n"
                 f"Вход: <code>${pos['entry_price']:.6g}</code>\n"
@@ -252,11 +258,46 @@ class AutoTrader:
         if not self.state.active_positions:
             return
         bybit_positions = await self.trader.get_open_positions()
-        bybit_syms = {p["symbol"] for p in bybit_positions}
+        bybit_map = {p["symbol"]: p for p in bybit_positions}
         for symbol in list(self.state.active_positions.keys()):
-            if symbol in bybit_syms:
+            if symbol in bybit_map:
+                if AUTO_TRAIL_ENABLED:
+                    await self.maybe_activate_trailing(symbol, bybit_map[symbol])
                 continue
             await self.handle_closed_position(symbol)
+
+    async def maybe_activate_trailing(self, symbol: str, live_pos: dict):
+        """Когда цена прошла TP1-триггер — снять фиксированный TP и включить
+        биржевой трейлинг-стоп. Один раз на позицию, дальше ведёт Bybit."""
+        tracked = self.state.active_positions.get(symbol)
+        if not tracked or tracked.get("trailing_active"):
+            return
+        entry = tracked["entry_price"]
+        mark = live_pos.get("mark_price") or 0
+        if entry <= 0 or mark <= 0:
+            return
+        gain_pct = (mark - entry) / entry * 100
+        if tracked.get("signal_type") == "PULLBACK":
+            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
+        else:
+            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
+        if gain_pct < trigger:
+            return
+        res = await self.trader.set_trailing_stop(symbol, trail_dist)
+        base = symbol.replace("USDT", "")
+        if res.get("ok"):
+            tracked["trailing_active"] = True
+            self.state._save()
+            await self.notify(
+                f"\U0001F513 <b>{base}</b>: +{gain_pct:.1f}% — TP1 пройден\n"
+                f"Фиксированный TP снят, включён <b>трейлинг {trail_dist}%</b>.\n"
+                f"<i>Стоп идёт за ценой вверх, вниз не двигается. Ведёт Bybit.</i>"
+            )
+        else:
+            await self.notify(
+                f"\u26A0\uFE0F <b>{base}</b>: трейлинг не включился "
+                f"(<code>{res.get('error')}</code>). Обычные TP/SL остаются."
+            )
 
     async def handle_closed_position(self, symbol: str):
         tracked = self.state.active_positions.get(symbol)

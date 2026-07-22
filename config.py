@@ -135,6 +135,15 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "30"))
 # Post-trade cooldown — block auto-trade on a symbol after it just closed (any reason)
 POST_TRADE_COOLDOWN_HOURS = int(os.getenv("POST_TRADE_COOLDOWN_HOURS", "48"))
 
+# ---------- Трейлинг-стоп после TP1 ----------
+# После достижения TP1 фиксированный тейк снимается, включается биржевой трейлинг-стоп.
+# Bybit ведёт его сам (даже если бот офлайн) — стоп поднимается за ценой, вниз не двигается.
+AUTO_TRAIL_ENABLED = os.getenv("AUTO_TRAIL_ENABLED", "true").lower() == "true"
+AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))        # STANDARD/SURGE: при +1.5%
+AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))  # дистанция трейлинга 1%
+AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))  # PULLBACK: при +0.9%
+AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
+
 # BTC trend filter for auto-entry (blocks ONLY auto-entry, alerts still come)
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
 BTC_FILTER_15M_DROP_MAX = float(os.getenv("BTC_FILTER_15M_DROP_MAX", "0.8"))      # block if BTC dropped > 0.8% in 15m

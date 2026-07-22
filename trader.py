@@ -322,6 +322,38 @@ class BybitTrader:
             return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
         return {"ok": True, "entry_price": entry, "tp_price": tp_price, "sl_price": sl_price}
 
+    async def set_trailing_stop(self, symbol: str, trail_distance_pct: float) -> dict:
+        """Включить БИРЖЕВОЙ трейлинг-стоп (Bybit ведёт сам, даже если бот офлайн).
+        trailingStop задаётся АБСОЛЮТНОЙ дистанцией в цене — считаем от текущей.
+        Фиксированный takeProfit снимаем (='0'), чтобы позиция шла за трейлингом.
+        positionIdx берём из реальной позиции — работает в One-Way и Hedge."""
+        positions = await self.get_open_positions(symbol)
+        if not positions:
+            return {"ok": False, "error": "нет позиции"}
+        pidx = positions[0].get("position_idx", 0)
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "нет данных инструмента"}
+        price = await self.get_last_price(symbol)
+        if price is None or price <= 0:
+            return {"ok": False, "error": "нет цены"}
+        trail_dist = self._round_price(price * trail_distance_pct / 100, info["tick_size"])
+        if trail_dist <= 0:
+            return {"ok": False, "error": "нулевая дистанция"}
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "trailingStop": self._fmt(trail_dist, info["tick_size"]),
+            "takeProfit": "0",
+            "tpslMode": "Full",
+            "positionIdx": pidx,
+        }
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "trail_distance": trail_dist, "ref_price": price}
+
     async def verify_position_protected(self, symbol: str) -> dict:
         """Проверить, что у позиции РЕАЛЬНО стоит стоп на бирже.
         Если бот падал/редеплоился, позиция могла остаться без защиты."""
