@@ -15,7 +15,7 @@ log = logging.getLogger("trader")
 
 class BybitTrader:
     def __init__(self, api_key: str, api_secret: str,
-                 base_url: str = "https://api-demo.bybit.com", recv_window: int = 5000):
+                 base_url: str = "https://api.bybit.com", recv_window: int = 5000):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url
@@ -136,10 +136,27 @@ class BybitTrader:
                         "mark_price": float(p.get("markPrice", 0)),
                         "unrealised_pnl": float(p.get("unrealisedPnl", 0)),
                         "leverage": float(p.get("leverage", 1)),
+                        "position_idx": int(p.get("positionIdx", 0)),
                     })
             except (KeyError, ValueError):
                 continue
         return positions
+
+    async def ensure_one_way_mode(self, symbol: str) -> bool:
+        """Переключить символ в One-Way режим (одна позиция на символ).
+        Нужно, потому что весь код шлёт positionIdx=0 — это значение для One-Way.
+        Если аккаунт в Hedge Mode, Bybit отвечает 10001 'position idx not match'.
+        retCode 34036 = режим уже One-Way (это ОК)."""
+        params = {"category": "linear", "symbol": symbol, "mode": 0}
+        resp = await self._signed_request("POST", "/v5/position/switch-mode", params)
+        code = resp.get("retCode")
+        if code in (0, 34036):
+            return True
+        # 110025 = mode not modified / нельзя менять при открытой позиции — тоже не блокер
+        if code == 110025:
+            return True
+        log.warning(f"switch-mode {symbol}: {resp.get('retMsg')} (код {code})")
+        return False
 
     async def set_leverage(self, symbol: str, leverage: float) -> bool:
         params = {
@@ -224,6 +241,9 @@ class BybitTrader:
         tp_str = self._fmt(tp_price, info["tick_size"])
         sl_str = self._fmt(sl_price, info["tick_size"])
 
+        # РЕЖИМ ПОЗИЦИИ: переключаем в One-Way, иначе positionIdx=0 даёт ошибку 10001
+        await self.ensure_one_way_mode(symbol)
+
         # ПЛЕЧО: фиксированное из конфига, но не выше лимита инструмента
         lev = leverage if leverage else 10.0
         lev = min(float(lev), float(info["max_leverage"]))
@@ -247,6 +267,12 @@ class BybitTrader:
             "positionIdx": 0,
         }
         resp = await self._signed_request("POST", "/v5/order/create", order_params)
+        # ЗАПАСНОЙ ВАРИАНТ: если аккаунт остался в Hedge Mode (переключить не вышло),
+        # positionIdx=0 даёт 10001. Повторяем с positionIdx=1 (Long в hedge).
+        if resp.get("retCode") == 10001 and "position idx" in str(resp.get("retMsg", "")).lower():
+            log.warning(f"{symbol}: One-Way не сработал, пробую hedge positionIdx=1")
+            order_params["positionIdx"] = 1
+            resp = await self._signed_request("POST", "/v5/order/create", order_params)
         if resp.get("retCode") != 0:
             return {
                 "ok": False,
@@ -262,6 +288,7 @@ class BybitTrader:
             "tp_price": tp_price,
             "sl_price": sl_price,
             "leverage": lev,
+            "position_idx": order_params["positionIdx"],
         }
 
     async def set_tpsl_from_fill(self, symbol: str, tp_pct: float, sl_pct: float) -> dict:
@@ -271,6 +298,7 @@ class BybitTrader:
         if not positions:
             return {"ok": False, "error": "нет позиции"}
         entry = positions[0]["entry_price"]
+        pidx = positions[0].get("position_idx", 0)
         if entry <= 0:
             return {"ok": False, "error": "нулевая цена входа"}
         instruments = await self.get_instruments_cached()
@@ -287,7 +315,7 @@ class BybitTrader:
             "tpslMode": "Full",
             "tpTriggerBy": "LastPrice",
             "slTriggerBy": "LastPrice",
-            "positionIdx": 0,
+            "positionIdx": pidx,
         }
         resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
         if resp.get("retCode") not in (0, 34040):   # 34040 = not modified
@@ -325,7 +353,7 @@ class BybitTrader:
             "orderType": "Market",
             "qty": qty_str,
             "reduceOnly": True,
-            "positionIdx": 0,
+            "positionIdx": pos.get("position_idx", 0),
         }
         resp = await self._signed_request("POST", "/v5/order/create", params)
         if resp.get("retCode") != 0:
