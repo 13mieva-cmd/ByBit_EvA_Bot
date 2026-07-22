@@ -18,13 +18,14 @@ from config import (
     BTC_FILTER_ENABLED, BTC_FILTER_15M_DROP_MAX,
     BTC_FILTER_15M_PUMP_MAX, BTC_FILTER_1H_VOLATILITY_MAX,
     TELEGRAM_CHAT_ID,
+    LEVERAGE, DEPOSIT_USD,
 )
 from trader import BybitTrader
 
 log = logging.getLogger("auto")
 
 
-BYBIT_PUBLIC = "https://api.bybit.com"
+BYBIT_PUBLIC = "https://api-demo.bybit.com"
 
 
 async def check_btc_health() -> dict:
@@ -174,7 +175,7 @@ class AutoTrader:
             )
 
             result = await self.trader.open_long_with_tpsl(
-                symbol, POSITION_SIZE_USD, tp_pct, sl_pct,
+                symbol, POSITION_SIZE_USD, tp_pct, sl_pct, leverage=LEVERAGE,
             )
             if not result["ok"]:
                 err = result.get("error", "unknown")
@@ -194,6 +195,28 @@ class AutoTrader:
                 )
                 return
             pos = positions[0]
+
+            # === Пересчитать TP/SL от РЕАЛЬНОЙ цены входа (avgPrice) ===
+            # Ордер маркетный — реальная цена исполнения отличается от той,
+            # что использовалась при расчёте TP/SL до входа. Переставляем на бирже.
+            adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
+            if adjust_result.get("ok"):
+                result["tp_price"] = adjust_result["tp_price"]
+                result["sl_price"] = adjust_result["sl_price"]
+            else:
+                log.warning(
+                    f"Failed to adjust TP/SL for {symbol}: {adjust_result.get('error')}"
+                )
+
+            # === Проверка, что стоп РЕАЛЬНО стоит на бирже ===
+            protected = await self.trader.verify_position_protected(symbol)
+            if protected.get("has_stop") is False:
+                await self.notify(
+                    f"🚨 <b>{base}</b>: стоп не установлен на бирже! "
+                    f"Закрываю позицию немедленно."
+                )
+                await self.trader.close_position_market(symbol)
+                return
 
             self.state.add_position(
                 symbol=symbol,
