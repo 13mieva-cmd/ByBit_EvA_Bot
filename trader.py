@@ -207,7 +207,9 @@ class BybitTrader:
 
     async def open_long_with_tpsl(self, symbol: str, position_size_usd: float,
                                    tp_pct: float, sl_pct: float,
-                                   leverage: float = None) -> dict:
+                                   leverage: float = None,
+                                   trail_trigger_pct: float = None,
+                                   trail_distance_pct: float = None) -> dict:
         """Открыть лонг с TP/SL на уровне позиции.
 
         ИСПРАВЛЕНО (было опасно):
@@ -237,8 +239,22 @@ class BybitTrader:
         tp_price = self._round_price(current_price * (1 + tp_pct / 100), info["tick_size"])
         sl_price = self._round_price(current_price * (1 - sl_pct / 100), info["tick_size"])
 
+        # РЕЖИМ ТРЕЙЛИНГА: если задан trigger — фиксированный TP НЕ ставим.
+        # Вместо него на бирже сразу вешаем трейлинг с activePrice на уровне первого
+        # профита. Bybit САМ активирует трейлинг, когда цена дойдёт до этого уровня,
+        # и ведёт стоп за ценой. Это убирает гонку "фикс.TP закрыл раньше трейлинга"
+        # и не зависит от 30-секундного цикла reconcile.
+        use_trailing = bool(trail_trigger_pct and trail_distance_pct)
+        active_price = None
+        trail_dist_price = None
+        if use_trailing:
+            active_price = self._round_price(
+                current_price * (1 + trail_trigger_pct / 100), info["tick_size"])
+            trail_dist_price = self._round_price(
+                current_price * (trail_distance_pct / 100), info["tick_size"])
+
         qty_str = self._fmt(qty, info["qty_step"])
-        tp_str = self._fmt(tp_price, info["tick_size"])
+        tp_str = "" if use_trailing else self._fmt(tp_price, info["tick_size"])
         sl_str = self._fmt(sl_price, info["tick_size"])
 
         # РЕЖИМ ПОЗИЦИИ: переключаем в One-Way, иначе positionIdx=0 даёт ошибку 10001
@@ -257,15 +273,16 @@ class BybitTrader:
             "side": "Buy",
             "orderType": "Market",
             "qty": qty_str,
-            "takeProfit": tp_str,
             "stopLoss": sl_str,
             "tpslMode": "Full",
-            "tpOrderType": "Market",
             "slOrderType": "Market",
-            "tpTriggerBy": "LastPrice",
             "slTriggerBy": "LastPrice",
             "positionIdx": 0,
         }
+        if not use_trailing:
+            order_params["takeProfit"] = tp_str
+            order_params["tpOrderType"] = "Market"
+            order_params["tpTriggerBy"] = "LastPrice"
         resp = await self._signed_request("POST", "/v5/order/create", order_params)
         # ЗАПАСНОЙ ВАРИАНТ: если аккаунт остался в Hedge Mode (переключить не вышло),
         # positionIdx=0 даёт 10001. Повторяем с positionIdx=1 (Long в hedge).
@@ -285,11 +302,53 @@ class BybitTrader:
             "order_id": resp.get("result", {}).get("orderId"),
             "qty": qty,
             "entry_price_estimate": current_price,
-            "tp_price": tp_price,
+            "tp_price": None if use_trailing else tp_price,
             "sl_price": sl_price,
             "leverage": lev,
             "position_idx": order_params["positionIdx"],
+            "use_trailing": use_trailing,
+            "trail_trigger_pct": trail_trigger_pct if use_trailing else None,
+            "trail_distance_pct": trail_distance_pct if use_trailing else None,
         }
+
+    async def arm_trailing_from_fill(self, symbol: str, sl_pct: float,
+                                     trail_trigger_pct: float,
+                                     trail_distance_pct: float) -> dict:
+        """Поставить биржевой трейлинг с activePrice от ФАКТИЧЕСКОЙ цены входа.
+        Пока цена не дошла до activePrice — работает обычный стоп-лосс.
+        Когда дошла — Bybit САМ активирует трейлинг и ведёт стоп. Фикс. TP не ставим.
+        Всё на бирже: не зависит от цикла reconcile и работает даже если бот офлайн."""
+        positions = await self.get_open_positions(symbol)
+        if not positions:
+            return {"ok": False, "error": "нет позиции"}
+        entry = positions[0]["entry_price"]
+        pidx = positions[0].get("position_idx", 0)
+        if entry <= 0:
+            return {"ok": False, "error": "нулевая цена входа"}
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "нет данных инструмента"}
+        sl_price = self._round_price(entry * (1 - sl_pct / 100), info["tick_size"])
+        active_price = self._round_price(entry * (1 + trail_trigger_pct / 100), info["tick_size"])
+        trail_dist = self._round_price(entry * (trail_distance_pct / 100), info["tick_size"])
+        if trail_dist <= 0:
+            return {"ok": False, "error": "нулевая дистанция трейлинга"}
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "stopLoss": self._fmt(sl_price, info["tick_size"]),
+            "trailingStop": self._fmt(trail_dist, info["tick_size"]),
+            "activePrice": self._fmt(active_price, info["tick_size"]),
+            "tpslMode": "Full",
+            "slTriggerBy": "LastPrice",
+            "positionIdx": pidx,
+        }
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "entry_price": entry, "sl_price": sl_price,
+                "active_price": active_price, "trail_distance": trail_dist}
 
     async def set_tpsl_from_fill(self, symbol: str, tp_pct: float, sl_pct: float) -> dict:
         """Пересчитать TP/SL от ФАКТИЧЕСКОЙ цены входа (avgPrice) и переставить на бирже.
@@ -322,37 +381,6 @@ class BybitTrader:
             return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
         return {"ok": True, "entry_price": entry, "tp_price": tp_price, "sl_price": sl_price}
 
-    async def set_trailing_stop(self, symbol: str, trail_distance_pct: float) -> dict:
-        """Включить БИРЖЕВОЙ трейлинг-стоп (Bybit ведёт сам, даже если бот офлайн).
-        trailingStop задаётся АБСОЛЮТНОЙ дистанцией в цене — считаем от текущей.
-        Фиксированный takeProfit снимаем (='0'), чтобы позиция шла за трейлингом.
-        positionIdx берём из реальной позиции — работает в One-Way и Hedge."""
-        positions = await self.get_open_positions(symbol)
-        if not positions:
-            return {"ok": False, "error": "нет позиции"}
-        pidx = positions[0].get("position_idx", 0)
-        instruments = await self.get_instruments_cached()
-        info = instruments.get(symbol)
-        if not info:
-            return {"ok": False, "error": "нет данных инструмента"}
-        price = await self.get_last_price(symbol)
-        if price is None or price <= 0:
-            return {"ok": False, "error": "нет цены"}
-        trail_dist = self._round_price(price * trail_distance_pct / 100, info["tick_size"])
-        if trail_dist <= 0:
-            return {"ok": False, "error": "нулевая дистанция"}
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "trailingStop": self._fmt(trail_dist, info["tick_size"]),
-            "takeProfit": "0",
-            "tpslMode": "Full",
-            "positionIdx": pidx,
-        }
-        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
-        if resp.get("retCode") not in (0, 34040):
-            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
-        return {"ok": True, "trail_distance": trail_dist, "ref_price": price}
 
     async def verify_position_protected(self, symbol: str) -> dict:
         """Проверить, что у позиции РЕАЛЬНО стоит стоп на бирже.

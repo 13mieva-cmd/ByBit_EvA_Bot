@@ -176,8 +176,14 @@ class AutoTrader:
                 f"Открываю позицию..."
             )
 
+            if sig_type == "PULLBACK":
+                trig_pct, dist_pct = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
+            else:
+                trig_pct, dist_pct = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
             result = await self.trader.open_long_with_tpsl(
                 symbol, POSITION_SIZE_USD, tp_pct, sl_pct, leverage=LEVERAGE,
+                trail_trigger_pct=(trig_pct if AUTO_TRAIL_ENABLED else None),
+                trail_distance_pct=(dist_pct if AUTO_TRAIL_ENABLED else None),
             )
             if not result["ok"]:
                 err = result.get("error", "unknown")
@@ -198,17 +204,28 @@ class AutoTrader:
                 return
             pos = positions[0]
 
-            # === Пересчитать TP/SL от РЕАЛЬНОЙ цены входа (avgPrice) ===
-            # Ордер маркетный — реальная цена исполнения отличается от той,
-            # что использовалась при расчёте TP/SL до входа. Переставляем на бирже.
-            adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
-            if adjust_result.get("ok"):
-                result["tp_price"] = adjust_result["tp_price"]
-                result["sl_price"] = adjust_result["sl_price"]
+            # === Настройка защиты от ФАКТИЧЕСКОЙ цены входа (avgPrice) ===
+            # Ордер маркетный — реальная цена входа отличается от расчётной.
+            if AUTO_TRAIL_ENABLED:
+                # Трейлинг с activePrice на уровне первого профита. Пока цена не дошла —
+                # держит обычный стоп. Дошла -> Bybit САМ включает трейлинг. Фикс. TP нет,
+                # значит нечему закрыть сделку раньше трейлинга.
+                arm = await self.trader.arm_trailing_from_fill(
+                    symbol, sl_pct, trig_pct, dist_pct)
+                if arm.get("ok"):
+                    result["sl_price"] = arm["sl_price"]
+                    result["active_price"] = arm["active_price"]
+                else:
+                    log.warning(f"arm_trailing {symbol}: {arm.get('error')}")
             else:
-                log.warning(
-                    f"Failed to adjust TP/SL for {symbol}: {adjust_result.get('error')}"
-                )
+                adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
+                if adjust_result.get("ok"):
+                    result["tp_price"] = adjust_result["tp_price"]
+                    result["sl_price"] = adjust_result["sl_price"]
+                else:
+                    log.warning(
+                        f"Failed to adjust TP/SL for {symbol}: {adjust_result.get('error')}"
+                    )
 
             # === Проверка, что стоп РЕАЛЬНО стоит на бирже ===
             protected = await self.trader.verify_position_protected(symbol)
@@ -230,17 +247,15 @@ class AutoTrader:
                 signal_type=sig_type,
                 stars=signal["stars"],
             )
-            _t0 = self.state.active_positions.get(symbol)
-            if _t0 is not None:
-                _t0["trailing_active"] = False
-                self.state._save()
             await self.notify(
                 f"✅ <b>{base}</b> позиция открыта ({sig_type})\n\n"
                 f"Вход: <code>${pos['entry_price']:.6g}</code>\n"
                 f"Размер: ${POSITION_SIZE_USD} (qty {pos['size']})\n"
                 f"Плечо: {result['leverage']:.0f}x\n"
-                f"🎯 TP: <code>${result['tp_price']:.6g}</code> (+{tp_pct}%)\n"
-                f"🛑 SL: <code>${result['sl_price']:.6g}</code> (−{sl_pct}%) "
+                + (f"📈 Трейлинг: включится на +{trig_pct}%, дистанция {dist_pct}%\n"
+                   if AUTO_TRAIL_ENABLED
+                   else f"🎯 TP: <code>${result['tp_price']:.6g}</code> (+{tp_pct}%)\n")
+                + f"🛑 SL: <code>${result['sl_price']:.6g}</code> (−{sl_pct}%) "
                 f"≈ −${POSITION_SIZE_USD * sl_pct / 100:.2f} "
                 f"({POSITION_SIZE_USD * sl_pct / 100 / DEPOSIT_USD * 100:.1f}% депозита)\n\n"
                 f"Активных позиций: {len(self.state.active_positions)}/{MAX_AUTO_POSITIONS}"
@@ -258,46 +273,12 @@ class AutoTrader:
         if not self.state.active_positions:
             return
         bybit_positions = await self.trader.get_open_positions()
-        bybit_map = {p["symbol"]: p for p in bybit_positions}
+        bybit_syms = {p["symbol"] for p in bybit_positions}
         for symbol in list(self.state.active_positions.keys()):
-            if symbol in bybit_map:
-                if AUTO_TRAIL_ENABLED:
-                    await self.maybe_activate_trailing(symbol, bybit_map[symbol])
+            if symbol in bybit_syms:
                 continue
             await self.handle_closed_position(symbol)
 
-    async def maybe_activate_trailing(self, symbol: str, live_pos: dict):
-        """Когда цена прошла TP1-триггер — снять фиксированный TP и включить
-        биржевой трейлинг-стоп. Один раз на позицию, дальше ведёт Bybit."""
-        tracked = self.state.active_positions.get(symbol)
-        if not tracked or tracked.get("trailing_active"):
-            return
-        entry = tracked["entry_price"]
-        mark = live_pos.get("mark_price") or 0
-        if entry <= 0 or mark <= 0:
-            return
-        gain_pct = (mark - entry) / entry * 100
-        if tracked.get("signal_type") == "PULLBACK":
-            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
-        else:
-            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
-        if gain_pct < trigger:
-            return
-        res = await self.trader.set_trailing_stop(symbol, trail_dist)
-        base = symbol.replace("USDT", "")
-        if res.get("ok"):
-            tracked["trailing_active"] = True
-            self.state._save()
-            await self.notify(
-                f"\U0001F513 <b>{base}</b>: +{gain_pct:.1f}% — TP1 пройден\n"
-                f"Фиксированный TP снят, включён <b>трейлинг {trail_dist}%</b>.\n"
-                f"<i>Стоп идёт за ценой вверх, вниз не двигается. Ведёт Bybit.</i>"
-            )
-        else:
-            await self.notify(
-                f"\u26A0\uFE0F <b>{base}</b>: трейлинг не включился "
-                f"(<code>{res.get('error')}</code>). Обычные TP/SL остаются."
-            )
 
     async def handle_closed_position(self, symbol: str):
         tracked = self.state.active_positions.get(symbol)
@@ -312,21 +293,34 @@ class AutoTrader:
         for cp in closed:
             try:
                 updated_ts = int(cp.get("updatedTime", 0)) / 1000
-                if updated_ts > tracked["opened_at"] - 5:
-                    pnl_usd = float(cp.get("closedPnl", 0))
-                    exit_price = float(cp.get("avgExitPrice", 0))
-                    if exit_price > 0:
-                        tp_dist = abs(exit_price - tracked["tp_price"]) / tracked["tp_price"]
-                        sl_dist = abs(exit_price - tracked["sl_price"]) / tracked["sl_price"]
-                        if tp_dist < 0.005:
-                            close_reason = "TP"
-                        elif sl_dist < 0.01:
-                            close_reason = "SL"
-                        else:
-                            close_reason = "MANUAL"
-                    break
+                if updated_ts <= tracked["opened_at"] - 5:
+                    continue
+                pnl_usd = float(cp.get("closedPnl", 0))
+                exit_price = float(cp.get("avgExitPrice", 0))
             except (KeyError, ValueError, TypeError):
                 continue
+            # Определение причины закрытия.
+            # ВАЖНО: в режиме трейлинга фиксированного TP НЕТ (tp_price = None).
+            # Раньше здесь был abs(exit_price - None) -> TypeError -> запись
+            # пропускалась, причина оставалась UNKNOWN, а PnL мог быть взят
+            # от ДРУГОЙ (более старой) сделки. Это ломало дневной лимит убытка.
+            try:
+                entry_p = tracked.get("entry_price") or 0
+                tp_p = tracked.get("tp_price")
+                sl_p = tracked.get("sl_price")
+                if exit_price > 0:
+                    if sl_p and abs(exit_price - sl_p) / sl_p < 0.01:
+                        close_reason = "SL"
+                    elif tp_p and abs(exit_price - tp_p) / tp_p < 0.005:
+                        close_reason = "TP"
+                    elif tp_p is None and entry_p and exit_price > entry_p:
+                        # трейлинг-режим: вышли выше входа -> сработал трейлинг-стоп
+                        close_reason = "TRAIL"
+                    else:
+                        close_reason = "MANUAL"
+            except (TypeError, ValueError, ZeroDivisionError):
+                close_reason = "UNKNOWN"
+            break
 
         if pnl_usd is not None:
             self.state.add_pnl(pnl_usd)
@@ -341,7 +335,8 @@ class AutoTrader:
         self.state.add_post_trade_cooldown(symbol, POST_TRADE_COOLDOWN_HOURS)
 
         base = symbol.replace("USDT", "")
-        emoji = {"TP": "✅", "SL": "🛑", "MANUAL": "✋", "UNKNOWN": "❓"}.get(close_reason, "❓")
+        emoji = {"TP": "✅", "SL": "🛑", "TRAIL": "📈",
+                 "MANUAL": "✋", "UNKNOWN": "❓"}.get(close_reason, "❓")
         pnl_str = f"${pnl_usd:+.2f}" if pnl_usd is not None else "?"
         exit_str = f"<code>${exit_price:.6g}</code>" if exit_price else "?"
 
