@@ -32,6 +32,8 @@ from config import (
     ENABLE_PULLBACK, PULLBACK_RSI_1H_MIN, PULLBACK_RSI_1H_MAX,
     PULLBACK_EMA_DISTANCE_PCT, PULLBACK_OI_24H_MIN, PULLBACK_OI_1H_MIN,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
+    REQUIRE_TREND_HEALTH, TREND_EMA50_SLOPE_LOOKBACK, TREND_EMA50_SLOPE_MIN_PCT,
+    MAX_SINGLE_CANDLE_SHARE_PCT, TREND_MIN_GREEN_RATIO,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
     POSITION_TIMEOUT_HOURS, POSITION_CHECK_INTERVAL_MIN,
@@ -48,6 +50,9 @@ from config import (
     POST_TRADE_COOLDOWN_HOURS,
     BTC_FILTER_ENABLED, BTC_FILTER_15M_DROP_MAX,
     BTC_FILTER_15M_PUMP_MAX, BTC_FILTER_1H_VOLATILITY_MAX,
+    AUTO_WAIT_FOR_PULLBACK, AUTO_PULLBACK_WAIT_TYPES,
+    PULLBACK_WATCH_TIMEOUT_HOURS, PULLBACK_MIN_RETRACE_PCT,
+    PULLBACK_MAX_RETRACE_PCT, PULLBACK_ENTRY_RSI_MAX,
 )
 from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
@@ -157,8 +162,12 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         if rsi_4h is None:
             return None
 
-        # Fetch 1h klines (used by SURGE and pullback)
-        klines_1h = await get_klines(session, symbol, "60", max(EMA_PERIOD + 5, 30))
+        # Fetch 1h klines (used by SURGE, pullback, and the trend-health check).
+        # Buffer must cover EMA_PERIOD + the longest EMA-slope lookback we compare against.
+        klines_1h = await get_klines(
+            session, symbol, "60",
+            max(EMA_PERIOD + TREND_EMA50_SLOPE_LOOKBACK, EMA_PERIOD + 5, 30)
+        )
         if len(klines_1h) < 25:
             return None
         closes_1h = [float(k[4]) for k in klines_1h]
@@ -275,6 +284,13 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "oi_24h_sparkline": oi_24h_sparkline,
     }
 
+    # ========== TREND HEALTH gate (anti short-squeeze) ==========
+    # Применяется поверх всех фильтров ниже. Если импульс не похож на настоящий
+    # тренд (см. trend_is_healthy) — ни один из трёх сигналов не считается,
+    # даже если формальные пороги Цена/OI/RSI пройдены.
+    if REQUIRE_TREND_HEALTH and not trend_is_healthy(base_data, closes_1h):
+        return None
+
     # ========== Try STANDARD signal ==========
     standard = try_standard(base_data)
     if standard:
@@ -293,6 +309,62 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
             return pullback
 
     return None
+
+
+def ema50_is_rising(ema50_now: Optional[float], closes_1h: list[float],
+                     lookback: int, min_slope_pct: float = 0.0) -> bool:
+    """
+    True, если EMA50(1h) сейчас выше, чем EMA50(1h) `lookback` свечей назад
+    (минимум на min_slope_pct%). Подтверждает, что тренд УЖЕ формировался,
+    а не появился только что за счёт последнего импульса.
+
+    ВАЖНО: calculate_ema требует len(values) >= period, поэтому для
+    "исторической" EMA берём весь ряд БЕЗ последних `lookback` свечей
+    (не узкий срез в lookback свечей — на нём calculate_ema всегда вернёт
+    None при period=50, что раньше тихо отключало эту проверку в PULLBACK).
+    """
+    if ema50_now is None:
+        return False
+    if len(closes_1h) < EMA_PERIOD + lookback:
+        return False
+    ema50_old = calculate_ema(closes_1h[:-lookback], EMA_PERIOD)
+    if ema50_old is None or ema50_old <= 0:
+        return False
+    return (ema50_now - ema50_old) / ema50_old * 100 > min_slope_pct
+
+
+def trend_is_healthy(d: dict, closes_1h: list[float]) -> bool:
+    """Защита от псевдо-трендов (шорт-сквиз / резкий вертикальный импульс).
+
+    Настоящий восходящий тренд — это накопление лонгов на нескольких свечах.
+    Шорт-сквиз или фитиль на тонком стакане тоже дают Цена↑ + OI↑ (в OI
+    попадают и новые шорты, которых потом выносит), но обычно это одна
+    резкая свеча на плоской/падающей базе, а не серия зелёных свечей на
+    растущей EMA50. Проверяем оба признака.
+    """
+    # 1) EMA50 должна расти — тренд сформирован ДО этого импульса.
+    if not ema50_is_rising(d["ema50_1h"], closes_1h,
+                            lookback=TREND_EMA50_SLOPE_LOOKBACK,
+                            min_slope_pct=TREND_EMA50_SLOPE_MIN_PCT):
+        return False
+
+    # 2) Ни одна отдельная 1h свеча за последние 6ч не должна давать
+    #    больше MAX_SINGLE_CANDLE_SHARE_PCT% всего движения, и большинство
+    #    свечей в этом окне должны быть зелёными.
+    window = closes_1h[-7:] if len(closes_1h) >= 7 else closes_1h
+    if len(window) >= 3:
+        total_move = window[-1] - window[0]
+        if total_move <= 0:
+            return False
+        candle_gains = [window[i] - window[i - 1] for i in range(1, len(window))]
+        max_candle_gain = max(candle_gains)
+        if max_candle_gain / total_move * 100 > MAX_SINGLE_CANDLE_SHARE_PCT:
+            return False
+        green = sum(1 for g in candle_gains if g > 0)
+        if green / len(candle_gains) < TREND_MIN_GREEN_RATIO:
+            return False
+
+    return True
 
 
 def try_standard(d: dict) -> Optional[dict]:
@@ -362,11 +434,13 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
     if d["price"] < d["ema50_1h"] or d["ema21_1h"] < d["ema50_1h"]:
         return None
 
-    # EMA50 должна РАСТИ — иначе тренд выдыхается
-    if len(closes_1h) >= 15:
-        ema50_old = calculate_ema(closes_1h[-15:-5], EMA_PERIOD)
-        if ema50_old is not None and d["ema50_1h"] <= ema50_old * 1.002:
-            return None
+    # EMA50 должна РАСТИ — иначе тренд выдыхается.
+    # (Раньше здесь передавался срез всего в 10 свечей при period=50 —
+    # calculate_ema требует len(values) >= period и тихо возвращал None,
+    # то есть проверка НИКОГДА не срабатывала. Теперь считаем EMA50 на
+    # полной истории без последних 5 свечей — корректно сопоставимо.)
+    if not ema50_is_rising(d["ema50_1h"], closes_1h, lookback=5, min_slope_pct=0.2):
+        return None
 
     # Расстояние до EMA21
     distance_ema21 = abs(d["price"] - d["ema21_1h"]) / d["ema21_1h"] * 100
@@ -843,6 +917,18 @@ async def cmd_settings(msg: types.Message):
         f"• OI 1ч: ≥+{PULLBACK_OI_1H_MIN}% (не падает)\n"
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
+        f"<b>🛡 Trend health (анти-сквиз, поверх всех сигналов):</b> "
+        f"{'ON' if REQUIRE_TREND_HEALTH else 'OFF'}\n"
+        f"• EMA50(1h) выше, чем {TREND_EMA50_SLOPE_LOOKBACK}ч назад "
+        f"(≥+{TREND_EMA50_SLOPE_MIN_PCT}%)\n"
+        f"• Ни одна свеча за 6ч не даёт &gt;{MAX_SINGLE_CANDLE_SHARE_PCT:.0f}% движения\n"
+        f"• Доля зелёных свечей за 6ч ≥{TREND_MIN_GREEN_RATIO*100:.0f}%\n\n"
+        f"<b>↩️ Вход на откате (авто-торговля):</b> "
+        f"{'ON' if AUTO_WAIT_FOR_PULLBACK else 'OFF'}\n"
+        f"• Типы в ожидании: {AUTO_PULLBACK_WAIT_TYPES}\n"
+        f"• Откат от пика: {PULLBACK_MIN_RETRACE_PCT}–{PULLBACK_MAX_RETRACE_PCT}%\n"
+        f"• RSI(1ч) на входе: ≤{PULLBACK_ENTRY_RSI_MAX}\n"
+        f"• Таймаут ожидания: {PULLBACK_WATCH_TIMEOUT_HOURS:.0f}ч\n\n"
         f"<b>Ручная сделка (трекер):</b>\n"
         f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
         f"• Hard SL: −{HARD_SL_PCT}%\n"
@@ -1166,17 +1252,36 @@ async def cmd_auto(msg: types.Message):
             )
     pos_block = "\n".join(pos_lines) if pos_lines else "<i>Нет открытых авто-позиций</i>"
 
+    # Ожидают отката перед авто-входом
+    pending = auto_state.pending_entries
+    pend_lines = []
+    if pending:
+        now = time.time()
+        for sym, p in pending.items():
+            base = sym.replace("USDT", "")
+            left_min = max(0, int((p["expires_at"] - now) / 60))
+            peak = p.get("peak_price", p["detected_price"])
+            pend_lines.append(
+                f"• <b>{base}</b> {p['signal_type']} {'⭐'*p['stars']} — "
+                f"сигнал <code>${p['detected_price']:.6g}</code>, "
+                f"пик <code>${peak:.6g}</code>, ещё {left_min} мин"
+            )
+    pend_block = "\n".join(pend_lines) if pend_lines else "<i>Никого не жду</i>"
+    wait_mode = "🟢 ВКЛ" if AUTO_WAIT_FOR_PULLBACK else "🔴 ВЫКЛ"
+
     await msg.answer(
         f"🤖 <b>Auto-trading status</b>\n\n"
         f"Общее состояние: {status_line}\n"
         f"Размер позиции: <b>${POSITION_SIZE_USD}</b>\n"
         f"Max позиций: {len(apos)}/{MAX_AUTO_POSITIONS}\n"
-        f"BTC-фильтр: {btc_filter_line}\n\n"
+        f"BTC-фильтр: {btc_filter_line}\n"
+        f"Вход на откате: {wait_mode} (типы: {AUTO_PULLBACK_WAIT_TYPES})\n\n"
         f"<b>По типам сигналов:</b>\n{sig_status_block}\n\n"
         f"<b>Сегодня (UTC):</b>\n"
         f"P&L: <b>${auto_state.daily_pnl:+.2f}</b> (лимит −${DAILY_LOSS_LIMIT_USD})\n"
         f"Подряд убытков: {auto_state.consecutive_losses}/{CONSECUTIVE_LOSS_BLOCK}\n\n"
         f"<b>Открытые позиции:</b>\n{pos_block}\n\n"
+        f"<b>Жду откат для входа ({len(pending)}):</b>\n{pend_block}\n\n"
         f"<b>Команды:</b>\n"
         f"/auto_on — включить общий\n"
         f"/auto_off — выключить общий\n"
@@ -1582,7 +1687,8 @@ async def main():
     asyncio.create_task(daily_report_loop(bot))
     if auto_trader is not None:
         asyncio.create_task(auto_trader.reconcile_loop())
-        log.info("Auto-trader reconcile loop started")
+        asyncio.create_task(auto_trader.pullback_watch_loop())
+        log.info("Auto-trader reconcile + pullback-watch loops started")
 
     await dp.start_polling(bot)
 

@@ -50,6 +50,22 @@ USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
 EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50"))
 EMA_PULLBACK_PERIOD = int(os.getenv("EMA_PULLBACK_PERIOD", "21"))
 
+# ---------- TREND QUALITY filter (anti short-squeeze) ----------
+# Применяется ко ВСЕМ трём сигналам поверх их собственных фильтров.
+# Цель: отличить настоящий восходящий тренд (накопление лонгов на нескольких
+# свечах) от резкого вертикального импульса (шорт-сквиз/закрытие шортов,
+# фитиль на тонком стакане), который внешне тоже даёт Цена↑ + OI↑.
+REQUIRE_TREND_HEALTH = os.getenv("REQUIRE_TREND_HEALTH", "true").lower() == "true"
+# EMA50(1h) должна быть выше, чем N свечей назад — тренд уже СФОРМИРОВАН,
+# а не начался только что этим импульсом.
+TREND_EMA50_SLOPE_LOOKBACK = int(os.getenv("TREND_EMA50_SLOPE_LOOKBACK", "10"))
+TREND_EMA50_SLOPE_MIN_PCT = float(os.getenv("TREND_EMA50_SLOPE_MIN_PCT", "0.3"))
+# Ни одна отдельная 1h свеча за последние 6ч не должна давать больше X% всего
+# движения — иначе это одна вертикальная свеча (типичный squeeze), а не тренд.
+MAX_SINGLE_CANDLE_SHARE_PCT = float(os.getenv("MAX_SINGLE_CANDLE_SHARE_PCT", "65.0"))
+# Доля зелёных свечей в этом же окне (не одна зелёная среди красных).
+TREND_MIN_GREEN_RATIO = float(os.getenv("TREND_MIN_GREEN_RATIO", "0.5"))
+
 # ---------- BTC filter ----------
 BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-0.5"))
 
@@ -118,6 +134,26 @@ AUTO_HARD_SL_PCT = float(os.getenv("AUTO_HARD_SL_PCT", "2.0"))# было 30.0 (!
 # PULLBACK — быстрый скальп, цели ближе
 AUTO_PULLBACK_TP_PCT = float(os.getenv("AUTO_PULLBACK_TP_PCT", "1.8"))  # было 1.15
 AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))  # было 30.0 (!)
+
+# ---------- Вход НА ОТКАТЕ, а не на хае ----------
+# STANDARD и SURGE по своей природе триггерятся ПОСЛЕ того, как цена уже
+# прошла 4h/1h импульс — рыночный ордер сразу по сигналу означает вход на
+# локальном хае. Вместо немедленного входа бот теперь ставит символ в
+# "лист ожидания" и открывает позицию только когда цена откатит к разумному
+# уровню И покажет отскок. PULLBACK-сигнал уже сам по себе вход на откате
+# (к EMA21 с отскоком), поэтому по умолчанию в лист ожидания НЕ ставится.
+AUTO_WAIT_FOR_PULLBACK = os.getenv("AUTO_WAIT_FOR_PULLBACK", "true").lower() == "true"
+AUTO_PULLBACK_WAIT_TYPES = os.getenv("AUTO_PULLBACK_WAIT_TYPES", "STANDARD,SURGE")
+PULLBACK_WATCH_INTERVAL_SEC = int(os.getenv("PULLBACK_WATCH_INTERVAL_SEC", "180"))
+PULLBACK_WATCH_TIMEOUT_HOURS = float(os.getenv("PULLBACK_WATCH_TIMEOUT_HOURS", "8"))
+# Минимальный откат от пика цены с момента сигнала, чтобы считать это
+# реальным откатом, а не шумом.
+PULLBACK_MIN_RETRACE_PCT = float(os.getenv("PULLBACK_MIN_RETRACE_PCT", "0.8"))
+# Если откат глубже этого — тренд, скорее всего, сломан, вход отменяется
+# (доп. защита от входа на разворот вместо отката).
+PULLBACK_MAX_RETRACE_PCT = float(os.getenv("PULLBACK_MAX_RETRACE_PCT", "6.0"))
+# RSI(1h) должен остыть до этого уровня или ниже — не покупаем в перекупленности.
+PULLBACK_ENTRY_RSI_MAX = float(os.getenv("PULLBACK_ENTRY_RSI_MAX", "58"))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
