@@ -137,7 +137,7 @@ class StatsStore(JsonStore):
             "timeouts": 0,
             "last_reset_day": "",
             "alerts_by_star": {"1": 0, "2": 0, "3": 0},
-            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0},
+            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0, "BB_SQUEEZE": 0},
         })
 
     def reset_daily_if_needed(self, today: str):
@@ -174,10 +174,10 @@ class AutoStateStore(JsonStore):
                 "STANDARD": True,
                 "SURGE": True,
                 "PULLBACK": True,
+                "BB_SQUEEZE": True,
             },
             "post_trade_cooldown": {},  # symbol -> expiration timestamp
             "btc_filter_enabled": True,
-            "pending_entries": {},  # symbol -> signal awaiting a pullback before auto-entry
         })
 
     def is_enabled(self) -> bool:
@@ -319,41 +319,3 @@ class AutoStateStore(JsonStore):
     def set_btc_filter(self, on: bool):
         self.data["btc_filter_enabled"] = on
         self._save()
-
-    # ---------- Pending entries (ждём откат перед авто-входом) ----------
-
-    @property
-    def pending_entries(self) -> dict:
-        return self.data.get("pending_entries", {})
-
-    def is_pending(self, symbol: str) -> bool:
-        return symbol in self.data.get("pending_entries", {})
-
-    def add_pending_entry(self, symbol: str, signal_type: str, stars: int,
-                           detected_price: float, peak_price: float,
-                           detected_at: float, expires_at: float):
-        pending = self.data.setdefault("pending_entries", {})
-        pending[symbol] = {
-            "symbol": symbol,
-            "signal_type": signal_type,
-            "stars": stars,
-            "detected_price": detected_price,
-            "peak_price": peak_price,
-            "detected_at": detected_at,
-            "expires_at": expires_at,
-        }
-        self._save()
-
-    def update_pending_entry(self, symbol: str, **fields):
-        pending = self.data.get("pending_entries", {})
-        if symbol in pending:
-            pending[symbol].update(fields)
-            self._save()
-
-    def remove_pending_entry(self, symbol: str) -> bool:
-        pending = self.data.get("pending_entries", {})
-        if symbol in pending:
-            del pending[symbol]
-            self._save()
-            return True
-        return False

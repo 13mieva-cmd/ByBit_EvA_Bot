@@ -1,7 +1,7 @@
 """
 Configuration for Bybit Open Interest LONG Scanner v2.
 Detects birth of an uptrend via Price + OI confluence.
-Three signal types: Standard, OI Surge, Pullback Continuation.
+Signal types: Standard, OI Surge, Pullback Continuation, BB Squeeze.
 """
 import os
 
@@ -16,55 +16,52 @@ MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "6"))
 MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "1"))
 
 # ---------- Pre-filter ----------
-MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "60"))
-MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "5000000"))
+MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "30"))
+MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "3000000"))
 
-# ---------- STANDARD signal (the original — UB-quality) ----------
-PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "3.0"))   # back to 3% (was lowered to 2 — caused early entries)
-PRICE_CHANGE_4H_MAX = float(os.getenv("PRICE_CHANGE_4H_MAX", "8.0"))
-OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "10.0"))
-OI_CHANGE_24H_2STAR = float(os.getenv("OI_CHANGE_24H_2STAR", "20.0"))
-VOLUME_SPIKE_MIN = float(os.getenv("VOLUME_SPIKE_MIN", "1.5"))
-VOLUME_SPIKE_2STAR = float(os.getenv("VOLUME_SPIKE_2STAR", "2.0"))
-RSI_4H_MIN = float(os.getenv("RSI_4H_MIN", "50"))
-RSI_4H_MAX = float(os.getenv("RSI_4H_MAX", "70"))
+# ---------- STANDARD signal (soft profile: earlier entries) ----------
+PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
+PRICE_CHANGE_4H_MAX = float(os.getenv("PRICE_CHANGE_4H_MAX", "10.0"))
+OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "6.0"))
+OI_CHANGE_24H_2STAR = float(os.getenv("OI_CHANGE_24H_2STAR", "15.0"))
+VOLUME_SPIKE_MIN = float(os.getenv("VOLUME_SPIKE_MIN", "1.2"))
+VOLUME_SPIKE_2STAR = float(os.getenv("VOLUME_SPIKE_2STAR", "1.8"))
+RSI_4H_MIN = float(os.getenv("RSI_4H_MIN", "48"))
+RSI_4H_MAX = float(os.getenv("RSI_4H_MAX", "72"))
 
-# ---------- OI SURGE signal (catches faster moves) ----------
+# ---------- OI SURGE signal (softer to catch earlier impulse) ----------
 ENABLE_OI_SURGE = os.getenv("ENABLE_OI_SURGE", "true").lower() == "true"
-SURGE_PRICE_1H_MIN = float(os.getenv("SURGE_PRICE_1H_MIN", "1.5"))    # +1.5% in 1h
-SURGE_PRICE_1H_MAX = float(os.getenv("SURGE_PRICE_1H_MAX", "5.0"))    # not more than +5%
-SURGE_OI_1H_MIN = float(os.getenv("SURGE_OI_1H_MIN", "5.0"))          # OI +5% in 1h
-SURGE_OI_24H_MIN = float(os.getenv("SURGE_OI_24H_MIN", "5.0"))        # NEW: OI 24h ≥ +5% — protects from closing-shorts squeeze
-SURGE_RSI_1H_MAX = float(os.getenv("SURGE_RSI_1H_MAX", "65"))
+SURGE_PRICE_1H_MIN = float(os.getenv("SURGE_PRICE_1H_MIN", "1.0"))
+SURGE_PRICE_1H_MAX = float(os.getenv("SURGE_PRICE_1H_MAX", "6.5"))
+SURGE_OI_1H_MIN = float(os.getenv("SURGE_OI_1H_MIN", "3.0"))
+SURGE_OI_24H_MIN = float(os.getenv("SURGE_OI_24H_MIN", "2.0"))
+SURGE_RSI_1H_MAX = float(os.getenv("SURGE_RSI_1H_MAX", "70"))
 
-# ---------- PULLBACK CONTINUATION signal ----------
+# ---------- PULLBACK CONTINUATION signal (wider / earlier) ----------
 ENABLE_PULLBACK = os.getenv("ENABLE_PULLBACK", "true").lower() == "true"
-PULLBACK_RSI_1H_MIN = float(os.getenv("PULLBACK_RSI_1H_MIN", "45"))   # tightened from 40 — was catching trend-breaks
-PULLBACK_RSI_1H_MAX = float(os.getenv("PULLBACK_RSI_1H_MAX", "55"))
-PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "1.5"))  # tightened from 2.0
-PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "15.0"))
-PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "0.0"))    # NEW: OI 1h ≥ 0% — current OI not falling
+PULLBACK_RSI_1H_MIN = float(os.getenv("PULLBACK_RSI_1H_MIN", "42"))
+PULLBACK_RSI_1H_MAX = float(os.getenv("PULLBACK_RSI_1H_MAX", "58"))
+PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
+PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
+PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
+
+# ---------- BB SQUEEZE signal ----------
+ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_MULT = float(os.getenv("BB_MULT", "2.0"))
+# Squeeze: bandwidth in lower percentile of lookback OR below absolute max
+BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 1h bars
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.5"))  # % hard cap
+# After squeeze: close above upper band, then small pullback entry
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.8"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "62"))
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "5.0"))
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
 EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50"))
 EMA_PULLBACK_PERIOD = int(os.getenv("EMA_PULLBACK_PERIOD", "21"))
-
-# ---------- TREND QUALITY filter (anti short-squeeze) ----------
-# Применяется ко ВСЕМ трём сигналам поверх их собственных фильтров.
-# Цель: отличить настоящий восходящий тренд (накопление лонгов на нескольких
-# свечах) от резкого вертикального импульса (шорт-сквиз/закрытие шортов,
-# фитиль на тонком стакане), который внешне тоже даёт Цена↑ + OI↑.
-REQUIRE_TREND_HEALTH = os.getenv("REQUIRE_TREND_HEALTH", "true").lower() == "true"
-# EMA50(1h) должна быть выше, чем N свечей назад — тренд уже СФОРМИРОВАН,
-# а не начался только что этим импульсом.
-TREND_EMA50_SLOPE_LOOKBACK = int(os.getenv("TREND_EMA50_SLOPE_LOOKBACK", "10"))
-TREND_EMA50_SLOPE_MIN_PCT = float(os.getenv("TREND_EMA50_SLOPE_MIN_PCT", "0.3"))
-# Ни одна отдельная 1h свеча за последние 6ч не должна давать больше X% всего
-# движения — иначе это одна вертикальная свеча (типичный squeeze), а не тренд.
-MAX_SINGLE_CANDLE_SHARE_PCT = float(os.getenv("MAX_SINGLE_CANDLE_SHARE_PCT", "65.0"))
-# Доля зелёных свечей в этом же окне (не одна зелёная среди красных).
-TREND_MIN_GREEN_RATIO = float(os.getenv("TREND_MIN_GREEN_RATIO", "0.5"))
 
 # ---------- BTC filter ----------
 BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-0.5"))
@@ -72,9 +69,9 @@ BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-0.5"))
 # ---------- Trade parameters ----------
 TP1_PCT = float(os.getenv("TP1_PCT", "2.0"))
 TP2_PCT = float(os.getenv("TP2_PCT", "5.0"))
-HARD_SL_PCT = float(os.getenv("HARD_SL_PCT", "10.0"))   # Aviation-style emergency only
-OI_DROP_WARNING_PCT = float(os.getenv("OI_DROP_WARNING_PCT", "5.0"))   # warn if OI -5% in 1h
-POSITION_TIMEOUT_HOURS = int(os.getenv("POSITION_TIMEOUT_HOURS", "24"))  # extended
+HARD_SL_PCT = float(os.getenv("HARD_SL_PCT", "10.0"))  # Aviation-style emergency only
+OI_DROP_WARNING_PCT = float(os.getenv("OI_DROP_WARNING_PCT", "5.0"))  # warn if OI -5% in 1h
+POSITION_TIMEOUT_HOURS = int(os.getenv("POSITION_TIMEOUT_HOURS", "24"))
 POSITION_CHECK_INTERVAL_MIN = int(os.getenv("POSITION_CHECK_INTERVAL_MIN", "5"))
 
 # Smart hold: when in +X% profit, monitor OI health intensively
@@ -84,14 +81,11 @@ SMART_HOLD_THRESHOLD_PCT = float(os.getenv("SMART_HOLD_THRESHOLD_PCT", "3.0"))
 IGNORE_DURATION_HOURS = int(os.getenv("IGNORE_DURATION_HOURS", "24"))
 
 # ---------- Storage ----------
-# ВАЖНО: на Railway файловая система ЭФЕМЕРНАЯ — при редеплое всё стирается.
-# Без volume состояние (открытые позиции!) терялось, а сделки на бирже оставались.
-# DATA_DIR должен указывать на смонтированный volume (обычно /data).
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except Exception:
-    DATA_DIR = "."          # локальный запуск без volume
+    DATA_DIR = "."
 
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", os.path.join(DATA_DIR, "oi_positions.json"))
 IGNORE_FILE = os.getenv("IGNORE_FILE", os.path.join(DATA_DIR, "oi_ignore.json"))
@@ -107,7 +101,6 @@ BLACKLIST = {
     "USDC", "USDT", "DAI", "TUSD", "FDUSD", "FOLKS"
 }
 
-
 # ============================================================
 # AUTO-TRADING CONFIGURATION
 # ============================================================
@@ -115,76 +108,57 @@ BLACKLIST = {
 # Bybit API credentials — set in Railway Variables, NEVER hardcode
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+# demo: https://api-demo.bybit.com | mainnet: https://api.bybit.com
+BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api-demo.bybit.com")
 
-# ---------- РИСК: депозит 500$, плечо 10x ----------
+# ---------- Risk ----------
 DEPOSIT_USD = float(os.getenv("DEPOSIT_USD", "500"))
-LEVERAGE = float(os.getenv("LEVERAGE", "10"))          # ФИКСИРОВАННОЕ плечо (было max_leverage биржи!)
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.5"))  # % депозита на сделку
-
-# Номинал позиции. При 500$ и плече 10 разумный размер 250-500$.
+LEVERAGE = float(os.getenv("LEVERAGE", "10"))
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.5"))
 POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "250"))
 
-# ВАЖНО про стопы:
-# Раньше стоял SL = 30% при МАКСИМАЛЬНОМ плече биржи. При плече 25-75x ликвидация
-# наступает на 1-4%, то есть стоп на 30% не срабатывал НИКОГДА — позицию просто
-# ликвидировало. Теперь плечо 10x (ликвидация ~10%), а стоп 2% — он реально сработает.
-AUTO_TP_PCT = float(os.getenv("AUTO_TP_PCT", "3.0"))          # было 2.15
-AUTO_HARD_SL_PCT = float(os.getenv("AUTO_HARD_SL_PCT", "2.0"))# было 30.0 (!)
+# ---------- Auto trade exits ----------
+AUTO_TP_PCT = float(os.getenv("AUTO_TP_PCT", "3.0"))
+AUTO_HARD_SL_PCT = float(os.getenv("AUTO_HARD_SL_PCT", "2.0"))
 
-# PULLBACK — быстрый скальп, цели ближе
-AUTO_PULLBACK_TP_PCT = float(os.getenv("AUTO_PULLBACK_TP_PCT", "1.8"))  # было 1.15
-AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))  # было 30.0 (!)
+# Pullback auto trade
+AUTO_PULLBACK_TP_PCT = float(os.getenv("AUTO_PULLBACK_TP_PCT", "1.8"))
+AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 
-# ---------- Вход НА ОТКАТЕ, а не на хае ----------
-# STANDARD и SURGE по своей природе триггерятся ПОСЛЕ того, как цена уже
-# прошла 4h/1h импульс — рыночный ордер сразу по сигналу означает вход на
-# локальном хае. Вместо немедленного входа бот теперь ставит символ в
-# "лист ожидания" и открывает позицию только когда цена откатит к разумному
-# уровню И покажет отскок. PULLBACK-сигнал уже сам по себе вход на откате
-# (к EMA21 с отскоком), поэтому по умолчанию в лист ожидания НЕ ставится.
-AUTO_WAIT_FOR_PULLBACK = os.getenv("AUTO_WAIT_FOR_PULLBACK", "true").lower() == "true"
-AUTO_PULLBACK_WAIT_TYPES = os.getenv("AUTO_PULLBACK_WAIT_TYPES", "STANDARD,SURGE")
-PULLBACK_WATCH_INTERVAL_SEC = int(os.getenv("PULLBACK_WATCH_INTERVAL_SEC", "180"))
-PULLBACK_WATCH_TIMEOUT_HOURS = float(os.getenv("PULLBACK_WATCH_TIMEOUT_HOURS", "8"))
-# Минимальный откат от пика цены с момента сигнала, чтобы считать это
-# реальным откатом, а не шумом.
-PULLBACK_MIN_RETRACE_PCT = float(os.getenv("PULLBACK_MIN_RETRACE_PCT", "0.8"))
-# Если откат глубже этого — тренд, скорее всего, сломан, вход отменяется
-# (доп. защита от входа на разворот вместо отката).
-PULLBACK_MAX_RETRACE_PCT = float(os.getenv("PULLBACK_MAX_RETRACE_PCT", "6.0"))
-# RSI(1h) должен остыть до этого уровня или ниже — не покупаем в перекупленности.
-PULLBACK_ENTRY_RSI_MAX = float(os.getenv("PULLBACK_ENTRY_RSI_MAX", "58"))
+# BB Squeeze auto trade
+AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.2"))
+AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.4"))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
-# Дневной лимит: раньше 300$ при убытке 300$ с одной сделки -> блок после ПЕРВОГО стопа.
-# Теперь стоп 2% от 250$ = 5$, лимит 25$ = примерно 5 стопов подряд.
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "25"))
 CONSECUTIVE_LOSS_BLOCK = int(os.getenv("CONSECUTIVE_LOSS_BLOCK", "3"))
 
-# Which signal types are eligible for auto-trade (comma-separated)
-AUTO_TRADE_SIGNAL_TYPES = os.getenv("AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK")
+# Which signal types are eligible for auto-trade
+AUTO_TRADE_SIGNAL_TYPES = os.getenv(
+    "AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK,BB_SQUEEZE"
+)
 
 # Reconciliation interval (sec)
 RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "30"))
 
-# Post-trade cooldown — block auto-trade on a symbol after it just closed (any reason)
+# Post-trade cooldown
 POST_TRADE_COOLDOWN_HOURS = int(os.getenv("POST_TRADE_COOLDOWN_HOURS", "48"))
 
-# ---------- Трейлинг-стоп после TP1 ----------
-# После достижения TP1 фиксированный тейк снимается, включается биржевой трейлинг-стоп.
-# Bybit ведёт его сам (даже если бот офлайн) — стоп поднимается за ценой, вниз не двигается.
+# ---------- Trailing stop after TP1 ----------
 AUTO_TRAIL_ENABLED = os.getenv("AUTO_TRAIL_ENABLED", "true").lower() == "true"
-AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))        # STANDARD/SURGE: при +1.5%
-AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))  # дистанция трейлинга 1%
-AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))  # PULLBACK: при +0.9%
+AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))
+AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))
+AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
+AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.1"))
+AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.7"))
 
-# BTC trend filter for auto-entry (blocks ONLY auto-entry, alerts still come)
+# BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
-BTC_FILTER_15M_DROP_MAX = float(os.getenv("BTC_FILTER_15M_DROP_MAX", "0.8"))      # block if BTC dropped > 0.8% in 15m
-BTC_FILTER_15M_PUMP_MAX = float(os.getenv("BTC_FILTER_15M_PUMP_MAX", "1.5"))      # block if BTC pumped > 1.5% in 15m
-BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "1.2"))  # block if BTC stddev > 1.2% in 1h
+BTC_FILTER_15M_DROP_MAX = float(os.getenv("BTC_FILTER_15M_DROP_MAX", "0.8"))
+BTC_FILTER_15M_PUMP_MAX = float(os.getenv("BTC_FILTER_15M_PUMP_MAX", "1.5"))
+BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "1.2"))
 
 # Storage
 AUTO_STATE_FILE = os.getenv("AUTO_STATE_FILE", os.path.join(DATA_DIR, "auto_state.json"))
