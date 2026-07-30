@@ -34,7 +34,9 @@ from config import (
     PULLBACK_EMA_DISTANCE_PCT, PULLBACK_OI_24H_MIN, PULLBACK_OI_1H_MIN,
     ENABLE_BB_SQUEEZE, BB_PERIOD, BB_MULT,
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
+    BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
+    BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
@@ -58,6 +60,7 @@ from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
 from indicators import calculate_rsi, calculate_ema, calculate_bollinger
+from backtest import backtest_symbol, top_symbols, format_result, format_summary
 from visuals import progress_bar, sparkline, position_progress
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -280,6 +283,17 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
     # RSI 15m — for BB pullback entry (not overbought on the signal TF)
     rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
 
+    # Volume spike 15m (breakout confirmation)
+    vol_spike_15m = 0.0
+    if klines_15m and len(klines_15m) >= 21:
+        try:
+            vols_15 = [float(k[5]) for k in klines_15m]
+            avg_v = sum(vols_15[-21:-1]) / 20
+            if avg_v > 0:
+                vol_spike_15m = vols_15[-1] / avg_v
+        except (ValueError, TypeError, IndexError):
+            vol_spike_15m = 0.0
+
     base_data = {
         "symbol": symbol,
         "price": current_price,
@@ -306,6 +320,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "bb_bandwidth": bb["bandwidth"] if bb else None,
         "bb_history_bw": bb_history_bw,
         "rsi_15m": rsi_15m,
+        "vol_spike_15m": vol_spike_15m,
     }
 
     # ========== Try STANDARD signal ==========
@@ -446,11 +461,13 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
-    BB Squeeze on 15m → breakout above upper band → small pullback entry.
-    1) Squeeze (15m): bandwidth in lower BB_SQUEEZE_PERCENTILE of lookback OR < MAX_BW
-    2) Breakout (15m): recent close above upper band
-    3) Pullback: price retraced 0.15%..BB_PULLBACK_MAX_PCT from breakout high
-    4) Filters: above EMA50 (1h), OI 24h, RSI 15m not overbought
+    BB Squeeze on 15m → breakout upper → small pullback entry.
+    1) Fresh squeeze (OR): relative percentile OR absolute MAX_BW, within FRESH_BARS
+    2) Breakout upper 15m + volume
+    3) Pullback 0.15..MAX%, price holds above mid BB
+    4) OI 24h + OI 4h (устойчивый приток, меньше short-cover вспышек)
+    5) Anti-parabolic: не входить после вертикального шипа 15–30m
+    6) EMA50 1h, RSI 15m
     """
     if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
         return None
@@ -458,21 +475,31 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         return None
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"]:
         return None
+
+    # Устойчивый приток: 24h и 4h (не только краткий squeeze шортов)
     if d["oi_change_24h"] < BB_OI_24H_MIN:
+        return None
+    if d.get("oi_change_4h", 0) < BB_OI_4H_MIN:
         return None
 
     bw = d["bb_bandwidth"]
     hist = d.get("bb_history_bw") or []
-    is_squeeze = False
+    # hist[0] = current bar bandwidth, hist[1] = previous, ...
+
+    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
+    recent = hist[:fresh_n] if hist else [bw]
+    min_recent = min(recent)
+
+    percentile_ok = False
     if hist and len(hist) >= 10:
         sorted_bw = sorted(hist)
-        idx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
-        threshold = sorted_bw[idx]
-        if bw <= threshold:
-            is_squeeze = True
-    if bw <= BB_SQUEEZE_MAX_BW:
-        is_squeeze = True
-    if not is_squeeze:
+        pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
+        percentile_ok = min_recent <= sorted_bw[pidx]
+    cap_ok = min_recent <= BB_SQUEEZE_MAX_BW
+    if not (percentile_ok or cap_ok):
+        return None
+
+    if min_recent > 0 and bw > min_recent * 1.8 and bw > BB_SQUEEZE_MAX_BW * 1.5:
         return None
 
     # Breakout above upper on 15m (current or last 1-2 bars)
@@ -483,9 +510,23 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         c = closes_15m[-i]
         if c > d["bb_upper"]:
             broke = True
-            breakout_high = max(breakout_high, c)
+            if c >= breakout_high:
+                breakout_high = c
     if not broke:
         return None
+
+    # Volume confirmation on 15m
+    vol15 = d.get("vol_spike_15m") or 0.0
+    if vol15 < BB_BREAKOUT_VOL_MIN:
+        return None
+
+    # Anti-parabolic: резкий шип за 2×15m без «нормального» отката — чаще short cover
+    if len(closes_15m) >= 3:
+        local_low = min(closes_15m[-3], closes_15m[-2], closes_15m[-1])
+        if local_low > 0:
+            spike_pct = (closes_15m[-1] - local_low) / local_low * 100
+            if spike_pct > BB_PARABOLIC_MAX_PCT:
+                return None
 
     # Small pullback from breakout high
     pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
@@ -494,18 +535,31 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
 
+    # Удержание mid BB как поддержки после пробоя (откат «в полосу», не под mid)
+    mid = d.get("bb_middle")
+    if BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
+        return None
+
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
         return None
 
-    # Momentum still alive on 15m: price above close 2 bars ago
+    # Momentum still alive on 15m
     if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
         return None
 
     stars = 1
-    if d["oi_change_24h"] >= BB_OI_24H_MIN * 1.8 and d["vol_spike_1h"] >= 1.3:
+    if d["oi_change_24h"] >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
         stars = 2
-    if stars == 2 and d["btc_1h"] >= -0.3 and bw <= BB_SQUEEZE_MAX_BW * 0.7:
+    if (
+        stars == 2
+        and d.get("oi_change_4h", 0) >= BB_OI_4H_MIN * 1.6
+        and d["btc_1h"] >= -0.3
+        and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
+    ):
+        stars = 3
+    # Бонус качества: откат близко к mid (не висит у upper)
+    if stars == 2 and mid and d["price"] <= mid * 1.008:
         stars = 3
 
     return {
@@ -514,6 +568,7 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         "signal_type": "BB_SQUEEZE",
         "bb_pullback_pct": round(pullback_pct, 2),
         "bb_bandwidth": round(bw, 2),
+        "vol_spike_15m": round(vol15, 2),
     }
 
 
@@ -640,7 +695,8 @@ def format_alert(s: dict) -> str:
     if s.get("signal_type") == "BB_SQUEEZE":
         bb_line = (
             f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
-            f"откат {s.get('bb_pullback_pct', 0):.2f}%\n"
+            f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
+            f"vol×{s.get('vol_spike_15m', 0):.1f}\n"
         )
 
     return (
@@ -914,7 +970,9 @@ async def cmd_start(msg: types.Message):
         "⚠️ OI watchdog: при падении OI бот алертит — выходи руками\n"
         "💚 Smart hold: при растущем OI бот скажет «держи»\n\n"
         "<b>Команды:</b>\n"
-        "/scan /settings /positions /stats\n"
+        "/scan — ручной скан\n"
+        "/backtest — бэктест BB_SQUEEZE\n"
+        "/settings /positions /stats\n"
         "/top_oi /active /ignored /unignore SYM\n"
         "/add SYM PRICE /remove SYM\n\n"
         "<b>🤖 Авто-торговля:</b>\n"
@@ -967,10 +1025,12 @@ async def cmd_settings(msg: types.Message):
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
         f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• Сужение полос 15m (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
-        f"• Пробой верхней границы BB (15m)\n"
-        f"• Вход на откате 0.15…{BB_PULLBACK_MAX_PCT}% от high пробоя\n"
-        f"• RSI 1ч ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"
+        f"• Свежее сужение 15m за {BB_SQUEEZE_FRESH_BARS} баров:\n"
+        f"  bw ≤{BB_SQUEEZE_MAX_BW}% <b>или</b> нижние {BB_SQUEEZE_PERCENTILE:.0f}% истории монеты\n"
+        f"• Пробой upper 15m + объём ×{BB_BREAKOUT_VOL_MIN}\n"
+        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}% и цена ≥ mid BB\n"
+        f"• OI 24ч ≥+{BB_OI_24H_MIN}% и OI 4ч ≥+{BB_OI_4H_MIN}%\n"
+        f"• Анти-шип ≤{BB_PARABOLIC_MAX_PCT}% за 30м; RSI 15м ≤{BB_PULLBACK_RSI_MAX}\n"
         f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
         f"<b>Ручная сделка (трекер):</b>\n"
         f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
@@ -978,6 +1038,76 @@ async def cmd_settings(msg: types.Message):
         f"• Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
         f"<b>Авто-торговля:</b> /auto"
     )
+
+
+@dp.message(Command("backtest"))
+async def cmd_backtest(msg: types.Message):
+    """Usage: /backtest [SYMBOL|TOP] [days]
+    Examples: /backtest PRL 14   |   /backtest TOP 7   |   /backtest ARB
+    """
+    parts = (msg.text or "").split()
+    days = 14
+    mode = "symbol"
+    symbol = None
+    top_n = 10
+
+    if len(parts) >= 2:
+        arg = parts[1].upper()
+        if arg in ("TOP", "TOP10", "ALL"):
+            mode = "top"
+            if arg.startswith("TOP") and arg[3:].isdigit():
+                top_n = int(arg[3:])
+            elif len(parts) >= 3 and parts[2].isdigit():
+                # /backtest TOP 15 — ambiguous; if parts[2] is days for TOP default
+                pass
+        else:
+            symbol = arg if arg.endswith("USDT") else arg + "USDT"
+
+    # days: last numeric token
+    for p_ in parts[1:]:
+        if p_.isdigit():
+            days = max(3, min(int(p_), 60))
+            break
+    if len(parts) >= 3 and parts[1].upper() in ("TOP", "ALL") and parts[2].isdigit():
+        # /backtest TOP 15 → 15 coins if no other number; treat as top_n if <=30 and days default
+        n = int(parts[2])
+        if n <= 30:
+            top_n = n
+            days = 14
+    if len(parts) >= 4 and parts[1].upper() == "TOP" and parts[2].isdigit() and parts[3].isdigit():
+        top_n = int(parts[2])
+        days = max(3, min(int(parts[3]), 60))
+
+    await msg.answer(
+        f"⏳ Backtest BB_SQUEEZE "
+        f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
+        f"за {days}д… это может занять 1–3 мин."
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            if mode == "top":
+                syms = await top_symbols(session, top_n)
+                if not syms:
+                    await msg.answer("Не удалось получить список монет.")
+                    return
+                results = []
+                for s in syms:
+                    results.append(await backtest_symbol(session, s, days, use_oi=True))
+                await msg.answer(format_summary(results))
+            else:
+                if not symbol:
+                    await msg.answer(
+                        "Использование:\n"
+                        "<code>/backtest PRL 14</code> — одна монета\n"
+                        "<code>/backtest TOP 10 14</code> — топ монет\n"
+                        "<code>/backtest TOP</code> — топ-10 за 14д"
+                    )
+                    return
+                r = await backtest_symbol(session, symbol, days, use_oi=True)
+                await msg.answer(format_result(r))
+    except Exception as e:
+        log.exception("backtest")
+        await msg.answer(f"❌ Backtest error: <code>{e}</code>")
 
 
 @dp.message(Command("top_oi"))
