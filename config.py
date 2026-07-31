@@ -22,7 +22,7 @@ MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "3000000"))
 # ---------- STANDARD signal (soft profile: earlier entries) ----------
 PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
 PRICE_CHANGE_4H_MAX = float(os.getenv("PRICE_CHANGE_4H_MAX", "10.0"))
-OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "6.0"))
+OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "4.0"))
 OI_CHANGE_24H_2STAR = float(os.getenv("OI_CHANGE_24H_2STAR", "15.0"))
 VOLUME_SPIKE_MIN = float(os.getenv("VOLUME_SPIKE_MIN", "1.2"))
 VOLUME_SPIKE_2STAR = float(os.getenv("VOLUME_SPIKE_2STAR", "1.8"))
@@ -42,29 +42,33 @@ ENABLE_PULLBACK = os.getenv("ENABLE_PULLBACK", "true").lower() == "true"
 PULLBACK_RSI_1H_MIN = float(os.getenv("PULLBACK_RSI_1H_MIN", "42"))
 PULLBACK_RSI_1H_MAX = float(os.getenv("PULLBACK_RSI_1H_MAX", "58"))
 PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
-PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
+PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "5.0"))
 PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
 
 # ---------- BB SQUEEZE signal (15m, strict preset) ----------
 ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
-BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # BB period on 15m
-BB_MULT = float(os.getenv("BB_MULT", "2.0"))
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # классика: Length 20
+BB_MULT = float(os.getenv("BB_MULT", "2.0"))            # классика: Deviation 2.0
+# После squeeze полосы должны начать расширяться (истинный пробой, не укол)
+BB_REQUIRE_EXPANSION = os.getenv("BB_REQUIRE_EXPANSION", "true").lower() == "true"
+# Отсев ложного пробоя: close снова внутри полос после укола upper
+BB_REJECT_FALSE_BREAKOUT = os.getenv("BB_REJECT_FALSE_BREAKOUT", "true").lower() == "true"
 # Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
 BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
-BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "15"))  # bottom 15%
-BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.2"))  # % hard cap — stricter
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "4.5"))  # % hard cap
 # Squeeze must have been present in the last N bars (fresh, not stale)
 BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "6"))  # 6×15m ≈ 1.5h
 # Breakout volume: current 15m vol vs avg of prior 20 bars
-BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.3"))
+BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.15"))
 # After squeeze: close above upper band on 15m, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.2"))
-BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI 15m
-BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "6.0"))
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.8"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "65"))  # RSI 15m
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "4.0"))
 # Доп. подтверждение притока (не только 24h-всплеск / short cover)
-BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "2.5"))
+BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "1.5"))
 # Анти-параболика: макс. рост цены за последние 2×15m от локального low
-BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "4.5"))
+BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "6.0"))
 # Откат должен удерживаться выше mid BB (поддержка после пробоя)
 BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "true"
 
@@ -74,7 +78,7 @@ EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50"))
 EMA_PULLBACK_PERIOD = int(os.getenv("EMA_PULLBACK_PERIOD", "21"))
 
 # ---------- BTC filter ----------
-BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-0.5"))
+BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-1.5"))
 
 # ---------- Trade parameters ----------
 TP1_PCT = float(os.getenv("TP1_PCT", "2.0"))

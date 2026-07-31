@@ -28,6 +28,7 @@ from config import (
     BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
+    BB_REQUIRE_EXPANSION, BB_REJECT_FALSE_BREAKOUT,
     USE_EMA_FILTER, EMA_PERIOD,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     POSITION_SIZE_USD, MIN_VOLUME_USD_24H, BLACKLIST,
@@ -369,6 +370,23 @@ def _signal_at(
     if not broke:
         return None
 
+    # Расширение полос после squeeze (истинный пробой)
+    if BB_REQUIRE_EXPANSION and len(hist) >= 3:
+        if bw < min_recent * 1.02 and bw <= (hist[1] if len(hist) > 1 else bw):
+            return None
+
+    # Ложный пробой: после close > upper был close < mid
+    if BB_REJECT_FALSE_BREAKOUT:
+        n = len(window)
+        up = bb["upper"]
+        md = bb["middle"]
+        for i in range(max(0, n - 5), n):
+            if window[i] > up:
+                for j in range(i + 1, n):
+                    if window[j] < md:
+                        return None
+                break
+
     # volume spike 15m
     if i < 20:
         return None
@@ -417,14 +435,8 @@ async def backtest_symbol(
 ) -> BacktestResult:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - days * 86400 * 1000
-    # Warm-up must cover BOTH: the 15m BB squeeze lookback, AND the 1h EMA50
-    # filter (EMA_PERIOD hours of 1h candles). Using only the 15m-derived
-    # warm-up left ~(EMA_PERIOD - 15m_warmup_hours) hours at the start of
-    # every backtest window where EMA50 wasn't computable yet -> guaranteed
-    # zero signals there regardless of market conditions.
-    warm_15m_ms = (BB_PERIOD + BB_SQUEEZE_LOOKBACK + 50) * 15 * 60 * 1000
-    warm_1h_ms = (EMA_PERIOD + 10) * 3600 * 1000  # +10h buffer
-    warm_ms = start_ms - max(warm_15m_ms, warm_1h_ms)
+    # warm-up for indicators
+    warm_ms = start_ms - (BB_PERIOD + BB_SQUEEZE_LOOKBACK + 50) * 15 * 60 * 1000
 
     kl_15 = await _fetch_klines(session, symbol, "15", warm_ms, end_ms)
     kl_1h = await _fetch_klines(session, symbol, "60", warm_ms, end_ms)
@@ -449,19 +461,11 @@ async def backtest_symbol(
         if len(oi_series) < 10:
             log.warning(f"{symbol}: OI history thin ({len(oi_series)}), OI filter may block all")
 
-    # Prebuild 1h close series available at each 15m bar (no look-ahead).
-    # A 1h candle's timestamp marks its OPEN, not its close — so a candle that
-    # merely *started* before ts may still be live (its close in the fetched
-    # history is the value it settles at up to an hour later, i.e. from the
-    # future relative to ts). Only candles that have FULLY closed by ts
-    # (open_ts + 1h <= ts) are safe to use; this mirrors what the live bot
-    # actually sees on completed 1h candles.
-    ONE_HOUR_MS = 3_600_000
-
+    # Prebuild 1h close series available at each 15m bar (no look-ahead)
     def closes_1h_at(ts: int) -> list[float]:
         out = []
         for t, c in zip(ts_1h, closes_1h_all):
-            if t + ONE_HOUR_MS <= ts:
+            if t <= ts:
                 out.append(c)
             else:
                 break
