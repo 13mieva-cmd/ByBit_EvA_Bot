@@ -71,6 +71,16 @@ BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "1.5"))
 BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "6.0"))
 # Откат должен удерживаться выше mid BB (поддержка после пробоя)
 BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "true"
+# Keltner Channels (TTM-style squeeze filter for BB)
+KC_EMA_PERIOD = int(os.getenv("KC_EMA_PERIOD", "20"))
+KC_ATR_PERIOD = int(os.getenv("KC_ATR_PERIOD", "10"))
+KC_ATR_MULT = float(os.getenv("KC_ATR_MULT", "1.5"))
+# BB inside KC recently = confirmed squeeze
+BB_REQUIRE_KC_SQUEEZE = os.getenv("BB_REQUIRE_KC_SQUEEZE", "true").lower() == "true"
+# Lookback bars for "was inside KC" (fresh squeeze)
+BB_KC_SQUEEZE_BARS = int(os.getenv("BB_KC_SQUEEZE_BARS", "6"))
+# Optional: breakout should clear Keltner upper too
+BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() == "true"
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"

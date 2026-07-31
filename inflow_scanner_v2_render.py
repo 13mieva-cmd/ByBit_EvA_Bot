@@ -38,6 +38,8 @@ from config import (
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
     BB_REQUIRE_EXPANSION, BB_REJECT_FALSE_BREAKOUT,
+    KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+    BB_REQUIRE_KC_SQUEEZE, BB_KC_SQUEEZE_BARS, BB_REQUIRE_KC_BREAKOUT,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
@@ -60,7 +62,10 @@ from config import (
 from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
-from indicators import calculate_rsi, calculate_ema, calculate_bollinger
+from indicators import (
+    calculate_rsi, calculate_ema, calculate_bollinger,
+    calculate_keltner, bb_inside_keltner,
+)
 from backtest import backtest_symbol, top_symbols, format_result, format_summary
 from visuals import progress_bar, sparkline, position_progress
 
@@ -268,18 +273,36 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
     if rsi_1h is None:
         return None
 
-    # Bollinger Bands on 15m + bandwidth history for squeeze detection
+    # Bollinger + Keltner on 15m (TTM-style: BB inside KC = squeeze)
+    highs_15m = [float(k[2]) for k in klines_15m] if klines_15m else []
+    lows_15m = [float(k[3]) for k in klines_15m] if klines_15m else []
     bb = calculate_bollinger(closes_15m, BB_PERIOD, BB_MULT) if closes_15m else None
+    kc = (
+        calculate_keltner(
+            highs_15m, lows_15m, closes_15m,
+            KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+        )
+        if highs_15m and lows_15m and closes_15m
+        else None
+    )
     bb_history_bw = []
+    kc_squeeze_hist = []  # True if BB was inside KC at that bar (newest first)
     need = BB_PERIOD + BB_SQUEEZE_LOOKBACK
-    if len(closes_15m) >= need:
+    atr_need = max(KC_EMA_PERIOD, KC_ATR_PERIOD) + 1
+    if len(closes_15m) >= need and len(highs_15m) >= need:
         for i in range(BB_SQUEEZE_LOOKBACK):
             end = len(closes_15m) - i
-            if end < BB_PERIOD:
+            if end < max(BB_PERIOD, atr_need):
                 break
             b = calculate_bollinger(closes_15m[:end], BB_PERIOD, BB_MULT)
+            k = calculate_keltner(
+                highs_15m[:end], lows_15m[:end], closes_15m[:end],
+                KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+            )
             if b:
                 bb_history_bw.append(b["bandwidth"])
+            if b and k:
+                kc_squeeze_hist.append(bb_inside_keltner(b, k))
 
     # RSI 15m — for BB pullback entry (not overbought on the signal TF)
     rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
@@ -320,6 +343,11 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "bb_lower": bb["lower"] if bb else None,
         "bb_bandwidth": bb["bandwidth"] if bb else None,
         "bb_history_bw": bb_history_bw,
+        "kc_upper": kc["upper"] if kc else None,
+        "kc_middle": kc["middle"] if kc else None,
+        "kc_lower": kc["lower"] if kc else None,
+        "kc_squeeze_now": bb_inside_keltner(bb, kc) if (bb and kc) else False,
+        "kc_squeeze_hist": kc_squeeze_hist,
         "rsi_15m": rsi_15m,
         "vol_spike_15m": vol_spike_15m,
     }
@@ -501,6 +529,14 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if not (percentile_ok or cap_ok):
         return None
 
+    # TTM-style: BB был внутри Keltner недавно (подтверждённый squeeze)
+    if BB_REQUIRE_KC_SQUEEZE:
+        hist_kc = d.get("kc_squeeze_hist") or []
+        n = max(1, min(BB_KC_SQUEEZE_BARS, len(hist_kc) if hist_kc else 1))
+        recent_kc = hist_kc[:n] if hist_kc else [d.get("kc_squeeze_now")]
+        if not any(recent_kc):
+            return None
+
     # Истинный пробой: после сжатия Width начинает расти (полосы расходятся)
     if BB_REQUIRE_EXPANSION and len(hist) >= 3:
         # минимум сжатия был недавно, сейчас bw выше этого минимума
@@ -525,6 +561,14 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
                 broke_idx = i
     if not broke:
         return None
+
+    # Опционально: пробой также выше верхней Keltner (сильный импульс)
+    if BB_REQUIRE_KC_BREAKOUT:
+        kc_up = d.get("kc_upper")
+        if kc_up is None:
+            return None
+        if not any(closes_15m[-i] > kc_up for i in range(1, look + 1)):
+            return None
 
     # Ложный пробой (классика): после close выше upper цена позже
     # закрылась НИЖЕ mid (SMA20) — импульс умер, часто ход к lower.
@@ -579,8 +623,12 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
     ):
         stars = 3
-    # сильное расхождение полос после squeeze
+    # сильное расхождение полос после squeeze / выход из KC
     if stars >= 2 and len(hist) >= 2 and bw >= min_recent * 1.15:
+        stars = 3
+    if stars >= 2 and d.get("kc_squeeze_now") is False and any(
+        (d.get("kc_squeeze_hist") or [False])[:BB_KC_SQUEEZE_BARS]
+    ):
         stars = 3
 
     return {
@@ -717,7 +765,8 @@ def format_alert(s: dict) -> str:
         bb_line = (
             f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
             f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
-            f"vol×{s.get('vol_spike_15m', 0):.1f}\n"
+            f"vol×{s.get('vol_spike_15m', 0):.1f}"
+            f"{' | KC-squeeze' if s.get('kc_squeeze_now') or any((s.get('kc_squeeze_hist') or [False])[:3]) else ''}\n"
         )
 
     return (
@@ -1046,7 +1095,8 @@ async def cmd_settings(msg: types.Message):
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
         f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• BB 20/2, сужение Width 15m (≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
+        f"• BB 20/2 + Keltner squeeze (BB inside KC)\n"
+        f"• BB Width 15m (≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
         f"• Истинный пробой upper + расширение полос + объём ×{BB_BREAKOUT_VOL_MIN}\n"
         f"• Отсев ложного пробоя (close обратно внутрь канала)\n"
         f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}%, цена ≥ mid BB\n"
