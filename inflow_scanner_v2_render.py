@@ -352,28 +352,9 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "vol_spike_15m": vol_spike_15m,
     }
 
-    # ========== Try STANDARD signal ==========
-    standard = try_standard(base_data)
-    if standard:
-        return standard
-
-    # ========== Try SURGE signal ==========
-    if ENABLE_OI_SURGE:
-        surge = try_surge(base_data)
-        if surge:
-            return surge
-
-    # ========== Try PULLBACK signal ==========
-    if ENABLE_PULLBACK:
-        pullback = try_pullback(base_data, closes_1h)
-        if pullback:
-            return pullback
-
-    # ========== Try BB SQUEEZE signal ==========
+    # Only BB_SQUEEZE signals are allowed to reach Telegram.
     if ENABLE_BB_SQUEEZE:
-        bb_sig = try_bb_squeeze(base_data, closes_15m)
-        if bb_sig:
-            return bb_sig
+        return try_bb_squeeze(base_data, closes_15m)
 
     return None
 
