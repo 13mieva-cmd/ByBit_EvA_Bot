@@ -38,6 +38,7 @@ from config import (
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
     BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_SQUEEZE_SL_BUFFER_PCT, BB_SQUEEZE_REQUIRE_BULL_CLOSE,
+    BB_SQUEEZE_MIN_KC_BARS, BB_SQUEEZE_RSI_MOMENTUM_MIN, BB_SQUEEZE_TP_BW_MULT,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
@@ -557,6 +558,7 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 
 
+
 def try_bb_squeeze(
     d: dict,
     closes_15m: list[float],
@@ -564,12 +566,13 @@ def try_bb_squeeze(
     lows_15m: list[float] | None = None,
 ) -> Optional[dict]:
     """
-    BB_SQUEEZE quality preset (TTM + pullback):
-    1) BB Width squeeze (percentile OR cap) + BB inside Keltner (ATR20 classic)
-    2) Expansion + close above upper
-    3) Breakout candle bullish (close > open)
-    4) Not false breakout; pullback; hold mid; vol≥1.2x; OI
-    5) SL under min(breakout low, mid) − buffer (capped by AUTO_BB_SL_PCT)
+    BB_SQUEEZE ideal preset (Carter/TTM + pullback):
+    1) ≥ MIN consecutive bars BB inside KC (energy build)
+    2) BW squeeze (percentile OR cap) + expansion
+    3) Close > upper, bullish candle, close > mid, RSI@breakout ≥ 50
+    4) Not false breakout; pullback hold mid; vol ≥ 1.2x; OI
+    5) SL = min(lows of squeeze zone) − buffer, capped
+    6) Soft TP = max(fixed%, 1.5 × BW) → asymmetry + trail after TP1
     """
     if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
         return None
@@ -587,6 +590,25 @@ def try_bb_squeeze(
 
     bw = d["bb_bandwidth"]
     hist = d.get("bb_history_bw") or []
+    hist_kc = d.get("kc_squeeze_hist") or []
+
+    # --- 1) Min consecutive BB-inside-KC (Carter red dots) ---
+    max_run = 0
+    cur_run = 0
+    for v in hist_kc:
+        if v:
+            cur_run += 1
+            if cur_run > max_run:
+                max_run = cur_run
+        else:
+            cur_run = 0
+    if BB_REQUIRE_KC_SQUEEZE and max_run < BB_SQUEEZE_MIN_KC_BARS:
+        return None
+
+    # Also keep "fresh" any() check soft if min_run already passed
+    if BB_REQUIRE_KC_SQUEEZE and not hist_kc:
+        if not d.get("kc_squeeze_now"):
+            return None
 
     fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
     recent = hist[:fresh_n] if hist else [bw]
@@ -601,22 +623,13 @@ def try_bb_squeeze(
     if not (percentile_ok or cap_ok):
         return None
 
-    if BB_REQUIRE_KC_SQUEEZE:
-        hist_kc = d.get("kc_squeeze_hist") or []
-        n = max(1, min(BB_KC_SQUEEZE_BARS, len(hist_kc) if hist_kc else 1))
-        recent_kc = hist_kc[:n] if hist_kc else [d.get("kc_squeeze_now")]
-        if not any(recent_kc):
-            return None
-
     if BB_REQUIRE_EXPANSION and len(hist) >= 3:
         if bw < min_recent * 1.02 and bw <= (hist[1] if len(hist) > 1 else bw):
             return None
 
     upper = d["bb_upper"]
     mid = d.get("bb_middle")
-    lower = d.get("bb_lower")
 
-    # Breakout: close above upper in last 1–3 bars; remember best breakout bar
     broke = False
     breakout_high = d["price"]
     broke_idx = None
@@ -631,12 +644,21 @@ def try_bb_squeeze(
     if not broke or broke_idx is None:
         return None
 
-    # Momentum proxy: breakout candle must be bullish (close > open)
+    # Bullish breakout candle
     if BB_SQUEEZE_REQUIRE_BULL_CLOSE and opens_15m and len(opens_15m) >= broke_idx:
-        bo_close = closes_15m[-broke_idx]
-        bo_open = opens_15m[-broke_idx]
-        if bo_close <= bo_open:
+        if closes_15m[-broke_idx] <= opens_15m[-broke_idx]:
             return None
+
+    # Momentum proxy: breakout close > mid + RSI at breakout ≥ 50
+    if mid is not None and closes_15m[-broke_idx] <= mid:
+        return None
+    rsi_at_bo = None
+    end_bo = len(closes_15m) - broke_idx + 1
+    if end_bo >= 15:
+        from indicators import calculate_rsi
+        rsi_at_bo = calculate_rsi(closes_15m[:end_bo], 14)
+    if rsi_at_bo is not None and rsi_at_bo < BB_SQUEEZE_RSI_MOMENTUM_MIN:
+        return None
 
     if BB_REQUIRE_KC_BREAKOUT:
         kc_up = d.get("kc_upper")
@@ -681,26 +703,37 @@ def try_bb_squeeze(
     if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
         return None
 
-    # --- Structural SL: under min(breakout candle low, mid) − buffer ---
+    # --- SL from entire squeeze zone (min low of consecutive KC-inside bars) ---
     entry = float(d["price"])
-    bo_low = closes_15m[-broke_idx]
-    if lows_15m and len(lows_15m) >= broke_idx:
-        bo_low = lows_15m[-broke_idx]
-    sl_raw = bo_low
+    zone_lows = []
+    if hist_kc and lows_15m:
+        i = 0
+        # skip leading False (already fired / expansion bars)
+        while i < len(hist_kc) and not hist_kc[i]:
+            i += 1
+        while i < len(hist_kc) and hist_kc[i]:
+            # hist_kc[i] ↔ lows_15m[-(i+1)]
+            if len(lows_15m) > i:
+                zone_lows.append(lows_15m[-(i + 1)])
+            i += 1
+    if not zone_lows and lows_15m and len(lows_15m) >= broke_idx:
+        zone_lows = [lows_15m[-broke_idx]]
+    if not zone_lows:
+        zone_lows = [closes_15m[-broke_idx]]
+    sl_raw = min(zone_lows)
     if mid is not None:
         sl_raw = min(sl_raw, mid)
     sl_price = sl_raw * (1 - BB_SQUEEZE_SL_BUFFER_PCT / 100)
-    # Cap: not wider than AUTO_BB_SL_PCT
     max_sl = entry * (1 - AUTO_BB_SL_PCT / 100)
     if sl_price < max_sl:
         sl_price = max_sl
     if sl_price >= entry:
         sl_price = entry * (1 - 0.4 / 100)
 
-    # TP: fixed % (can refine later to bandwidth projection)
-    tp_price = entry * (1 + AUTO_BB_TP_PCT / 100)
+    # Soft TP: max(fixed%, 1.5 × bandwidth at fire) — capture expansion
+    tp_pct = max(float(AUTO_BB_TP_PCT), float(bw) * float(BB_SQUEEZE_TP_BW_MULT))
+    tp_price = entry * (1 + tp_pct / 100)
     sl_pct = (entry - sl_price) / entry * 100 if entry > 0 else AUTO_BB_SL_PCT
-    tp_pct = AUTO_BB_TP_PCT
 
     stars = 1
     if (oi24 or 0) >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
@@ -712,11 +745,9 @@ def try_bb_squeeze(
         and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
     ):
         stars = 3
-    if stars >= 2 and len(hist) >= 2 and bw >= min_recent * 1.15:
+    if stars >= 2 and max_run >= BB_SQUEEZE_MIN_KC_BARS + 2:
         stars = 3
-    if stars >= 2 and d.get("kc_squeeze_now") is False and any(
-        (d.get("kc_squeeze_hist") or [False])[:BB_KC_SQUEEZE_BARS]
-    ):
+    if stars >= 2 and len(hist) >= 2 and bw >= min_recent * 1.15:
         stars = 3
 
     return {
@@ -726,13 +757,14 @@ def try_bb_squeeze(
         "bb_pullback_pct": round(pullback_pct, 2),
         "bb_bandwidth": round(bw, 2),
         "vol_spike_15m": round(vol15, 2),
+        "squeeze_bars": max_run,
         "tp_price_abs": round(tp_price, 8),
         "sl_price_abs": round(sl_price, 8),
         "tp_pct": round(tp_pct, 3),
         "sl_pct": round(sl_pct, 3),
         "entry_note": (
-            f"squeeze→breakout→pullback | vol×{vol15:.2f} | "
-            f"SL structure {sl_pct:.2f}%"
+            f"KC×{max_run}→break→pullback | vol×{vol15:.2f} | "
+            f"SL zone {sl_pct:.2f}% | TP soft {tp_pct:.2f}%"
         ),
     }
 

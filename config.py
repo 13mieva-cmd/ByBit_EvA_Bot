@@ -91,6 +91,12 @@ KC_ATR_MULT = float(os.getenv("KC_ATR_MULT", "1.5"))
 BB_REQUIRE_KC_SQUEEZE = os.getenv("BB_REQUIRE_KC_SQUEEZE", "true").lower() == "true"
 # Lookback bars for "was inside KC" (fresh squeeze)
 BB_KC_SQUEEZE_BARS = int(os.getenv("BB_KC_SQUEEZE_BARS", "10"))
+# Min consecutive bars BB inside KC (Carter: 5–8+ red dots)
+BB_SQUEEZE_MIN_KC_BARS = int(os.getenv("BB_SQUEEZE_MIN_KC_BARS", "6"))
+# Momentum proxy on breakout bar: RSI >= this
+BB_SQUEEZE_RSI_MOMENTUM_MIN = float(os.getenv("BB_SQUEEZE_RSI_MOMENTUM_MIN", "50"))
+# Soft TP = max(AUTO_BB_TP_PCT, BW * multiplier) for asymmetry
+BB_SQUEEZE_TP_BW_MULT = float(os.getenv("BB_SQUEEZE_TP_BW_MULT", "1.5"))
 # Optional: breakout should clear Keltner upper too
 BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() == "true"
 
@@ -203,7 +209,7 @@ AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 
 # BB Squeeze auto trade
 AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
-AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))  # cap if structure wider
+AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.5"))  # cap zone SL width
 BB_SQUEEZE_SL_BUFFER_PCT = float(os.getenv("BB_SQUEEZE_SL_BUFFER_PCT", "0.15"))
 BB_SQUEEZE_REQUIRE_BULL_CLOSE = os.getenv("BB_SQUEEZE_REQUIRE_BULL_CLOSE", "true").lower() == "true"
 # BB_LOWER: fallback %, если mid/upper слишком близко; основной TP/SL — уровни BB
@@ -235,8 +241,8 @@ AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))
 AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))
 AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
-AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.0"))
-AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.6"))
+AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.3"))  # partial then trail
+AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.9"))
 AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", str(AUTO_TP1_TRIGGER_PCT_BB)))
 AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", str(AUTO_TRAIL_DISTANCE_PCT_BB)))
 
