@@ -23,14 +23,16 @@ from config import (
     STATE_FILE, METRICS_CSV,
     MIN_TURNOVER_USD, MAX_SYMBOLS, MIN_AGE_DAYS, SCAN_INTERVAL_SEC, BLACKLIST,
     LEVERAGE, RISK_USD, SIZE_MIN_USD, SIZE_MAX_USD,
-    MAX_POSITIONS, DAILY_LOSS_USD, CONSEC_LOSS_BLOCK,
+    MAX_POSITIONS, MAX_ENTRIES_PER_SCAN, MAX_ENTRIES_PER_DAY,
+    SIZE_MODE, POSITION_SIZE_USD,
+    DAILY_LOSS_USD, CONSEC_LOSS_BLOCK,
     TRAIL_PCT, BE_TRIGGER_R, PARTIAL_PCT, RECONCILE_SEC, COOLDOWN_HOURS,
-    BTC_15M_MIN, MIN_SQUEEZE_BARS,
+    BTC_15M_MIN, MIN_SQUEEZE_BARS, MOMENTUM_FADE_BARS,
 )
 from strategy import detect_ttm
 from storage import State, append_csv
 from trader import BybitTrader
-from indicators import momentum_hist
+from indicators import momentum_hist, ema
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ttm")
@@ -39,6 +41,7 @@ dp = Dispatcher()
 state = State(STATE_FILE)
 trader: BybitTrader | None = None
 last_alert: dict[str, float] = {}
+entries_this_scan = 0
 
 
 def allowed(msg) -> bool:
@@ -134,16 +137,30 @@ async def klines(session, symbol, interval="15", limit=80):
 
 
 def size_usd(sl_pct: float) -> float:
-    if sl_pct <= 0:
-        return SIZE_MIN_USD
-    s = RISK_USD / (sl_pct / 100.0)
-    return round(max(SIZE_MIN_USD, min(SIZE_MAX_USD, s)), 2)
+    """Сумма позиции: FIXED = POSITION_SIZE_USD; RISK = от ширины стопа."""
+    if SIZE_MODE == "RISK":
+        if sl_pct <= 0:
+            return SIZE_MIN_USD
+        s = RISK_USD / (sl_pct / 100.0)
+        return round(max(SIZE_MIN_USD, min(SIZE_MAX_USD, s)), 2)
+    # FIXED
+    return round(max(SIZE_MIN_USD, min(SIZE_MAX_USD, POSITION_SIZE_USD)), 2)
 
 
 async def try_enter(bot, symbol, sig):
+    global entries_this_scan
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     state.reset_day(today)
-    if state.blocked() or len(state.positions) >= MAX_POSITIONS:
+    if state.blocked():
+        return
+    if len(state.positions) >= MAX_POSITIONS:
+        log.info("max positions %s", MAX_POSITIONS)
+        return
+    if entries_this_scan >= MAX_ENTRIES_PER_SCAN:
+        log.info("max entries this scan %s", MAX_ENTRIES_PER_SCAN)
+        return
+    if state.entries_today() >= MAX_ENTRIES_PER_DAY:
+        log.info("max entries today %s", MAX_ENTRIES_PER_DAY)
         return
     if symbol in state.positions or state.is_cool(symbol):
         return
@@ -171,6 +188,8 @@ async def try_enter(bot, symbol, sig):
         sl_pct=sig["sl_pct"], size_usd=usd, signal=sig["signal_type"],
         be=False, trail=False, partial=False,
     )
+    state.incr_entry()
+    entries_this_scan += 1
     append_csv(METRICS_CSV, {
         "event": "entry", "ts": time.time(), "symbol": symbol,
         "side": sig["side"], "sl_pct": sig["sl_pct"], "squeeze": sig["squeeze_bars"],
@@ -183,6 +202,8 @@ async def try_enter(bot, symbol, sig):
 
 
 async def scan_once(bot: Bot):
+    global entries_this_scan
+    entries_this_scan = 0
     async with aiohttp.ClientSession() as session:
         if not await btc_ok(session):
             log.info("BTC filter skip")
@@ -197,7 +218,11 @@ async def scan_once(bot: Bot):
             kl = await klines(session, sym)
             if not kl:
                 continue
-            sig = detect_ttm(kl["o"], kl["h"], kl["l"], kl["c"], kl["v"])
+            ema50_1h = None
+            kl1h = await klines(session, sym, "60", 60)
+            if kl1h and len(kl1h["c"]) >= 50:
+                ema50_1h = ema(kl1h["c"], 50)
+            sig = detect_ttm(kl["o"], kl["h"], kl["l"], kl["c"], kl["v"], ema50_1h=ema50_1h)
             if not sig:
                 continue
             n += 1
@@ -283,17 +308,33 @@ async def reconcile(bot: Bot):
                 tr["trail"] = True
                 state.save()
                 await bot.send_message(TELEGRAM_CHAT_ID, f"Trail {sym.replace('USDT', '')}")
+        # Carter: 2 bars momentum turning against after profit
         if gain_r >= 0.6 and not tr.get("trail"):
             async with aiohttp.ClientSession() as session:
-                kl = await klines(session, sym, "15", 20)
-            if kl and len(kl["c"]) >= 8:
-                mom = momentum_hist(kl["c"], 12)
-                mom_prev = momentum_hist(kl["c"][:-2], 12)
+                kl = await klines(session, sym, "15", 24)
+            if kl and len(kl["c"]) >= 10:
                 fade = False
-                if side == "Buy" and mom is not None and mom_prev is not None:
-                    fade = mom_prev > 0 and mom < mom_prev * 0.5
-                elif side == "Sell" and mom is not None and mom_prev is not None:
-                    fade = mom_prev < 0 and abs(mom) < abs(mom_prev) * 0.5
+                if side == "Buy":
+                    # 2 consecutive lower closes after green impulse
+                    c = kl["c"]
+                    if c[-1] < c[-2] < c[-3] and c[-1] < entry:
+                        fade = True
+                    mom = momentum_hist(c, 12)
+                    mom1 = momentum_hist(c[:-1], 12)
+                    mom2 = momentum_hist(c[:-2], 12)
+                    if mom is not None and mom1 is not None and mom2 is not None:
+                        if mom2 > 0 and mom1 < mom2 and mom < mom1:
+                            fade = True
+                else:
+                    c = kl["c"]
+                    if c[-1] > c[-2] > c[-3] and c[-1] > entry:
+                        fade = True
+                    mom = momentum_hist(c, 12)
+                    mom1 = momentum_hist(c[:-1], 12)
+                    mom2 = momentum_hist(c[:-2], 12)
+                    if mom is not None and mom1 is not None and mom2 is not None:
+                        if mom2 < 0 and mom1 > mom2 and mom > mom1:
+                            fade = True
                 if fade:
                     await trader.close(sym, side)
                     tr["exit_reason"] = "MOMENTUM"
@@ -323,7 +364,7 @@ async def loop_recon(bot):
 async def cmd_start(m: types.Message):
     await m.answer(
         f"<b>TTM Squeeze Bot</b>\n"
-        f"Carter BB/KC | squeeze>={MIN_SQUEEZE_BARS}\n"
+        f"Carter BB/KC | squeeze>={MIN_SQUEEZE_BARS} | EMA50 1h | vol 1.3x\n"
         f"Risk ${RISK_USD} | lev {LEVERAGE}x | max {MAX_POSITIONS}\n\n"
         f"/scan /auto_on /auto_off /status /resume /panic"
     )
@@ -361,6 +402,8 @@ async def cmd_status(m: types.Message):
         f"Auto: {'ON' if state.enabled() else 'OFF'}\n"
         f"Blocked: {state.blocked()} {state.data.get('blocked_reason','')}\n"
         f"Positions: {len(state.positions)}/{MAX_POSITIONS}\n"
+        f"Entries today: {state.entries_today()}/{MAX_ENTRIES_PER_DAY}\n"
+        f"Size mode: {SIZE_MODE} | ${POSITION_SIZE_USD if SIZE_MODE=='FIXED' else RISK_USD}\n"
         f"Day PnL: ${state.data.get('daily_pnl', 0):+.2f}"
     )
 

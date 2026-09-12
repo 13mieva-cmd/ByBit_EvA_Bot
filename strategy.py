@@ -18,6 +18,7 @@ from config import (
     BB_PERIOD, BB_MULT, KC_EMA, KC_ATR, KC_MULT,
     MIN_SQUEEZE_BARS, MOM_LENGTH, VOL_SPIKE_MIN,
     SL_BUFFER_PCT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
+    REQUIRE_EMA50_1H, REQUIRE_CLOSE_OUTSIDE_BB,
 )
 from indicators import bollinger, keltner, bb_inside_kc, momentum_hist, rsi
 
@@ -28,6 +29,7 @@ def detect_ttm(
     lows: list[float],
     closes: list[float],
     volumes: list[float],
+    ema50_1h: float | None = None,
 ) -> Optional[dict]:
     need = max(BB_PERIOD, KC_EMA, KC_ATR) + MIN_SQUEEZE_BARS + 5
     if len(closes) < need:
@@ -76,8 +78,15 @@ def detect_ttm(
     if not recent_sq:
         return None
 
-    long_fire = (not in_squeeze_now and close > mid) or (close > upper)
-    short_fire = (not in_squeeze_now and close < mid) or (close < lower)
+    if REQUIRE_CLOSE_OUTSIDE_BB:
+        long_fire = close > upper and (not in_squeeze_now or close > upper)
+        short_fire = close < lower and (not in_squeeze_now or close < lower)
+        # classic: must close outside band after squeeze energy
+        long_fire = close > upper
+        short_fire = close < lower
+    else:
+        long_fire = (not in_squeeze_now and close > mid) or (close > upper)
+        short_fire = (not in_squeeze_now and close < mid) or (close < lower)
 
     mom = momentum_hist(closes, MOM_LENGTH)
     if mom is None:
@@ -107,10 +116,16 @@ def detect_ttm(
 
     side = None
     if long_fire and mom > 0 and vol_x >= VOL_SPIKE_MIN and close > open_:
-        side = "Buy"
+        if REQUIRE_EMA50_1H and ema50_1h is not None and close < ema50_1h:
+            pass  # reject long below EMA50 1h
+        else:
+            side = "Buy"
     elif ALLOW_SHORT and short_fire and mom < 0 and vol_x >= VOL_SPIKE_MIN and close < open_:
-        side = "Sell"
-    else:
+        if REQUIRE_EMA50_1H and ema50_1h is not None and close > ema50_1h:
+            pass  # reject short above EMA50 1h
+        else:
+            side = "Sell"
+    if side is None:
         return None
 
     entry = close
