@@ -18,7 +18,7 @@ STATE_FILE = os.path.join(DATA_DIR, "ttm_state.json")
 METRICS_CSV = os.path.join(DATA_DIR, "ttm_trades.csv")
 
 # --- Universe ---
-MIN_TURNOVER_USD = float(os.getenv("MIN_TURNOVER_USD", "8000000"))
+MIN_TURNOVER_USD = float(os.getenv("MIN_TURNOVER_USD", "12000000"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
 MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "30"))
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
@@ -32,16 +32,31 @@ KC_ATR = 20
 KC_MULT = 1.5
 MIN_SQUEEZE_BARS = int(os.getenv("MIN_SQUEEZE_BARS", "5"))  # literature 5–8; crypto 15m: 4–6
 MOM_LENGTH = 12
-VOL_SPIKE_MIN = float(os.getenv("VOL_SPIKE_MIN", "1.15"))
+VOL_SPIKE_MIN = float(os.getenv("VOL_SPIKE_MIN", "1.3"))
+REQUIRE_CLOSE_OUTSIDE_BB = os.getenv("REQUIRE_CLOSE_OUTSIDE_BB", "true").lower() == "true"
+MOMENTUM_FADE_BARS = int(os.getenv("MOMENTUM_FADE_BARS", "2"))
 
-# --- Risk (crypto futures canon: 1% risk, modest leverage) ---
+# Higher TF bias: long only if price >= EMA50 on 1h (Carter-style)
+REQUIRE_EMA50_1H = os.getenv("REQUIRE_EMA50_1H", "true").lower() == "true"
+EMA50_PERIOD = int(os.getenv("EMA50_PERIOD", "50"))
+
+
+# --- Risk / size / limits (Railway) ---
 DEPOSIT_USD = float(os.getenv("DEPOSIT_USD", "500"))
 LEVERAGE = float(os.getenv("LEVERAGE", "7"))
-RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))          # % of deposit per trade
+# Сколько позиций одновременно (сколько сигналов может «держать» бот)
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
+# Макс. новых авто-входов за один скан (чтобы не открыть всё сразу)
+MAX_ENTRIES_PER_SCAN = int(os.getenv("MAX_ENTRIES_PER_SCAN", "1"))
+# Макс. авто-входов за сутки (UTC)
+MAX_ENTRIES_PER_DAY = int(os.getenv("MAX_ENTRIES_PER_DAY", "6"))
+# Сумма входа: FIXED = всегда POSITION_SIZE_USD; RISK = от стопа
+SIZE_MODE = os.getenv("SIZE_MODE", "FIXED").upper()  # FIXED | RISK
+POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "100"))  # сумма на сделку при FIXED
+RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))
 RISK_USD = float(os.getenv("RISK_USD", str(DEPOSIT_USD * RISK_PCT / 100)))
 SIZE_MIN_USD = float(os.getenv("SIZE_MIN_USD", "40"))
-SIZE_MAX_USD = float(os.getenv("SIZE_MAX_USD", "200"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+SIZE_MAX_USD = float(os.getenv("SIZE_MAX_USD", "250"))
 DAILY_LOSS_USD = float(os.getenv("DAILY_LOSS_USD", "20"))
 CONSEC_LOSS_BLOCK = int(os.getenv("CONSEC_LOSS_BLOCK", "3"))
 SL_TRIGGER = os.getenv("SL_TRIGGER", "MarkPrice")
@@ -50,12 +65,12 @@ SL_TRIGGER = os.getenv("SL_TRIGGER", "MarkPrice")
 SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0.12"))
 SL_CAP_PCT = float(os.getenv("SL_CAP_PCT", "1.8"))       # max stop distance
 TP_R_MULTIPLE = float(os.getenv("TP_R_MULTIPLE", "2.0")) # first target 2R
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "1.0"))
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "1.3"))
 BE_TRIGGER_R = float(os.getenv("BE_TRIGGER_R", "0.8"))   # move BE after 0.8R
 PARTIAL_PCT = float(os.getenv("PARTIAL_PCT", "50"))
 RECONCILE_SEC = int(os.getenv("RECONCILE_SEC", "20"))
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
 
 # BTC crash gate
-BTC_15M_MIN = float(os.getenv("BTC_15M_MIN", "-0.9"))
+BTC_15M_MIN = float(os.getenv("BTC_15M_MIN", "-0.5"))
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
