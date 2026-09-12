@@ -1,9 +1,5 @@
-"""
-Bybit OI LONG Scanner v2 — four signal types + smart hold + visuals.
-- STANDARD: Price↑ 4h + OI↑ 4h + Volume
-- SURGE: Price↑ 1h + OI↑ 1h (catches faster moves)
-- PULLBACK: pullback to EMA21 in existing uptrend
-- BB_SQUEEZE: Bollinger squeeze → breakout upper → small pullback entry
+"""Bybit BB SQUEEZE scanner + auto-trade (TTM-style 15m).
+Signal: BB_SQUEEZE long (optional BB_SQUEEZE_SHORT).
 """
 import asyncio
 import json
@@ -26,6 +22,7 @@ from config import (
     MIN_AGE_DAYS, MIN_VOLUME_USD_24H,
     MIN_ABS_CHANGE_24H_PCT, ACTIVE_REQUIRE_24H_UP, ACTIVE_MIN_24H_UP_PCT,
     MAX_SPREAD_PCT, MAX_SCAN_SYMBOLS,
+    REL_STRENGTH_VS_BTC_ENABLED, REL_STRENGTH_MIN_PCT, LONG_BIAS_MID_OR_EMA,
     PRICE_CHANGE_4H_MIN, PRICE_CHANGE_4H_MAX,
     OI_CHANGE_4H_MIN, OI_CHANGE_24H_2STAR,
     VOLUME_SPIKE_MIN, VOLUME_SPIKE_2STAR,
@@ -73,6 +70,7 @@ from config import (
 from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
+from signals_bb import try_bb_squeeze, try_bb_squeeze_short
 from indicators import (
     calculate_rsi, calculate_ema, calculate_bollinger,
     calculate_keltner, bb_inside_keltner,
@@ -226,7 +224,7 @@ async def get_btc_1h_change(session):
 
 # ---------- Analysis ----------
 
-async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) -> Optional[dict]:
+async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, btc_24h: float = 0.0) -> Optional[dict]:
     """Try all three signal types. Returns best match or None."""
     symbol = c["symbol"]
 
@@ -413,6 +411,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) ->
         "rsi_4h": rsi_4h,
         "rsi_1h": rsi_1h,
         "btc_1h": btc_1h,
+        "btc_24h": btc_24h,
         "btc_15m": btc_15m,
         "age_days": c["age_days"],
         "ema50_1h": ema50,
@@ -438,10 +437,14 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) ->
     # ========== Only BB_SQUEEZE (остальные сигналы отключены) ==========
     if ENABLE_BB_SQUEEZE:
         opens_15 = [float(k[1]) for k in klines_15m] if klines_15m else []
+        highs_15 = [float(k[2]) for k in klines_15m] if klines_15m else []
         lows_15 = [float(k[3]) for k in klines_15m] if klines_15m else []
-        bb_sig = try_bb_squeeze(base_data, closes_15m, opens_15, lows_15)
+        bb_sig = try_bb_squeeze(base_data, closes_15m, opens_15, lows_15, highs_15)
         if bb_sig:
             return bb_sig
+        short_sig = try_bb_squeeze_short(base_data, closes_15m, opens_15, highs_15)
+        if short_sig:
+            return short_sig
 
     return None
 
@@ -559,216 +562,6 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 
 
-def try_bb_squeeze(
-    d: dict,
-    closes_15m: list[float],
-    opens_15m: list[float] | None = None,
-    lows_15m: list[float] | None = None,
-) -> Optional[dict]:
-    """
-    BB_SQUEEZE ideal preset (Carter/TTM + pullback):
-    1) ≥ MIN consecutive bars BB inside KC (energy build)
-    2) BW squeeze (percentile OR cap) + expansion
-    3) Close > upper, bullish candle, close > mid, RSI@breakout ≥ 50
-    4) Not false breakout; pullback hold mid; vol ≥ 1.2x; OI
-    5) SL = min(lows of squeeze zone) − buffer, capped
-    6) Soft TP = max(fixed%, 1.5 × BW) → asymmetry + trail after TP1
-    """
-    if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
-        return None
-    if not closes_15m or len(closes_15m) < BB_PERIOD + 3:
-        return None
-    if USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
-        return None
-
-    oi24 = d.get("oi_change_24h")
-    oi4 = d.get("oi_change_4h")
-    if oi24 is None or oi24 < BB_OI_24H_MIN:
-        return None
-    if oi4 is None or oi4 < BB_OI_4H_MIN:
-        return None
-
-    bw = d["bb_bandwidth"]
-    hist = d.get("bb_history_bw") or []
-    hist_kc = d.get("kc_squeeze_hist") or []
-
-    # --- 1) Min consecutive BB-inside-KC (Carter red dots) ---
-    max_run = 0
-    cur_run = 0
-    for v in hist_kc:
-        if v:
-            cur_run += 1
-            if cur_run > max_run:
-                max_run = cur_run
-        else:
-            cur_run = 0
-    if BB_REQUIRE_KC_SQUEEZE and max_run < BB_SQUEEZE_MIN_KC_BARS:
-        return None
-
-    # Also keep "fresh" any() check soft if min_run already passed
-    if BB_REQUIRE_KC_SQUEEZE and not hist_kc:
-        if not d.get("kc_squeeze_now"):
-            return None
-
-    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
-    recent = hist[:fresh_n] if hist else [bw]
-    min_recent = min(recent)
-
-    percentile_ok = False
-    if hist and len(hist) >= 10:
-        sorted_bw = sorted(hist)
-        pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
-        percentile_ok = min_recent <= sorted_bw[pidx]
-    cap_ok = min_recent <= BB_SQUEEZE_MAX_BW
-    if not (percentile_ok or cap_ok):
-        return None
-
-    if BB_REQUIRE_EXPANSION and len(hist) >= 3:
-        if bw < min_recent * 1.02 and bw <= (hist[1] if len(hist) > 1 else bw):
-            return None
-
-    upper = d["bb_upper"]
-    mid = d.get("bb_middle")
-
-    broke = False
-    breakout_high = d["price"]
-    broke_idx = None
-    look = min(3, len(closes_15m))
-    for i in range(1, look + 1):
-        c = closes_15m[-i]
-        if c > upper:
-            broke = True
-            if c >= breakout_high:
-                breakout_high = c
-                broke_idx = i
-    if not broke or broke_idx is None:
-        return None
-
-    # Bullish breakout candle
-    if BB_SQUEEZE_REQUIRE_BULL_CLOSE and opens_15m and len(opens_15m) >= broke_idx:
-        if closes_15m[-broke_idx] <= opens_15m[-broke_idx]:
-            return None
-
-    # Momentum proxy: breakout close > mid + RSI at breakout ≥ 50
-    if mid is not None and closes_15m[-broke_idx] <= mid:
-        return None
-    rsi_at_bo = None
-    end_bo = len(closes_15m) - broke_idx + 1
-    if end_bo >= 15:
-        from indicators import calculate_rsi
-        rsi_at_bo = calculate_rsi(closes_15m[:end_bo], 14)
-    if rsi_at_bo is not None and rsi_at_bo < BB_SQUEEZE_RSI_MOMENTUM_MIN:
-        return None
-
-    if BB_REQUIRE_KC_BREAKOUT:
-        kc_up = d.get("kc_upper")
-        if kc_up is None:
-            return None
-        if not any(closes_15m[-i] > kc_up for i in range(1, look + 1)):
-            return None
-
-    if BB_REJECT_FALSE_BREAKOUT and mid is not None:
-        n = len(closes_15m)
-        for i in range(max(0, n - 5), n):
-            if closes_15m[i] > upper:
-                for j in range(i + 1, n):
-                    if closes_15m[j] < mid:
-                        return None
-                break
-
-    vol15 = d.get("vol_spike_15m") or 0.0
-    if vol15 < BB_BREAKOUT_VOL_MIN:
-        return None
-
-    if len(closes_15m) >= 3:
-        local_low = min(closes_15m[-3], closes_15m[-2], closes_15m[-1])
-        if local_low > 0:
-            spike_pct = (closes_15m[-1] - local_low) / local_low * 100
-            if spike_pct > BB_PARABOLIC_MAX_PCT:
-                return None
-
-    pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
-    if pullback_pct < 0.15:
-        return None
-    if pullback_pct > BB_PULLBACK_MAX_PCT:
-        return None
-
-    if BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
-        return None
-
-    rsi_15 = d.get("rsi_15m")
-    if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
-        return None
-
-    if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
-        return None
-
-    # --- SL from entire squeeze zone (min low of consecutive KC-inside bars) ---
-    entry = float(d["price"])
-    zone_lows = []
-    if hist_kc and lows_15m:
-        i = 0
-        # skip leading False (already fired / expansion bars)
-        while i < len(hist_kc) and not hist_kc[i]:
-            i += 1
-        while i < len(hist_kc) and hist_kc[i]:
-            # hist_kc[i] ↔ lows_15m[-(i+1)]
-            if len(lows_15m) > i:
-                zone_lows.append(lows_15m[-(i + 1)])
-            i += 1
-    if not zone_lows and lows_15m and len(lows_15m) >= broke_idx:
-        zone_lows = [lows_15m[-broke_idx]]
-    if not zone_lows:
-        zone_lows = [closes_15m[-broke_idx]]
-    sl_raw = min(zone_lows)
-    if mid is not None:
-        sl_raw = min(sl_raw, mid)
-    sl_price = sl_raw * (1 - BB_SQUEEZE_SL_BUFFER_PCT / 100)
-    max_sl = entry * (1 - AUTO_BB_SL_PCT / 100)
-    if sl_price < max_sl:
-        sl_price = max_sl
-    if sl_price >= entry:
-        sl_price = entry * (1 - 0.4 / 100)
-
-    # Soft TP: max(fixed%, 1.5 × bandwidth at fire) — capture expansion
-    tp_pct = max(float(AUTO_BB_TP_PCT), float(bw) * float(BB_SQUEEZE_TP_BW_MULT))
-    tp_price = entry * (1 + tp_pct / 100)
-    sl_pct = (entry - sl_price) / entry * 100 if entry > 0 else AUTO_BB_SL_PCT
-
-    stars = 1
-    if (oi24 or 0) >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
-        stars = 2
-    if (
-        stars == 2
-        and (oi4 or 0) >= BB_OI_4H_MIN * 1.6
-        and d.get("btc_1h", 0) >= -0.3
-        and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
-    ):
-        stars = 3
-    if stars >= 2 and max_run >= BB_SQUEEZE_MIN_KC_BARS + 2:
-        stars = 3
-    if stars >= 2 and len(hist) >= 2 and bw >= min_recent * 1.15:
-        stars = 3
-
-    return {
-        **d,
-        "stars": stars,
-        "signal_type": "BB_SQUEEZE",
-        "bb_pullback_pct": round(pullback_pct, 2),
-        "bb_bandwidth": round(bw, 2),
-        "vol_spike_15m": round(vol15, 2),
-        "squeeze_bars": max_run,
-        "tp_price_abs": round(tp_price, 8),
-        "sl_price_abs": round(sl_price, 8),
-        "tp_pct": round(tp_pct, 3),
-        "sl_pct": round(sl_pct, 3),
-        "entry_note": (
-            f"KC×{max_run}→break→pullback | vol×{vol15:.2f} | "
-            f"SL zone {sl_pct:.2f}% | TP soft {tp_pct:.2f}%"
-        ),
-    }
-
-
 def try_bb_lower(
     d: dict,
     closes_15m: list[float],
@@ -777,7 +570,7 @@ def try_bb_lower(
     vols_15m: list[float] | None = None,
 ) -> Optional[dict]:
     """
-    BB_LOWER v2:
+    BB_SQUEEZE:
     24h long -> dip under lower -> reclaim close above lower ->
     OI/funding/vol OK, BTC 15m OK, not choppy -> long
     TP1=mid BB, TP2=upper, SL under low/lower.
@@ -931,14 +724,22 @@ async def scan_once(session) -> list[dict]:
     log.info("=== SCAN START ===")
     btc_1h = await get_btc_1h_change(session)
     btc_15m = await get_btc_15m_change(session)
-    log.info(f"BTC 1h: {btc_1h:+.2f}% | 15m: {btc_15m:+.2f}%")
+    tickers_early = await get_tickers(session)
+    btc_24h = 0.0
+    try:
+        raw = (tickers_early.get("BTCUSDT") or {}).get("price24hPcnt")
+        if raw is not None:
+            btc_24h = float(raw) * 100
+    except (TypeError, ValueError):
+        btc_24h = 0.0
+    log.info(f"BTC 1h: {btc_1h:+.2f}% | 15m: {btc_15m:+.2f}% | 24h: {btc_24h:+.2f}%")
 
     if btc_1h < BTC_MIN_1H_CHANGE:
         log.info(f"BTC dropping hard ({btc_1h:.2f}% < {BTC_MIN_1H_CHANGE}%) — skip full scan.")
         return []
 
     instruments = await get_instruments(session)
-    tickers = await get_tickers(session)
+    tickers = tickers_early
     now_ms = int(time.time() * 1000)
     min_age_ms = MIN_AGE_DAYS * 86_400_000
     candidates = []
@@ -1009,10 +810,10 @@ async def scan_once(session) -> list[dict]:
 
     log.info(
         f"Pre-filtered active: {len(prefiltered)}/{len(candidates)} "
-        f"(min turn ${MIN_VOLUME_USD_24H/1e6:.0f}M, 24h≥+{ACTIVE_MIN_24H_UP_PCT}%={ACTIVE_REQUIRE_24H_UP})"
+        f"(turn≥${MIN_VOLUME_USD_24H/1e6:.0f}M, |Δ24h|≥{MIN_ABS_CHANGE_24H_PCT}%, top{MAX_SCAN_SYMBOLS})"
     )
 
-    tasks = [analyze_coin(session, c, btc_1h, btc_15m) for c in prefiltered]
+    tasks = [analyze_coin(session, c, btc_1h, btc_15m, btc_24h) for c in prefiltered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     scored = []
     for r in results:
@@ -1025,7 +826,7 @@ async def scan_once(session) -> list[dict]:
     for s in scored:
         by_type[s["signal_type"]] += 1
     log.info(f"=== SCAN END: {len(scored)} alerts | "
-             f"STD:{by_type.get('STANDARD',0)} SURGE:{by_type.get('SURGE',0)} PB:{by_type.get('PULLBACK',0)} BB:{by_type.get('BB_SQUEEZE',0)} BBL:{by_type.get('BB_LOWER',0)} ===")
+             f"BB:{by_type.get('BB_SQUEEZE',0)} SHORT:{by_type.get('BB_SQUEEZE_SHORT',0)} ===")
     return scored
 
 
@@ -1051,75 +852,135 @@ def make_tp1_keyboard(symbol: str):
 
 
 SIGNAL_HEADERS = {
-    "STANDARD": "🟢 <b>LONG</b> · STANDARD",
-    "SURGE":    "⚡ <b>LONG</b> · OI SURGE",
-    "PULLBACK": "↩️ <b>LONG</b> · PULLBACK",
     "BB_SQUEEZE": "📉 <b>LONG</b> · BB SQUEEZE",
-    "BB_LOWER": "📗 <b>LONG</b> · BB LOWER",
+    "BB_SQUEEZE_SHORT": "📈 <b>SHORT</b> · BB SQUEEZE",
 }
 
 SIGNAL_LOGIC = {
-    "STANDARD": "Цена↑ 4ч + OI↑ 4ч + объём = свежие деньги входят",
-    "SURGE":    "Цена↑ 1ч + OI↑ 1ч = очень ранний старт тренда",
-    "PULLBACK": "Тренд вверх + откат к EMA21 + OI растёт = вход на ретесте",
-    "BB_SQUEEZE": "Сужение Bollinger 15m → пробой upper → вход на небольшом откате",
-    "BB_LOWER": "24h long → dip under lower → reclaim 15m → OI/vol → TP mid/upper",
+    "BB_SQUEEZE": (
+        "KC-squeeze ≥6 · пробой upper · откат · vol/OI · "
+        "SL зона · TP soft/zone"
+    ),
+    "BB_SQUEEZE_SHORT": (
+        "KC-squeeze ≥6 · пробой lower · отскок · vol · "
+        "SL зона · TP soft"
+    ),
 }
 
 
 def format_alert(s: dict) -> str:
+    """Актуальная карточка только под BB_SQUEEZE / SHORT."""
     base = s["symbol"].replace("USDT", "")
-    star_emoji = "⭐" * s["stars"]
-    star_label = {1: "СЛАБЫЙ", 2: "ХОРОШИЙ", 3: "ПРЕМИУМ"}[s["stars"]]
-    price = s["price"]
-    tp1 = price * (1 + TP1_PCT / 100)
-    tp2 = price * (1 + TP2_PCT / 100)
-    hard_sl = price * (1 - HARD_SL_PCT / 100)
-    vol_m = s["vol_24h"] / 1e6
-    header = SIGNAL_HEADERS.get(s["signal_type"], "🟢 <b>LONG</b>")
-    logic = SIGNAL_LOGIC.get(s["signal_type"], "")
+    stars = int(s.get("stars") or 1)
+    star_emoji = "⭐" * max(1, min(stars, 3))
+    star_label = {1: "СЛАБЫЙ", 2: "ХОРОШИЙ", 3: "ПРЕМИУМ"}.get(stars, "СЛАБЫЙ")
+    price = float(s.get("price") or 0)
+    sig = s.get("signal_type") or "BB_SQUEEZE"
+    is_short = sig == "BB_SQUEEZE_SHORT"
+    header = SIGNAL_HEADERS.get(sig, "📉 <b>BB SQUEEZE</b>")
+    logic = SIGNAL_LOGIC.get(sig, "")
 
-    # Sparklines block
-    sparkline_block = ""
-    if s.get("price_sparkline_24h"):
-        sparkline_block += f"Цена 24ч: <code>{s['price_sparkline_24h']}</code>\n"
-    if s.get("oi_24h_sparkline"):
-        sparkline_block += f"OI 24ч:    <code>{s['oi_24h_sparkline']}</code>\n"
+    # Levels from signal (structure) or fallbacks
+    tp_pct = float(s.get("tp_pct") or 0) or None
+    sl_pct = float(s.get("sl_pct") or 0) or None
+    tp_abs = s.get("tp_price_abs")
+    sl_abs = s.get("sl_price_abs")
+    if tp_abs is None and tp_pct and price:
+        tp_abs = price * (1 - tp_pct / 100) if is_short else price * (1 + tp_pct / 100)
+    if sl_abs is None and sl_pct and price:
+        sl_abs = price * (1 + sl_pct / 100) if is_short else price * (1 - sl_pct / 100)
 
-    bb_line = ""
-    if s.get("signal_type") == "BB_SQUEEZE":
-        bb_line = (
-            f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
-            f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
-            f"vol×{s.get('vol_spike_15m', 0):.1f}"
-            f"{' | KC-squeeze' if s.get('kc_squeeze_now') or any((s.get('kc_squeeze_hist') or [False])[:3]) else ''}\n"
+    bw = s.get("bb_bandwidth")
+    pull = s.get("bb_pullback_pct")
+    vol15 = s.get("vol_spike_15m")
+    sq = s.get("squeeze_bars")
+    zone_r = s.get("zone_range_pct")
+    note = s.get("entry_note") or ""
+
+    oi24 = s.get("oi_change_24h")
+    oi4 = s.get("oi_change_4h")
+    pc24 = s.get("price_change_24h")
+    pc1 = s.get("price_change_1h")
+    btc1 = s.get("btc_1h")
+    btc24 = s.get("btc_24h")
+    fr = s.get("funding_rate")
+    rsi15 = s.get("rsi_15m")
+    vol_m = (s.get("vol_24h") or 0) / 1e6
+
+    lines = [
+        f"{header} {star_emoji} <b>{star_label}</b> — <b>{base}</b>",
+        "",
+        f"<i>{logic}</i>",
+        "",
+        f"💵 <b>Цена:</b> <code>${price:.6g}</code>",
+    ]
+    if tp_abs and sl_abs and tp_pct is not None and sl_pct is not None:
+        lines.append(
+            f"🎯 <b>TP</b> <code>${float(tp_abs):.6g}</code> ({tp_pct:+.2f}%) · "
+            f"<b>SL</b> <code>${float(sl_abs):.6g}</code> ({sl_pct:+.2f}%)"
         )
-    elif s.get("signal_type") == "BB_LOWER":
-        bb_line = (
-            f"📗 BB lower: прокол {s.get('bb_break_pct', 0):.2f}% | "
-            f"24h {s.get('price_change_24h', 0):+.1f}%\n"
-        )
-    
-    return (
-        f"{header} {star_emoji} <b>{star_label}</b> — <b>{base}</b>\n\n"
-        f"💵 Цена: <code>${price:.6g}</code>\n"
-        f"📈 Цена: 1ч <b>{s['price_change_1h']:+.2f}%</b> | 4ч <b>{s['price_change_4h']:+.2f}%</b>\n"
-        f"💰 OI: 1ч <b>{(s.get('oi_change_1h') or 0):+.1f}%</b> | "
-        f"4ч <b>{(s.get('oi_change_4h') or 0):+.1f}%</b> | "
-        f"24ч <b>{(s.get('oi_change_24h') or 0):+.1f}%</b>\n"
-        f"📊 Объём: 4ч ×{s['vol_spike_4h']:.1f} | 24ч ${vol_m:.0f}M\n"
-        f"📈 RSI: 1h {s['rsi_1h']:.0f} | 4h {s['rsi_4h']:.0f}\n"
-        f"{bb_line}"
-        f"₿ BTC 1ч: {s['btc_1h']:+.2f}%\n"
-        f"📅 Возраст: {s['age_days']}д\n\n"
-        f"{sparkline_block}\n"
-        f"<b>Логика:</b> {logic}\n\n"
-        f"🎯 <b>TP1 (+{TP1_PCT}%):</b> <code>${tp1:.6g}</code>  — закрой 50%\n"
-        f"🎯 <b>TP2 (+{TP2_PCT}%):</b> <code>${tp2:.6g}</code>  — закрой остаток\n"
-        f"🛑 <b>Hard SL (−{HARD_SL_PCT}%):</b> <code>${hard_sl:.6g}</code> <i>(аварийный)</i>\n"
-        f"⏱ Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
-        f"<i>Стратегия: следим за OI. При падении OI бот предупредит — это сигнал выхода.</i>"
-    )
+    elif tp_pct is not None and sl_pct is not None:
+        lines.append(f"🎯 TP {tp_pct:+.2f}% · SL {sl_pct:+.2f}%")
+
+    lines.append("")
+    lines.append("<b>Squeeze</b>")
+    sq_bits = []
+    if sq is not None:
+        sq_bits.append(f"KC×{sq}")
+    if bw is not None:
+        sq_bits.append(f"BW {float(bw):.2f}%")
+    if pull is not None:
+        sq_bits.append(f"откат {float(pull):.2f}%")
+    if vol15 is not None:
+        sq_bits.append(f"vol×{float(vol15):.2f}")
+    if zone_r is not None:
+        sq_bits.append(f"zone {float(zone_r):.2f}%")
+    if sq_bits:
+        lines.append(" · ".join(sq_bits))
+    if note:
+        lines.append(f"<i>{note}</i>")
+
+    lines.append("")
+    lines.append("<b>Контекст</b>")
+    ctx = []
+    if pc1 is not None:
+        ctx.append(f"1ч {float(pc1):+.2f}%")
+    if pc24 is not None:
+        ctx.append(f"24ч {float(pc24):+.2f}%")
+    if oi4 is not None:
+        ctx.append(f"OI4ч {float(oi4):+.1f}%")
+    if oi24 is not None:
+        ctx.append(f"OI24ч {float(oi24):+.1f}%")
+    if ctx:
+        lines.append(" · ".join(ctx))
+    extra = []
+    if rsi15 is not None:
+        extra.append(f"RSI15 {float(rsi15):.0f}")
+    if fr is not None:
+        extra.append(f"fund {float(fr)*100:.3f}%")
+    if vol_m:
+        extra.append(f"оборот ${vol_m:.1f}M")
+    if extra:
+        lines.append(" · ".join(extra))
+    btc_bits = []
+    if btc1 is not None:
+        btc_bits.append(f"BTC1ч {float(btc1):+.2f}%")
+    if btc24 is not None:
+        btc_bits.append(f"BTC24ч {float(btc24):+.2f}%")
+    if btc_bits:
+        lines.append(" · ".join(btc_bits))
+
+    # Optional sparklines
+    if s.get("price_sparkline_24h") or s.get("oi_24h_sparkline"):
+        lines.append("")
+        if s.get("price_sparkline_24h"):
+            lines.append(f"Цена 24ч <code>{s['price_sparkline_24h']}</code>")
+        if s.get("oi_24h_sparkline"):
+            lines.append(f"OI 24ч <code>{s['oi_24h_sparkline']}</code>")
+
+    lines.append("")
+    lines.append("<i>Авто: только SL до TP1 → partial → trail · BE · momentum exit</i>")
+    return "\n".join(lines)
 
 
 async def scan_and_alert(bot: Bot):
@@ -1333,6 +1194,8 @@ async def daily_report_loop(bot: Bot):
                 msg = (
                     f"📊 <b>Дневной отчёт</b>\n\n"
                     f"Алертов сегодня: <b>{stats.data['alerts_today']}</b>\n"
+                    f"BB_SQUEEZE: {by_type.get('BB_SQUEEZE', 0)} · "
+                    f"SHORT: {by_type.get('BB_SQUEEZE_SHORT', 0)}\n"
                     f"  ⭐ {by_star.get('1', 0)} | ⭐⭐ {by_star.get('2', 0)} | ⭐⭐⭐ {by_star.get('3', 0)}\n\n"
                     f"<b>Типы сигналов (всего):</b>\n"
                     f"  STANDARD: {by_type.get('STANDARD', 0)}\n"
@@ -1375,35 +1238,25 @@ async def _auth_gate(handler, event, data):
 
 @dp.message(Command("start", "help"))
 async def cmd_start(msg: types.Message):
-    await msg.answer(
-        "✅ <b>OI LONG Scanner v2</b>\n\n"
-        "<b>4 типа сигналов:</b>\n"
-        "🟢 STANDARD — цена↑ + OI↑ 4ч + объём\n"
-        "⚡ SURGE — цена↑ + OI↑ 1ч (ранний вход)\n"
-        "↩️ PULLBACK — откат к EMA21 в тренде\n📉 BB_SQUEEZE — squeeze BB 15m → пробой → откат\n\n"
-        "<b>Логика выхода:</b>\n"
-        "🎯 TP1 +2% (закрыть 50%)\n"
-        "🎯 TP2 +5% (закрыть остаток)\n"
-        f"🛑 Hard SL −{HARD_SL_PCT}% (аварийный)\n"
-        "⚠️ OI watchdog: при падении OI бот алертит — выходи руками\n"
-        "💚 Smart hold: при растущем OI бот скажет «держи»\n\n"
-        "<b>Команды:</b>\n"
-        "/scan — ручной скан\n"
-        "/backtest — бэктест BB_LOWER v2\n"
-        "/settings /positions /stats\n"
-        "/top_oi /active /ignored /unignore SYM\n"
-        "/add SYM PRICE /remove SYM\n\n"
-        "<b>🤖 Авто-торговля:</b>\n"
-        "/auto — статус\n"
-        "/auto_on — включить\n"
-        "/auto_off — выключить\n"
-        "/sig_off TYPE — выключить тип (PULLBACK / SURGE / STANDARD)\n"
-        "/sig_on TYPE — включить тип\n"
-        "/cooldown — список монет в пост-сделочном блоке\n"
-        "/cooldown_clear SYM — снять блок с монеты\n"
-        "/panic — закрыть всё + блок\n"
-        "/resume — снять блок"
-    )
+    await msg.answer("\n".join([
+        "✅ <b>BB SQUEEZE Bot</b>",
+        "",
+        "<b>Сигнал:</b> BB SQUEEZE (15m TTM)",
+        "• Squeeze ≥6 KC · пробой · откат · vol/OI",
+        "• SL зона · TP soft/zone · partial → trail",
+        "• BE · momentum exit · circuit breaker",
+        "",
+        "<b>Команды</b>",
+        "/scan — скан сейчас",
+        "/settings — пороги",
+        "/positions · /stats · /status",
+        "/backtest SYMBOL|TOP [days]",
+        "/auto · /auto_on · /auto_off",
+        "/sig_on BB_SQUEEZE · /sig_off BB_SQUEEZE",
+        "/cooldown · /panic · /resume",
+        "/top_oi · /active",
+    ]))
+
 
 
 @dp.message(Command("scan"))
@@ -1415,47 +1268,30 @@ async def cmd_scan(msg: types.Message):
 
 @dp.message(Command("settings"))
 async def cmd_settings(msg: types.Message):
-    await msg.answer(
-        f"<b>Сканер:</b>\n"
-        f"• Интервал скана: {SCAN_INTERVAL_MIN} мин\n"
-        f"• Кулдаун: {ALERT_COOLDOWN_HOURS}ч\n"
-        f"• Возраст: ≥{MIN_AGE_DAYS}д\n"
-        f"• Активные: оборот ≥${MIN_VOLUME_USD_24H/1e6:.0f}M, топ-{MAX_SCAN_SYMBOLS}\n"f"• 24h long ≥+{ACTIVE_MIN_24H_UP_PCT}% | спред ≤{MAX_SPREAD_PCT}%\n\n"
-        f"<b>🟢 STANDARD:</b>\n"
-        f"• Цена 4ч: +{PRICE_CHANGE_4H_MIN}…+{PRICE_CHANGE_4H_MAX}%\n"
-        f"• OI 4ч: ≥+{OI_CHANGE_4H_MIN}%\n"
-        f"• Объём 4ч: ≥×{VOLUME_SPIKE_MIN}\n"
-        f"• RSI 4ч: {RSI_4H_MIN}–{RSI_4H_MAX}\n"
-        f"• ⭐⭐: OI 24ч ≥+{OI_CHANGE_24H_2STAR}% И объём ×{VOLUME_SPIKE_2STAR}\n"
-        f"• ⭐⭐⭐: ⭐⭐ + пробой 24ч максимума + BTC 1ч ≥ 0%\n\n"
-        f"<b>⚡ SURGE:</b> {'ON' if ENABLE_OI_SURGE else 'OFF'}\n"
-        f"• Цена 1ч: +{SURGE_PRICE_1H_MIN}…+{SURGE_PRICE_1H_MAX}%\n"
-        f"• OI 1ч: ≥+{SURGE_OI_1H_MIN}%\n"
-        f"• OI 24ч: ≥+{SURGE_OI_24H_MIN}% (защита от short squeeze)\n"
-        f"• RSI 1ч: ≤{SURGE_RSI_1H_MAX}\n"
-        f"• ⭐⭐⭐: ⭐⭐ + объём 4ч ×1.5 + BTC 1ч ≥ 0%\n\n"
-        f"<b>↩️ PULLBACK:</b> {'ON' if ENABLE_PULLBACK else 'OFF'}\n"
-        f"• Цена &gt; EMA50, EMA21 &gt; EMA50\n"
-        f"• Расстояние до EMA21: ≤{PULLBACK_EMA_DISTANCE_PCT}%\n"
-        f"• RSI 1ч: {PULLBACK_RSI_1H_MIN}–{PULLBACK_RSI_1H_MAX}\n"
-        f"• OI 24ч: ≥+{PULLBACK_OI_24H_MIN}%\n"
-        f"• OI 1ч: ≥+{PULLBACK_OI_1H_MIN}% (не падает)\n"
-        f"• 2 зелёные свечи подряд на 1h\n"
-        f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
-        f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• BB 20/2 + Keltner squeeze (BB inside KC)\n"
-        f"• BB Width 15m (≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
-        f"• Истинный пробой upper + расширение полос + объём ×{BB_BREAKOUT_VOL_MIN}\n"
-        f"• Отсев ложного пробоя (close обратно внутрь канала)\n"
-        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}%, цена ≥ mid BB\n"
-        f"• OI 24ч ≥+{BB_OI_24H_MIN}% / 4ч ≥+{BB_OI_4H_MIN}%; RSI 15м ≤{BB_PULLBACK_RSI_MAX}\n"
-        f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
-        f"<b>Ручная сделка (трекер):</b>\n"
-        f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
-        f"• Hard SL: −{HARD_SL_PCT}%\n"
-        f"• Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
-        f"<b>Авто-торговля:</b> /auto"
-    )
+    text = "\n".join([
+        "<b>⚙️ Настройки бота</b>",
+        "",
+        "<b>Сканер</b>",
+        f"• Интервал: {SCAN_INTERVAL_MIN} мин · кулдаун {ALERT_COOLDOWN_HOURS}ч",
+        f"• Оборот ≥ ${MIN_VOLUME_USD_24H/1e6:.0f}M · |Δ24h| ≥ {MIN_ABS_CHANGE_24H_PCT}%",
+        f"• Топ-{MAX_SCAN_SYMBOLS} · спред ≤ {MAX_SPREAD_PCT}% · возраст ≥ {MIN_AGE_DAYS}д",
+        f"• Bias: mid BB или EMA50 · vs BTC ≥ {REL_STRENGTH_MIN_PCT}%",
+        "",
+        f"<b>📉 BB SQUEEZE</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}",
+        f"• BB 20/2 + Keltner ATR{KC_ATR_PERIOD} · squeeze ≥ {BB_SQUEEZE_MIN_KC_BARS} бар",
+        f"• BW ≤ {BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%",
+        f"• Пробой upper · bull close · RSI≥50 · vol ×{BB_BREAKOUT_VOL_MIN}",
+        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}% · OI24 ≥+{BB_OI_24H_MIN}% / OI4 ≥+{BB_OI_4H_MIN}%",
+        f"• SL зона (cap {AUTO_BB_SL_PCT}%) · TP max(2%, 1.5×BW, zone×1.5)",
+        "• Partial @ TP1 → trail · BE · momentum exit",
+        "",
+        f"<b>Авто</b> типы: <code>{AUTO_TRADE_SIGNAL_TYPES}</code>",
+        "• Risk sizing · daily limit · circuit breaker",
+        "• Таймфильтр UTC / funding filter",
+        "",
+        "Команды: /auto · /status · /backtest · /help",
+    ])
+    await msg.answer(text)
 
 
 @dp.message(Command("backtest"))
@@ -1497,7 +1333,7 @@ async def cmd_backtest(msg: types.Message):
         days = max(3, min(int(parts[3]), 60))
 
     await msg.answer(
-        f"⏳ Backtest BB_LOWER v2 "
+        f"⏳ Backtest BB_SQUEEZE "
         f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
         f"за {days}д… это может занять 1–3 мин."
     )
@@ -1815,17 +1651,10 @@ async def cmd_auto(msg: types.Message):
 
     # Per-signal-type status
     sig_status_lines = []
-    for sig_type in ["STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"]:
+    for sig_type in ["BB_SQUEEZE", "BB_SQUEEZE_SHORT"]:
         on = auto_state.get_signal_toggle(sig_type)
         emoji = "🟢" if on else "🔴"
-        if sig_type == "PULLBACK":
-            params = f"TP +{AUTO_PULLBACK_TP_PCT}% / SL −{AUTO_PULLBACK_SL_PCT}%"
-        elif sig_type == "BB_SQUEEZE":
-            params = f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%"
-        elif sig_type == "BB_LOWER":
-            params = f"TP +{AUTO_BB_LOWER_TP_PCT}% / SL −{AUTO_BB_LOWER_SL_PCT}%"
-        else:
-            params = f"TP +{AUTO_TP_PCT}% / SL −{AUTO_HARD_SL_PCT}%"
+        params = f"TP soft/zone · SL zone (cap {AUTO_BB_SL_PCT}%)"
         sig_status_lines.append(f"  {emoji} {sig_type}: {params}")
     sig_status_block = "\n".join(sig_status_lines)
 
@@ -1841,8 +1670,8 @@ async def cmd_auto(msg: types.Message):
             pos_lines.append(
                 f"• <b>{base}</b> {p['signal_type']} {'⭐'*p['stars']}\n"
                 f"  Вход <code>${p['entry_price']:.6g}</code> | "
-                f"TP <code>${p['tp_price']:.6g}</code> | "
-                f"SL <code>${p['sl_price']:.6g}</code>\n"
+                f"SL <code>{p.get('sl_price') or '—'}</code> | "
+                f"TP {('<code>$'+format(p['tp_price'], '.6g')+'</code>') if p.get('tp_price') else 'soft/trail'}\n"
                 f"  Плечо {p['leverage']:.0f}x | {age_min:.0f} мин"
             )
     pos_block = "\n".join(pos_lines) if pos_lines else "<i>Нет открытых авто-позиций</i>"
@@ -1861,8 +1690,8 @@ async def cmd_auto(msg: types.Message):
         f"<b>Команды:</b>\n"
         f"/auto_on — включить общий\n"
         f"/auto_off — выключить общий\n"
-        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK/BB_SQUEEZE/BB_LOWER)\n"
-        f"/sig_on TYPE — включить тип\n"
+        f"/sig_off TYPE — выключить тип (BB_SQUEEZE, BB_SQUEEZE_SHORT)\n"
+        f"/sig_on TYPE — BB_SQUEEZE или BB_SQUEEZE_SHORT\n"
         f"/btc_filter — статус BTC-фильтра\n"
         f"/cooldown — список монет в кулдауне ({POST_TRADE_COOLDOWN_HOURS}ч)\n"
         f"/panic — закрыть всё + блок\n"
@@ -1954,27 +1783,19 @@ async def cmd_resume(msg: types.Message):
 async def cmd_sig_on(msg: types.Message):
     parts = (msg.text or "").split()
     if len(parts) != 2:
-        await msg.answer(
-            "Использование: <code>/sig_on TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
-            "Пример: <code>/sig_on PULLBACK</code>"
-        )
+        await msg.answer("\n".join([
+            "Использование: <code>/sig_on TYPE</code>",
+            "TYPE: <code>BB_SQUEEZE</code> или <code>BB_SQUEEZE_SHORT</code>",
+            "Пример: <code>/sig_on BB_SQUEEZE</code>",
+        ]))
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
-        await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
+    if sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+        await msg.answer("❌ TYPE: BB_SQUEEZE или BB_SQUEEZE_SHORT")
         return
     auto_state.set_signal_toggle(sig_type, True)
-    if sig_type == "PULLBACK":
-        params = f"TP +{AUTO_PULLBACK_TP_PCT}% / SL −{AUTO_PULLBACK_SL_PCT}%"
-    elif sig_type == "BB_SQUEEZE":
-        params = f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%"
-    else:
-        params = f"TP +{AUTO_TP_PCT}% / SL −{AUTO_HARD_SL_PCT}%"
     await msg.answer(
-        f"🟢 <b>{sig_type}</b> авто-торговля ВКЛЮЧЕНА\n"
-        f"Параметры: {params}\n\n"
-        f"Общий статус: /auto"
+        f"🟢 <b>{sig_type}</b> авто ВКЛ — SL зона · TP soft/zone · trail. /auto"
     )
 
 
@@ -1982,22 +1803,19 @@ async def cmd_sig_on(msg: types.Message):
 async def cmd_sig_off(msg: types.Message):
     parts = (msg.text or "").split()
     if len(parts) != 2:
-        await msg.answer(
-            "Использование: <code>/sig_off TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
-            "Пример: <code>/sig_off PULLBACK</code>"
-        )
+        await msg.answer("\n".join([
+            "Использование: <code>/sig_off TYPE</code>",
+            "TYPE: <code>BB_SQUEEZE</code> или <code>BB_SQUEEZE_SHORT</code>",
+            "Пример: <code>/sig_off BB_SQUEEZE</code>",
+        ]))
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
-        await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
+    if sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+        await msg.answer("❌ TYPE: BB_SQUEEZE или BB_SQUEEZE_SHORT")
         return
     auto_state.set_signal_toggle(sig_type, False)
     await msg.answer(
-        f"🔴 <b>{sig_type}</b> авто-торговля ВЫКЛЮЧЕНА\n"
-        f"Сигналы продолжат приходить в Telegram, но бот не будет автоматически входить.\n"
-        f"Другие типы сигналов работают как обычно.\n\n"
-        f"Общий статус: /auto"
+        f"🔴 <b>{sig_type}</b> авто ВЫКЛ. Алерты могут идти, вход — нет. /auto"
     )
 
 

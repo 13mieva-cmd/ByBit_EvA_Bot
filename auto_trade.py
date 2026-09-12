@@ -1,3 +1,4 @@
+from storage import append_metrics_csv
 """Auto-trading orchestration: signal -> entry, reconciliation, safety rails."""
 import asyncio
 import logging
@@ -32,6 +33,11 @@ from config import (
     EMA_PERIOD, BYBIT_BASE_URL as _BYBIT_BASE,
     RISK_SIZING_ENABLED, RISK_USD_PER_TRADE, RISK_SIZE_MIN_USD, RISK_SIZE_MAX_USD,
     PARTIAL_TP_ENABLED, PARTIAL_TP_PCT,
+    CIRCUIT_BREAKER_ENABLED, CIRCUIT_BREAKER_MIN_TRADES,
+    CIRCUIT_BREAKER_MIN_WR, CIRCUIT_BREAKER_LOOKBACK,
+    METRICS_CSV,
+    MOMENTUM_EXIT_ENABLED, MOMENTUM_EXIT_MIN_GAIN_PCT,
+    TRADE_TIME_FILTER_ENABLED, TRADE_BLOCK_UTC_START, TRADE_BLOCK_UTC_END,
 )
 from indicators import calculate_ema
 from trader import BybitTrader
@@ -133,6 +139,15 @@ class AutoTrader:
         async with self._signal_lock:
             if not self.state.is_enabled():
                 return
+            if CIRCUIT_BREAKER_ENABLED:
+                wr, n = self.state.recent_winrate(CIRCUIT_BREAKER_LOOKBACK)
+                if n >= CIRCUIT_BREAKER_MIN_TRADES and wr is not None and wr < CIRCUIT_BREAKER_MIN_WR:
+                    self.state.block_circuit(wr, n)
+                    await self.notify(
+                        f"🚫 <b>Circuit breaker</b>: WR {wr:.1f}% на {n} сделках "
+                        f"(<{CIRCUIT_BREAKER_MIN_WR}%). Авто выключен. /resume"
+                    )
+                    return
             sig_type = signal["signal_type"]
             if sig_type not in self.allowed_types:
                 return
@@ -141,8 +156,8 @@ class AutoTrader:
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
 
-            # Только монеты в 24h лонг-тренде
-            if AUTO_REQUIRE_24H_UPTREND:
+            # 24h тренд: long требует up; short — не требуем сильный up
+            if AUTO_REQUIRE_24H_UPTREND and sig_type != "BB_SQUEEZE_SHORT":
                 pc24 = signal.get("price_change_24h")
                 if pc24 is None:
                     log.info(f"{signal['symbol']}: no 24h change data, skip auto")
@@ -202,7 +217,7 @@ class AutoTrader:
             if sig_type == "PULLBACK":
                 tp_pct = AUTO_PULLBACK_TP_PCT
                 sl_pct = AUTO_PULLBACK_SL_PCT
-            elif sig_type == "BB_SQUEEZE":
+            elif sig_type in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
                 tp_pct = float(signal.get("tp_pct") or AUTO_BB_TP_PCT)
                 sl_pct = float(signal.get("sl_pct") or AUTO_BB_SL_PCT)
             elif sig_type == "BB_LOWER":
@@ -224,9 +239,15 @@ class AutoTrader:
                 f"Открываю позицию..."
             )
 
-            result = await self.trader.open_long_with_tpsl(
-                symbol, pos_usd, tp_pct, sl_pct, leverage=LEVERAGE,
-            )
+            sl_only = sig_type in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT")
+            if sig_type == "BB_SQUEEZE_SHORT":
+                result = await self.trader.open_short_with_tpsl(
+                    symbol, pos_usd, tp_pct, sl_pct, leverage=LEVERAGE, sl_only=sl_only,
+                )
+            else:
+                result = await self.trader.open_long_with_tpsl(
+                    symbol, pos_usd, tp_pct, sl_pct, leverage=LEVERAGE, sl_only=sl_only,
+                )
             if not result["ok"]:
                 err = result.get("error", "unknown")
                 code = result.get("code", "")
@@ -249,27 +270,54 @@ class AutoTrader:
             # === Пересчитать TP/SL от РЕАЛЬНОЙ цены входа (avgPrice) ===
             # Ордер маркетный — реальная цена исполнения отличается от той,
             # что использовалась при расчёте TP/SL до входа. Переставляем на бирже.
-            adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
-            if sig_type in ("BB_LOWER", "BB_SQUEEZE") and signal.get("tp_price_abs") and signal.get("sl_price_abs"):
-                # Сдвинуть уровни BB на дельту fill vs signal price (проскальзывание)
+            if sig_type in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+                # До TP1 — только SL (без hard TP)
                 sig_px = float(signal.get("price") or 0) or float(pos["entry_price"])
                 fill_px = float(pos["entry_price"])
                 delta = fill_px - sig_px
-                tp_abs = float(signal["tp_price_abs"]) + delta
-                sl_abs = float(signal["sl_price_abs"]) + delta
-                if sl_abs >= fill_px:
-                    sl_abs = fill_px * (1 - float(signal.get("sl_pct") or (AUTO_BB_LOWER_SL_PCT if sig_type == "BB_LOWER" else AUTO_BB_SL_PCT)) / 100)
-                if tp_abs <= fill_px:
-                    tp_abs = fill_px * (1 + float(signal.get("tp_pct") or (AUTO_BB_LOWER_TP_PCT if sig_type == "BB_LOWER" else AUTO_BB_TP_PCT)) / 100)
-                abs_res = await self.trader.set_tpsl_prices(symbol, tp_abs, sl_abs)
-                if abs_res.get("ok"):
-                    adjust_result = abs_res
-                    log.info(f"{symbol}: {sig_type} structure TP/SL applied (delta={delta:.6g})")
+                if signal.get("sl_price_abs"):
+                    sl_abs = float(signal["sl_price_abs"]) + delta
+                    if sig_type == "BB_SQUEEZE_SHORT":
+                        if sl_abs <= fill_px:
+                            sl_abs = fill_px * (1 + float(signal.get("sl_pct") or AUTO_BB_SL_PCT) / 100)
+                    else:
+                        if sl_abs >= fill_px:
+                            sl_abs = fill_px * (1 - float(signal.get("sl_pct") or AUTO_BB_SL_PCT) / 100)
+                    abs_res = await self.trader.set_stop_loss(symbol, sl_abs)
+                    if abs_res.get("ok"):
+                        adjust_result = abs_res
+                        adjust_result["tp_price"] = None
+                        log.info(f"{symbol}: {sig_type} SL-only structure (delta={delta:.6g})")
+                    else:
+                        adjust_result = await self.trader.set_sl_only_from_fill(symbol, sl_pct)
+                        log.warning(f"{symbol}: structure SL failed {abs_res}, fallback pct")
                 else:
-                    log.warning(f"{symbol}: structure TPSL failed {abs_res}")
+                    adjust_result = await self.trader.set_sl_only_from_fill(symbol, sl_pct)
+            else:
+                adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
+                if sig_type == "BB_LOWER" and signal.get("tp_price_abs") and signal.get("sl_price_abs"):
+                    sig_px = float(signal.get("price") or 0) or float(pos["entry_price"])
+                    fill_px = float(pos["entry_price"])
+                    delta = fill_px - sig_px
+                    tp_abs = float(signal["tp_price_abs"]) + delta
+                    sl_abs = float(signal["sl_price_abs"]) + delta
+                    if sl_abs >= fill_px:
+                        sl_abs = fill_px * (1 - float(signal.get("sl_pct") or AUTO_BB_LOWER_SL_PCT) / 100)
+                    if tp_abs <= fill_px:
+                        tp_abs = fill_px * (1 + float(signal.get("tp_pct") or AUTO_BB_LOWER_TP_PCT) / 100)
+                    abs_res = await self.trader.set_tpsl_prices(symbol, tp_abs, sl_abs)
+                    if abs_res.get("ok"):
+                        adjust_result = abs_res
+                        log.info(f"{symbol}: BB_LOWER structure TP/SL applied (delta={delta:.6g})")
+                    else:
+                        log.warning(f"{symbol}: structure TPSL failed {abs_res}")
             if adjust_result.get("ok"):
-                result["tp_price"] = adjust_result["tp_price"]
-                result["sl_price"] = adjust_result["sl_price"]
+                if adjust_result.get("tp_price") is not None:
+                    result["tp_price"] = adjust_result["tp_price"]
+                else:
+                    result["tp_price"] = None
+                if adjust_result.get("sl_price") is not None:
+                    result["sl_price"] = adjust_result["sl_price"]
             else:
                 log.warning(
                     f"Failed to adjust TP/SL for {symbol}: {adjust_result.get('error')}"
@@ -289,7 +337,7 @@ class AutoTrader:
                 symbol=symbol,
                 entry_price=pos["entry_price"],
                 qty=pos["size"],
-                tp_price=result["tp_price"],
+                tp_price=result.get("tp_price"),
                 sl_price=result["sl_price"],
                 leverage=result["leverage"],
                 signal_type=sig_type,
@@ -298,6 +346,33 @@ class AutoTrader:
             _t0 = self.state.active_positions.get(symbol)
             if _t0 is not None:
                 _t0["trailing_active"] = False
+                _t0["sl_only"] = sig_type in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT")
+                _t0["side"] = "Sell" if sig_type == "BB_SQUEEZE_SHORT" else "Buy"
+                _t0["soft_tp_pct"] = float(signal.get("tp_pct") or tp_pct)
+                _t0["tp_pct"] = float(signal.get("tp_pct") or tp_pct)
+                _t0["sl_pct"] = float(signal.get("sl_pct") or sl_pct)
+                self.state._save()
+
+            try:
+                append_metrics_csv(METRICS_CSV, {
+                    "event": "entry",
+                    "ts": __import__("time").time(),
+                    "symbol": symbol,
+                    "signal_type": sig_type,
+                    "stars": signal.get("stars"),
+                    "entry": pos["entry_price"],
+                    "tp_pct": signal.get("tp_pct") or tp_pct,
+                    "sl_pct": signal.get("sl_pct") or sl_pct,
+                    "size_usd": pos_usd,
+                    "bw": signal.get("bb_bandwidth"),
+                    "squeeze_bars": signal.get("squeeze_bars"),
+                    "vol_spike": signal.get("vol_spike_15m"),
+                    "oi_24h": signal.get("oi_change_24h"),
+                    "price_24h": signal.get("price_change_24h"),
+                    "note": signal.get("entry_note"),
+                })
+            except Exception as e:
+                log.warning(f"metrics entry: {e}")
                 self.state._save()
             await self.notify(
                 f"✅ <b>{base}</b> позиция открыта ({sig_type})\n\n"
@@ -327,15 +402,17 @@ class AutoTrader:
         for symbol in list(self.state.active_positions.keys()):
             if symbol in bybit_map:
                 live = bybit_map[symbol]
-                # 1) Слом структуры → market close
+                # 1) Momentum fade exit (Carter)
+                if await self.maybe_momentum_exit(symbol, live):
+                    continue
+                # 2) Structure break → market close
                 if STRUCTURE_EXIT_ENABLED:
-                    closed = await self.maybe_structure_exit(symbol, live)
-                    if closed:
+                    if await self.maybe_structure_exit(symbol, live):
                         continue
-                # 2) Ранний BE
+                # 3) Early BE
                 if AUTO_BE_ENABLED:
                     await self.maybe_move_to_be(symbol, live)
-                # 3) Трейлинг после TP1
+                # 4) Trailing after TP1
                 if AUTO_TRAIL_ENABLED:
                     await self.maybe_activate_trailing(symbol, live)
                 continue
@@ -369,7 +446,7 @@ class AutoTrader:
             return []
 
     async def maybe_move_to_be(self, symbol: str, live_pos: dict) -> None:
-        """После +AUTO_BE_TRIGGER_PCT% перенести SL на entry (+ буфер)."""
+        """После +AUTO_BE_TRIGGER_PCT% перенести SL на entry (± буфер) long/short."""
         tracked = self.state.active_positions.get(symbol)
         if not tracked or tracked.get("be_active") or tracked.get("trailing_active"):
             return
@@ -377,13 +454,19 @@ class AutoTrader:
         mark = live_pos.get("mark_price") or 0
         if entry <= 0 or mark <= 0:
             return
-        gain_pct = (mark - entry) / entry * 100
+        side = tracked.get("side") or "Buy"
+        if side == "Sell":
+            gain_pct = (entry - mark) / entry * 100
+            sl_price = entry * (1 - AUTO_BE_BUFFER_PCT / 100)
+            if sl_price <= mark:
+                sl_price = entry
+        else:
+            gain_pct = (mark - entry) / entry * 100
+            sl_price = entry * (1 + AUTO_BE_BUFFER_PCT / 100)
+            if sl_price >= mark:
+                sl_price = entry
         if gain_pct < AUTO_BE_TRIGGER_PCT:
             return
-        sl_price = entry * (1 + AUTO_BE_BUFFER_PCT / 100)
-        # Не ставить SL выше рынка
-        if sl_price >= mark:
-            sl_price = entry
         res = await self.trader.set_stop_loss(symbol, sl_price)
         base = symbol.replace("USDT", "")
         if res.get("ok"):
@@ -391,12 +474,56 @@ class AutoTrader:
             tracked["sl_price"] = res.get("sl_price", sl_price)
             self.state._save()
             await self.notify(
-                f"🛡 <b>{base}</b>: +{gain_pct:.2f}% — SL в <b>безубыток</b>\n"
-                f"Стоп ≈ <code>{tracked['sl_price']:.6g}</code> (entry +{AUTO_BE_BUFFER_PCT}%)\n"
-                f"<i>Дальше риск по позиции ≈ 0, ждём TP / трейлинг / структуру.</i>"
+                "BE <b>{}</b>: +{:.2f}% — SL в безубыток. Стоп ≈ <code>{:.6g}</code>".format(
+                    base, gain_pct, tracked["sl_price"]
+                )
             )
         else:
             log.warning(f"BE failed {symbol}: {res}")
+
+
+    async def maybe_momentum_exit(self, symbol: str, live_pos: dict) -> bool:
+        """Carter-style: after profit, 2-bar momentum fade → exit."""
+        if not MOMENTUM_EXIT_ENABLED:
+            return False
+        tracked = self.state.active_positions.get(symbol)
+        if not tracked or tracked.get("trailing_active"):
+            return False
+        entry = float(tracked.get("entry_price") or 0)
+        mark = float(live_pos.get("mark_price") or 0)
+        if entry <= 0 or mark <= 0:
+            return False
+        side = tracked.get("side") or "Buy"
+        if side == "Sell":
+            gain_pct = (entry - mark) / entry * 100
+        else:
+            gain_pct = (mark - entry) / entry * 100
+        if gain_pct < MOMENTUM_EXIT_MIN_GAIN_PCT:
+            return False
+        closes = await self._fetch_closes(symbol, "15", 8)
+        if len(closes) < 6:
+            return False
+        mom_now = closes[-1] - closes[-3]
+        mom_prev = closes[-3] - closes[-5]
+        if side == "Buy":
+            faded = mom_prev > 0 and mom_now < 0 and closes[-1] < closes[-2]
+        else:
+            faded = mom_prev < 0 and mom_now > 0 and closes[-1] > closes[-2]
+        if not faded:
+            return False
+        base = symbol.replace("USDT", "")
+        res = await self.trader.close_position_market(symbol)
+        if res.get("ok"):
+            tracked["exit_reason"] = "MOMENTUM"
+            tracked["exit_detail"] = "fade after +{:.2f}%".format(gain_pct)
+            self.state._save()
+            await self.notify(
+                "MOMENTUM EXIT <b>{}</b>: +{:.2f}% then 2 bars against".format(base, gain_pct)
+            )
+            await self.handle_closed_position(symbol)
+            return True
+        return False
+
 
     async def maybe_structure_exit(self, symbol: str, live_pos: dict) -> bool:
         """True если позицию закрыли по слому EMA50 (1h и/или 15m)."""
@@ -450,10 +577,14 @@ class AutoTrader:
         mark = live_pos.get("mark_price") or 0
         if entry <= 0 or mark <= 0:
             return
-        gain_pct = (mark - entry) / entry * 100
+        side = tracked.get("side") or "Buy"
+        if side == "Sell":
+            gain_pct = (entry - mark) / entry * 100
+        else:
+            gain_pct = (mark - entry) / entry * 100
         if tracked.get("signal_type") == "PULLBACK":
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
-        elif tracked.get("signal_type") == "BB_SQUEEZE":
+        elif tracked.get("signal_type") in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB
         elif tracked.get("signal_type") == "BB_LOWER":
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER
@@ -599,6 +730,30 @@ class AutoTrader:
             elif pnl_usd > 0:
                 self.state.reset_consecutive_loss()
 
+        try:
+            self.state.record_closed_trade({
+                "symbol": symbol,
+                "signal_type": (tracked or {}).get("signal_type"),
+                "pnl_usd": pnl_usd,
+                "reason": close_reason,
+                "ts": __import__("time").time(),
+            })
+            append_metrics_csv(METRICS_CSV, {
+                "event": "exit",
+                "ts": __import__("time").time(),
+                "symbol": symbol,
+                "signal_type": (tracked or {}).get("signal_type"),
+                "entry": entry,
+                "exit": exit_price,
+                "pnl_usd": pnl_usd,
+                "reason": close_reason,
+                "tp_pct": (tracked or {}).get("tp_pct"),
+                "sl_pct": (tracked or {}).get("sl_pct"),
+                "soft_tp_pct": (tracked or {}).get("soft_tp_pct"),
+            })
+        except Exception as e:
+            log.warning(f"metrics exit: {e}")
+
         self.state.remove_position(symbol)
         self.state.add_post_trade_cooldown(symbol, POST_TRADE_COOLDOWN_HOURS)
 
@@ -635,6 +790,13 @@ class AutoTrader:
                 f"\n\n🚫 <b>{CONSECUTIVE_LOSS_BLOCK} убытков подряд</b>.\n"
                 f"Авто-торговля заблокирована. <code>/resume</code> чтобы разблокировать."
             )
+        if CIRCUIT_BREAKER_ENABLED:
+            wr, n = self.state.recent_winrate(CIRCUIT_BREAKER_LOOKBACK)
+            if n >= CIRCUIT_BREAKER_MIN_TRADES and wr is not None and wr < CIRCUIT_BREAKER_MIN_WR:
+                self.state.block_circuit(wr, n)
+                msg += (
+                    f"\n\n🚫 <b>Circuit breaker</b>: WR {wr:.1f}% на {n} сделках."
+                )
 
         await self.notify(msg)
 

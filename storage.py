@@ -6,6 +6,21 @@ import time
 
 log = logging.getLogger("storage")
 
+def append_metrics_csv(path: str, row: dict):
+    """Append one trade/signal row to CSV (header auto)."""
+    import csv
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new_file = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()), extrasaction="ignore")
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        log.warning(f"metrics csv: {e}")
+
+
 
 class JsonStore:
     def __init__(self, path: str, default):
@@ -23,11 +38,29 @@ class JsonStore:
             log.error(f"Failed to load {self.path}: {e}")
 
     def _save(self):
+        """Atomic write: temp file + os.replace. Optional flock when available."""
         try:
-            with open(self.path, "w") as f:
+            directory = os.path.dirname(os.path.abspath(self.path)) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = self.path + ".tmp"
+            # Write to temp
+            with open(tmp_path, "w") as f:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
                 json.dump(self.data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
         except Exception as e:
             log.error(f"Failed to save {self.path}: {e}")
+            try:
+                if os.path.exists(self.path + ".tmp"):
+                    os.remove(self.path + ".tmp")
+            except Exception:
+                pass
 
 
 class PositionStore(JsonStore):
@@ -39,7 +72,7 @@ class PositionStore(JsonStore):
         s = symbol.upper()
         return s if s.endswith("USDT") else s + "USDT"
 
-    def add(self, symbol: str, entry_price: float, tp1: float, tp2: float, hard_sl: float, signal_type: str = "STANDARD") -> bool:
+    def add(self, symbol: str, entry_price: float, tp1: float, tp2: float, hard_sl: float, signal_type: str = "BB_SQUEEZE") -> bool:
         symbol = self._normalize(symbol)
         if symbol in self.data:
             return False
@@ -137,7 +170,7 @@ class StatsStore(JsonStore):
             "timeouts": 0,
             "last_reset_day": "",
             "alerts_by_star": {"1": 0, "2": 0, "3": 0},
-            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0, "BB_SQUEEZE": 0},
+            "alerts_by_type": {"BB_SQUEEZE": 0, "BB_SQUEEZE_SHORT": 0},
         })
 
     def reset_daily_if_needed(self, today: str):
@@ -147,7 +180,7 @@ class StatsStore(JsonStore):
             self.data["last_reset_day"] = today
             self._save()
 
-    def incr_alert(self, stars: int, signal_type: str = "STANDARD"):
+    def incr_alert(self, stars: int, signal_type: str = "BB_SQUEEZE"):
         self.data["alerts_today"] += 1
         self.data["alerts_total"] += 1
         self.data["alerts_by_star"][str(stars)] = self.data["alerts_by_star"].get(str(stars), 0) + 1
@@ -167,14 +200,14 @@ class AutoStateStore(JsonStore):
             "daily_pnl": 0.0,
             "daily_pnl_date": "",
             "consecutive_losses": 0,
+            "closed_trades": [],  # recent closed for circuit breaker
+
             "blocked_until": 0,
             "blocked_reason": "",
             "active_positions": {},
             "signal_toggles": {
-                "STANDARD": True,
-                "SURGE": True,
-                "PULLBACK": True,
                 "BB_SQUEEZE": True,
+                "BB_SQUEEZE_SHORT": False,
             },
             "post_trade_cooldown": {},  # symbol -> expiration timestamp
             "btc_filter_enabled": True,
@@ -233,6 +266,31 @@ class AutoStateStore(JsonStore):
     @property
     def consecutive_losses(self) -> int:
         return self.data.get("consecutive_losses", 0)
+
+
+    def record_closed_trade(self, trade: dict):
+        """Append closed trade summary (for WR circuit breaker). Keep last 50."""
+        hist = self.data.setdefault("closed_trades", [])
+        hist.append(trade)
+        self.data["closed_trades"] = hist[-50:]
+        self._save()
+
+    def recent_winrate(self, lookback: int = 12) -> tuple:
+        """Return (winrate_pct or None, n_trades)."""
+        hist = self.data.get("closed_trades") or []
+        recent = hist[-lookback:] if lookback else hist
+        if not recent:
+            return None, 0
+        wins = sum(1 for x in recent if float(x.get("pnl_usd") or 0) > 0)
+        n = len(recent)
+        return wins / n * 100.0, n
+
+    def block_circuit(self, wr: float, n: int):
+        self.data["enabled"] = False
+        self.data["blocked"] = True
+        self.data["blocked_reason"] = f"circuit_breaker WR {wr:.1f}% on {n} trades"
+        self._save()
+
 
     def incr_consecutive_loss(self):
         self.data["consecutive_losses"] = self.data.get("consecutive_losses", 0) + 1
