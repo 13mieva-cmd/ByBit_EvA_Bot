@@ -356,7 +356,41 @@ def signal_at(i, opens, highs, lows, closes, volumes):
     }
 
 
-async def backtest_symbol(session, symbol: str, days: int) -> BacktestResult:
+
+async def top_symbols(session, n: int = 10) -> list[str]:
+    """Top USDT linear perps by 24h turnover (excl. blacklist)."""
+    base = BYBIT_BASE_URL.rstrip("/")
+    try:
+        async with session.get(
+            f"{base}/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning(f"top_symbols: {e}")
+        return []
+    tickers = data.get("result", {}).get("list", []) if isinstance(data, dict) else []
+    scored = []
+    for tk in tickers:
+        sym = tk.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        base_sym = sym.replace("USDT", "")
+        if base_sym in BLACKLIST:
+            continue
+        try:
+            turn = float(tk.get("turnover24h") or 0)
+        except Exception:
+            turn = 0
+        if turn < MIN_VOLUME_USD_24H:
+            continue
+        scored.append((turn, sym))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:n]]
+
+
+async def backtest_symbol(session, symbol: str, days: int, use_oi: bool = False) -> BacktestResult:
     limit = min(1000, days * 96 + 100)
     rows = await fetch_klines(session, symbol, "15", limit)
     if len(rows) < BB_PERIOD + 50:
