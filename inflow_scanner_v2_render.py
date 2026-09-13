@@ -356,6 +356,10 @@ def allowed(msg) -> bool:
 @dp.message.middleware()
 async def auth_mw(handler, event, data):
     if isinstance(event, types.Message) and not allowed(event):
+        log.warning("auth deny uid=%s cid=%s text=%s",
+                    getattr(getattr(event, "from_user", None), "id", None),
+                    getattr(getattr(event, "chat", None), "id", None),
+                    getattr(event, "text", None))
         try:
             await event.answer("No access")
         except Exception:
@@ -695,9 +699,24 @@ async def loop_recon(bot):
         await asyncio.sleep(RECONCILE_SEC)
 
 
-@dp.message(Command("start", "help", "menu"))
+@dp.message(Command("start"))
+@dp.message(Command("help"))
+@dp.message(Command("menu"))
 async def cmd_start(m: types.Message):
-    await m.answer(card_help(), reply_markup=kb_main())
+    try:
+        await m.answer(card_help(), reply_markup=kb_main())
+    except Exception as e:
+        log.exception("help/start failed: %s", e)
+        try:
+            await m.answer(
+                "TTM Squeeze Bot\n"
+                f"/scan /status /positions /settings\n"
+                f"/auto_on /auto_off /resume /panic\n"
+                f"Risk ${RISK_USD:.0f} | max {MAX_POSITIONS} | lev {LEVERAGE:.0f}x",
+                reply_markup=kb_main(),
+            )
+        except Exception:
+            await m.answer("Bot online. Use /status")
 
 
 @dp.message(Command("scan"))
@@ -786,7 +805,11 @@ async def cb_cmd(q: CallbackQuery):
     chat = q.message.chat.id if q.message else TELEGRAM_CHAT_ID
 
     if action == "menu" or action == "help":
-        await bot.send_message(chat, card_help(), reply_markup=kb_main())
+        try:
+            await bot.send_message(chat, card_help(), reply_markup=kb_main())
+        except Exception as e:
+            log.exception("callback help: %s", e)
+            await bot.send_message(chat, "Help temporarily unavailable. /status", reply_markup=kb_main())
     elif action == "scan":
         await bot.send_message(chat, "📡 <b>Scanning…</b>")
         await scan_once(bot)
