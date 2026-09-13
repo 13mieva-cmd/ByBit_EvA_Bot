@@ -13,10 +13,11 @@ import time
 from datetime import datetime, timezone
 
 import aiohttp
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_IDS,
@@ -26,9 +27,11 @@ from config import (
     LEVERAGE, RISK_USD, SIZE_MIN_USD, SIZE_MAX_USD,
     MAX_POSITIONS, DAILY_LOSS_USD, CONSEC_LOSS_BLOCK,
     TRAIL_PCT, BE_TRIGGER_R, PARTIAL_PCT, RECONCILE_SEC, COOLDOWN_HOURS,
-    BTC_15M_MIN, MIN_SQUEEZE_BARS, HTF_INTERVAL, REQUIRE_HTF,
+    BTC_15M_MIN, MIN_SQUEEZE_BARS, MAX_SQUEEZE_BARS, HTF_INTERVAL, REQUIRE_HTF,
     REQUIRE_BTC_TREND, BTC_HTF_INTERVAL, MOM_LENGTH, MAX_HOLD_BARS, MOM_FADE_BARS,
-    USE_CLOSED_BARS_ONLY,
+    USE_CLOSED_BARS_ONLY, VOL_SPIKE_MIN, BW_EXPAND_MIN, EMA_FAST, EMA_SLOW,
+    REQUIRE_EMA_STACK, SL_ATR_MULT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
+    DEPOSIT_USD, RISK_PCT,
 )
 from strategy import detect_ttm
 from storage import State, append_csv
@@ -43,6 +46,296 @@ state = State(STATE_FILE)
 trader: BybitTrader | None = None
 http: aiohttp.ClientSession | None = None  # single shared session
 last_alert: dict[str, float] = {}
+# last signal cache for manual enter button: symbol -> sig dict
+last_signals: dict[str, dict] = {}
+
+
+def _kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_main() -> InlineKeyboardMarkup:
+    auto = "🟢 AUTO ON" if state.enabled() else "⚪ AUTO OFF"
+    return _kb([
+        [
+            InlineKeyboardButton(text="📡 Scan", callback_data="cmd:scan"),
+            InlineKeyboardButton(text="📊 Status", callback_data="cmd:status"),
+        ],
+        [
+            InlineKeyboardButton(text=auto, callback_data="cmd:auto_toggle"),
+            InlineKeyboardButton(text="📂 Positions", callback_data="cmd:positions"),
+        ],
+        [
+            InlineKeyboardButton(text="📖 Help", callback_data="cmd:help"),
+            InlineKeyboardButton(text="⚙️ Settings", callback_data="cmd:settings"),
+        ],
+        [
+            InlineKeyboardButton(text="▶️ Resume", callback_data="cmd:resume"),
+            InlineKeyboardButton(text="🛑 PANIC", callback_data="cmd:panic"),
+        ],
+    ])
+
+
+def kb_signal(symbol: str, side: str) -> InlineKeyboardMarkup:
+    base = symbol.replace("USDT", "")
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'🟢 Long' if side == 'Buy' else '🔴 Short'} · Enter now",
+            callback_data=f"enter:{symbol}",
+        )],
+        [
+            InlineKeyboardButton(text="📊 Status", callback_data="cmd:status"),
+            InlineKeyboardButton(text="📂 Positions", callback_data="cmd:positions"),
+        ],
+    ]
+    return _kb(rows)
+
+
+def kb_position(symbol: str) -> InlineKeyboardMarkup:
+    return _kb([
+        [InlineKeyboardButton(text="✖️ Close position", callback_data=f"close:{symbol}")],
+        [
+            InlineKeyboardButton(text="📂 All positions", callback_data="cmd:positions"),
+            InlineKeyboardButton(text="📊 Status", callback_data="cmd:status"),
+        ],
+    ])
+
+
+def kb_back() -> InlineKeyboardMarkup:
+    return _kb([[InlineKeyboardButton(text="◀️ Menu", callback_data="cmd:menu")]])
+
+
+def htf_label() -> str:
+    m = {"15": "15m", "60": "1H", "240": "4H", "D": "1D"}
+    return m.get(str(HTF_INTERVAL), f"{HTF_INTERVAL}")
+
+
+def card_help() -> str:
+    mode = "🟢 trading" if trader else "🟡 signals only"
+    return (
+        f"<b>TTM Squeeze Bot</b> · crypto futures\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Mode:</b> {mode}\n"
+        f"<b>Work TF:</b> 15m (closed bars only)\n"
+        f"<b>Trend TF:</b> {htf_label()} EMA{HTF_EMA}\n"
+        f"<b>Stack:</b> EMA{EMA_FAST}/{EMA_SLOW} "
+        f"{'ON' if REQUIRE_EMA_STACK else 'OFF'}\n"
+        f"<b>BTC filter:</b> {'ON' if REQUIRE_BTC_TREND else 'OFF'} "
+        f"({BTC_HTF_INTERVAL}m)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Entry rules</b>\n"
+        f"• Squeeze {MIN_SQUEEZE_BARS}–{MAX_SQUEEZE_BARS} bars → FIRE\n"
+        f"• BW expand ≥{BW_EXPAND_MIN}x · Vol ≥{VOL_SPIKE_MIN}x\n"
+        f"• Momentum rising · bullish close\n"
+        f"• Long only: {'yes' if not ALLOW_SHORT else 'long+short'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Risk</b>\n"
+        f"• Risk ${RISK_USD:.0f}/trade ({RISK_PCT}% of ${DEPOSIT_USD:.0f})\n"
+        f"• Leverage {LEVERAGE:.0f}x · size ${SIZE_MIN_USD:.0f}–{SIZE_MAX_USD:.0f}\n"
+        f"• Max positions {MAX_POSITIONS}\n"
+        f"• SL: zone / ATR×{SL_ATR_MULT} · cap {SL_CAP_PCT}%\n"
+        f"• TP {TP_R_MULTIPLE:.0f}R · BE @{BE_TRIGGER_R}R · "
+        f"partial {PARTIAL_PCT:.0f}% @1R\n"
+        f"• Fade {MOM_FADE_BARS} bars · time-stop {MAX_HOLD_BARS} bars\n"
+        f"• Daily loss −${DAILY_LOSS_USD:.0f} · "
+        f"{CONSEC_LOSS_BLOCK} losses → block\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Use buttons below or commands."
+    )
+
+
+def card_settings() -> str:
+    return (
+        f"<b>⚙️ Live settings</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Scan every <code>{SCAN_INTERVAL_SEC}s</code> · "
+        f"recon <code>{RECONCILE_SEC}s</code>\n"
+        f"Universe top <code>{MAX_SYMBOLS}</code> · "
+        f"min turnover <code>${MIN_TURNOVER_USD/1e6:.0f}M</code>\n"
+        f"Min age <code>{MIN_AGE_DAYS}d</code> · "
+        f"cooldown <code>{COOLDOWN_HOURS}h</code>\n"
+        f"Closed bars: <code>{USE_CLOSED_BARS_ONLY}</code>\n"
+        f"API: <code>{BYBIT_BASE_URL.replace('https://','')}</code>\n"
+        f"Trail <code>{TRAIL_PCT}%</code> · "
+        f"BTC 15m gate <code>{BTC_15M_MIN}%</code>"
+    )
+
+
+async def card_status() -> str:
+    bal = None
+    if trader:
+        try:
+            bal = await trader.balance()
+        except Exception:
+            pass
+    auto = "🟢 ON" if state.enabled() else "⚪ OFF"
+    blk = state.blocked()
+    reason = state.data.get("blocked_reason") or "—"
+    npos = len(state.positions)
+    pnl = float(state.data.get("daily_pnl") or 0)
+    pnl_s = f"{pnl:+.2f}"
+    lines = [
+        f"<b>📊 Status</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Auto: <b>{auto}</b>",
+        f"Blocked: <b>{'🔒 ' + reason if blk else '🔓 no'}</b>",
+        f"Positions: <b>{npos}/{MAX_POSITIONS}</b>",
+        f"Day PnL: <b>${pnl_s}</b>",
+    ]
+    if bal is not None:
+        lines.append(f"Balance: <b>${bal:,.2f}</b>")
+    else:
+        lines.append("Balance: <i>no API / n/a</i>")
+    lines.append(f"Risk/trade: <b>${RISK_USD:.0f}</b> · lev <b>{LEVERAGE:.0f}x</b>")
+    if npos == 0:
+        lines.append("")
+        lines.append("<i>No open trades. Waiting for TTM fire…</i>")
+    else:
+        lines.append("")
+        lines.append("<b>Open:</b>")
+        for sym, tr in state.positions.items():
+            base = sym.replace("USDT", "")
+            side = "LONG" if tr.get("side") == "Buy" else "SHORT"
+            flags = []
+            if tr.get("be"):
+                flags.append("BE")
+            if tr.get("partial"):
+                flags.append("partial")
+            if tr.get("trail"):
+                flags.append("trail")
+            fl = (" · " + " ".join(flags)) if flags else ""
+            lines.append(
+                f"• <b>{base}</b> {side} @ <code>{float(tr.get('entry', 0)):.6g}</code>{fl}"
+            )
+    return "\n".join(lines)
+
+
+def card_signal(sig: dict, symbol: str) -> str:
+    base = symbol.replace("USDT", "")
+    side = "LONG 🟢" if sig["side"] == "Buy" else "SHORT 🔴"
+    stars = "⭐" * int(sig.get("stars") or 1)
+    filters = []
+    if sig.get("fired"):
+        filters.append("FIRE")
+    if sig.get("trend_ok"):
+        filters.append(f"EMA{EMA_FAST}/{EMA_SLOW}")
+    if sig.get("htf_ok"):
+        filters.append(htf_label())
+    if sig.get("btc_ok"):
+        filters.append("BTC")
+    filt = " · ".join(filters) if filters else "—"
+    usd = size_usd(sig["sl_pct"])
+    return (
+        f"<b>{side}</b> TTM {stars} — <b>{base}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Setup</b>\n"
+        f"Squeeze: <code>{sig['squeeze_bars']}</code> bars · "
+        f"Vol <code>x{sig['vol_spike']}</code>\n"
+        f"BW: <code>{sig['bb_bandwidth']}%</code> · "
+        f"Mom <code>{sig['momentum']:.6g}</code>\n"
+        f"Filters: <code>{filt}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Levels</b>\n"
+        f"Entry ≈ <code>${sig['entry']:.6g}</code>\n"
+        f"SL <code>${sig['sl']:.6g}</code> "
+        f"(−{sig['sl_pct']:.2f}%)\n"
+        f"TP {TP_R_MULTIPLE:.0f}R <code>${sig['tp']:.6g}</code> "
+        f"(+{sig['tp_pct']:.2f}%)\n"
+        f"Size ≈ <code>${usd:.0f}</code> · lev {LEVERAGE:.0f}x\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Closed-bar signal · 15m</i>"
+    )
+
+
+def card_opened(base: str, entry: float, sig: dict, usd: float) -> str:
+    side = "LONG 🟢" if sig["side"] == "Buy" else "SHORT 🔴"
+    return (
+        f"<b>✅ Position opened</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{base}</b> {side}\n"
+        f"Entry <code>${entry:.6g}</code>\n"
+        f"SL <code>${sig['sl']:.6g}</code> (−{sig['sl_pct']:.2f}%)\n"
+        f"TP {TP_R_MULTIPLE:.0f}R <code>${sig['tp']:.6g}</code>\n"
+        f"Size <code>${usd:.0f}</code> · risk ${RISK_USD:.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"BE @{BE_TRIGGER_R}R · partial {PARTIAL_PCT:.0f}% @1R · "
+        f"fade {MOM_FADE_BARS} / time {MAX_HOLD_BARS}"
+    )
+
+
+def card_closed(symbol: str, pnl, reason: str | None) -> str:
+    base = symbol.replace("USDT", "")
+    day = float(state.data.get("daily_pnl") or 0)
+    pnl_s = f"{pnl:+.2f}" if pnl is not None else "n/a"
+    why = reason or "exchange / SL / TP"
+    return (
+        f"<b>📤 Position closed</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{base}</b>\n"
+        f"PnL: <b>${pnl_s}</b>\n"
+        f"Reason: <code>{why}</code>\n"
+        f"Day PnL: <b>${day:+.2f}</b>"
+    )
+
+
+def card_positions_empty() -> str:
+    return (
+        f"<b>📂 Positions</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Open: <b>0/{MAX_POSITIONS}</b>\n\n"
+        f"<i>Нет открытых сделок.</i>\n"
+        f"Бот ждёт TTM fire на 15m с фильтрами "
+        f"{htf_label()} + EMA{EMA_FAST}/{EMA_SLOW}"
+        f"{' + BTC' if REQUIRE_BTC_TREND else ''}."
+    )
+
+
+async def card_positions() -> tuple[str, InlineKeyboardMarkup | None]:
+    if not state.positions:
+        return card_positions_empty(), kb_back()
+    lines = [
+        f"<b>📂 Positions</b> · {len(state.positions)}/{MAX_POSITIONS}",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
+    rows = []
+    live = {}
+    if trader:
+        try:
+            live = {p["symbol"]: p for p in await trader.positions()}
+        except Exception:
+            pass
+    for sym, tr in state.positions.items():
+        base = sym.replace("USDT", "")
+        side = "LONG" if tr.get("side") == "Buy" else "SHORT"
+        entry = float(tr.get("entry") or 0)
+        sl = float(tr.get("sl") or 0)
+        mark = None
+        if sym in live:
+            mark = float(live[sym].get("mark_price") or 0)
+        u = ""
+        if mark and entry:
+            if tr.get("side") == "Buy":
+                u = f" · mark {mark:.6g} ({(mark/entry-1)*100:+.2f}%)"
+            else:
+                u = f" · mark {mark:.6g} ({(entry/mark-1)*100:+.2f}%)"
+        flags = []
+        if tr.get("be"):
+            flags.append("BE")
+        if tr.get("partial"):
+            flags.append("½")
+        if tr.get("trail"):
+            flags.append("trail")
+        fl = (" [" + " ".join(flags) + "]") if flags else ""
+        lines.append(
+            f"<b>{base}</b> {side}{fl}\n"
+            f"  in <code>{entry:.6g}</code> SL <code>{sl:.6g}</code>{u}"
+        )
+        rows.append([InlineKeyboardButton(
+            text=f"✖️ Close {base}", callback_data=f"close:{sym}"
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Menu", callback_data="cmd:menu")])
+    return "\n".join(lines), _kb(rows)
+
 
 
 def allowed(msg) -> bool:
@@ -162,31 +455,49 @@ def size_usd(sl_pct: float) -> float:
     return round(max(SIZE_MIN_USD, min(SIZE_MAX_USD, s)), 2)
 
 
-async def try_enter(bot, symbol, sig):
+async def try_enter(bot, symbol, sig, notify: bool = True) -> bool:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     state.reset_day(today)
+    if not trader:
+        if notify:
+            await bot.send_message(TELEGRAM_CHAT_ID, "⚠️ No Bybit API — signals only", reply_markup=kb_back())
+        return False
     if state.blocked() or len(state.positions) >= MAX_POSITIONS:
-        return
+        if notify:
+            await bot.send_message(
+                TELEGRAM_CHAT_ID,
+                f"⚠️ Skip entry: blocked or max positions ({len(state.positions)}/{MAX_POSITIONS})",
+                reply_markup=kb_back(),
+            )
+        return False
     if symbol in state.positions or state.is_cool(symbol):
-        return
+        return False
     if await trader.positions(symbol):
-        return
+        return False
     usd = size_usd(sig["sl_pct"])
     base = symbol.replace("USDT", "")
-    await bot.send_message(TELEGRAM_CHAT_ID, f"AUTO entry {base} ${usd:.0f}...")
+    if notify:
+        await bot.send_message(
+            TELEGRAM_CHAT_ID,
+            f"⏳ Opening <b>{base}</b> · size ~${usd:.0f} · lev {LEVERAGE:.0f}x…",
+        )
     res = await trader.open_market(symbol, sig["side"], usd, sig["sl"], LEVERAGE, None)
     if not res.get("ok"):
-        await bot.send_message(TELEGRAM_CHAT_ID, f"Fail {base}: {res.get('error')}")
-        return
+        await bot.send_message(
+            TELEGRAM_CHAT_ID,
+            f"❌ Entry failed <b>{base}</b>\n<code>{res.get('error')}</code>",
+            reply_markup=kb_back(),
+        )
+        return False
     await asyncio.sleep(2)
     pos = await trader.positions(symbol)
     if not pos:
-        await bot.send_message(TELEGRAM_CHAT_ID, f"Warn {base}: no position")
-        return
+        await bot.send_message(TELEGRAM_CHAT_ID, f"⚠️ {base}: order sent, position not found", reply_markup=kb_back())
+        return False
     if not await trader.has_sl(symbol):
         await trader.close(symbol, sig["side"])
-        await bot.send_message(TELEGRAM_CHAT_ID, f"No SL on {base} — closed")
-        return
+        await bot.send_message(TELEGRAM_CHAT_ID, f"❌ No SL on {base} — closed for safety", reply_markup=kb_back())
+        return False
     entry = pos[0]["entry_price"]
     state.add_pos(
         symbol, side=sig["side"], entry=entry, sl=sig["sl"], tp=sig["tp"],
@@ -199,9 +510,10 @@ async def try_enter(bot, symbol, sig):
     })
     await bot.send_message(
         TELEGRAM_CHAT_ID,
-        f"Opened <b>{base}</b> @ <code>${entry:.6g}</code>\n"
-        f"SL <code>${sig['sl']:.6g}</code> size ${usd:.0f}",
+        card_opened(base, entry, sig, usd),
+        reply_markup=kb_position(symbol),
     )
+    return True
 
 
 async def scan_once(bot: Bot):
@@ -234,31 +546,14 @@ async def scan_once(bot: Bot):
             continue
         n += 1
         last_alert[sym] = time.time()
-        base = sym.replace("USDT", "")
-        side = "LONG" if sig["side"] == "Buy" else "SHORT"
-        filters = []
-        if sig.get("fired"):
-            filters.append("FIRE")
-        if sig.get("trend_ok"):
-            filters.append("EMA50/200")
-        if sig.get("htf_ok"):
-            filters.append("4H")
-        if sig.get("btc_ok"):
-            filters.append("BTC")
-        filt = " · ".join(filters) if filters else "—"
-        text = (
-            f"<b>{side} TTM</b> {'*' * sig['stars']} — <b>{base}</b>\n\n"
-            f"KC x{sig['squeeze_bars']} | vol x{sig['vol_spike']} | BW {sig['bb_bandwidth']}%\n"
-            f"Price <code>${sig['entry']:.6g}</code>\n"
-            f"SL <code>${sig['sl']:.6g}</code> (-{sig['sl_pct']:.2f}%)\n"
-            f"TP 2R <code>${sig['tp']:.6g}</code> (+{sig['tp_pct']:.2f}%)\n"
-            f"Mom {sig['momentum']:.6g}\n"
-            f"Filters: {filt}\n"
-            f"<i>closed-bar signal</i>"
+        last_signals[sym] = sig
+        text = card_signal(sig, sym)
+        await bot.send_message(
+            TELEGRAM_CHAT_ID, text, reply_markup=kb_signal(sym, sig["side"]),
         )
-        await bot.send_message(TELEGRAM_CHAT_ID, text)
         if trader and state.enabled() and not state.blocked():
-            await try_enter(bot, sym, sig)
+            await try_enter(bot, sym, sig, notify=True)
+
         await asyncio.sleep(0.08)
     log.info("Scan done alerts=%s", n)
 
@@ -283,17 +578,26 @@ async def on_closed(bot, symbol):
         "event": "exit", "ts": time.time(), "symbol": symbol, "pnl": pnl,
         "reason": (tr or {}).get("exit_reason"),
     })
+    reason = (tr or {}).get("exit_reason")
     await bot.send_message(
         TELEGRAM_CHAT_ID,
-        f"Closed {symbol.replace('USDT', '')} PnL {pnl}\n"
-        f"Day ${state.data.get('daily_pnl', 0):+.2f}",
+        card_closed(symbol, pnl, reason),
+        reply_markup=kb_main(),
     )
     if state.data.get("daily_pnl", 0) <= -DAILY_LOSS_USD:
         state.block("daily_loss", 20)
-        await bot.send_message(TELEGRAM_CHAT_ID, "Daily loss limit — blocked")
+        await bot.send_message(
+            TELEGRAM_CHAT_ID,
+            f"🔒 <b>Daily loss limit</b> (−${DAILY_LOSS_USD:.0f}) — trading blocked.\n/resume to unlock",
+            reply_markup=kb_main(),
+        )
     elif state.data.get("consec_losses", 0) >= CONSEC_LOSS_BLOCK:
         state.block("consec", 48)
-        await bot.send_message(TELEGRAM_CHAT_ID, "Consec losses — /resume")
+        await bot.send_message(
+            TELEGRAM_CHAT_ID,
+            f"🔒 <b>{CONSEC_LOSS_BLOCK} consecutive losses</b> — blocked.\n/resume to unlock",
+            reply_markup=kb_main(),
+        )
 
 
 async def reconcile(bot: Bot):
@@ -318,7 +622,7 @@ async def reconcile(bot: Bot):
             if (await trader.set_sl(sym, be_sl, side)).get("ok"):
                 tr["be"] = True
                 state.save()
-                await bot.send_message(TELEGRAM_CHAT_ID, f"BE {sym.replace('USDT', '')}")
+                await bot.send_message(TELEGRAM_CHAT_ID, f"🛡️ BE · <b>{sym.replace('USDT', '')}</b> — stop to breakeven")
 
         if not tr.get("trail") and gain_r >= 1.0:
             if not tr.get("partial"):
@@ -328,7 +632,7 @@ async def reconcile(bot: Bot):
             if (await trader.set_trail(sym, TRAIL_PCT, side)).get("ok"):
                 tr["trail"] = True
                 state.save()
-                await bot.send_message(TELEGRAM_CHAT_ID, f"Trail {sym.replace('USDT', '')}")
+                await bot.send_message(TELEGRAM_CHAT_ID, f"📉 Trail + partial · <b>{sym.replace('USDT', '')}</b>")
 
         opened_at = float(tr.get("opened_at") or 0)
         bars_held = int((time.time() - opened_at) / 900) if opened_at else 0
@@ -391,69 +695,193 @@ async def loop_recon(bot):
         await asyncio.sleep(RECONCILE_SEC)
 
 
-@dp.message(Command("start", "help"))
+@dp.message(Command("start", "help", "menu"))
 async def cmd_start(m: types.Message):
-    await m.answer(
-        f"<b>TTM Squeeze Bot</b> (crypto 15m+4H, closed-bar)\n"
-        f"squeeze≥{MIN_SQUEEZE_BARS} | vol≥1.7 | mom rising\n"
-        f"EMA50/200 + 4H + BTC 1H | SL ATR×1.6\n"
-        f"Exit: fade {MOM_FADE_BARS} / time {MAX_HOLD_BARS} bars\n"
-        f"Risk ${RISK_USD} | lev {LEVERAGE}x | max {MAX_POSITIONS}\n\n"
-        f"/scan /auto_on /auto_off /status /resume /panic"
-    )
+    await m.answer(card_help(), reply_markup=kb_main())
 
 
 @dp.message(Command("scan"))
 async def cmd_scan(m: types.Message):
-    await m.answer("Scanning...")
+    await m.answer("📡 <b>Scanning universe…</b>\n15m closed bars · filters active")
     await scan_once(m.bot)
-    await m.answer("Done")
+    await m.answer(
+        f"✅ Scan done\nPositions: <b>{len(state.positions)}/{MAX_POSITIONS}</b>",
+        reply_markup=kb_main(),
+    )
 
 
 @dp.message(Command("auto_on"))
 async def cmd_on(m: types.Message):
     if not trader:
-        await m.answer("No API keys")
+        await m.answer("⚠️ No Bybit API keys — signals only", reply_markup=kb_main())
         return
     if state.blocked():
-        await m.answer(f"Blocked: {state.data.get('blocked_reason')} — /resume")
+        await m.answer(
+            f"🔒 Blocked: <code>{state.data.get('blocked_reason')}</code>\nUse /resume",
+            reply_markup=kb_main(),
+        )
         return
     bal = await trader.balance()
     state.set_enabled(True)
-    await m.answer(f"AUTO ON | balance ${bal or 0:.2f}")
+    await m.answer(
+        f"🟢 <b>AUTO ON</b>\n"
+        f"Balance <b>${(bal or 0):,.2f}</b>\n"
+        f"Risk ${RISK_USD:.0f}/trade · max {MAX_POSITIONS} pos · lev {LEVERAGE:.0f}x",
+        reply_markup=kb_main(),
+    )
 
 
 @dp.message(Command("auto_off"))
 async def cmd_off(m: types.Message):
     state.set_enabled(False)
-    await m.answer("AUTO OFF")
+    await m.answer(
+        "⚪ <b>AUTO OFF</b>\nOnly signals — no new entries",
+        reply_markup=kb_main(),
+    )
 
 
 @dp.message(Command("status"))
 async def cmd_status(m: types.Message):
-    await m.answer(
-        f"Auto: {'ON' if state.enabled() else 'OFF'}\n"
-        f"Blocked: {state.blocked()} {state.data.get('blocked_reason','')}\n"
-        f"Positions: {len(state.positions)}/{MAX_POSITIONS}\n"
-        f"Day PnL: ${state.data.get('daily_pnl', 0):+.2f}"
-    )
+    await m.answer(await card_status(), reply_markup=kb_main())
+
+
+@dp.message(Command("positions", "pos"))
+async def cmd_positions(m: types.Message):
+    text, kb = await card_positions()
+    await m.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("settings", "config"))
+async def cmd_settings(m: types.Message):
+    await m.answer(card_settings(), reply_markup=kb_back())
 
 
 @dp.message(Command("resume"))
 async def cmd_resume(m: types.Message):
     state.unblock()
-    await m.answer("Unblocked")
+    await m.answer("🔓 <b>Unblocked</b> — trading allowed again", reply_markup=kb_main())
 
 
 @dp.message(Command("panic"))
 async def cmd_panic(m: types.Message):
+    closed = 0
     if trader:
         for sym in list(state.positions.keys()):
             await trader.close(sym, state.positions[sym].get("side", "Buy"))
             state.remove_pos(sym)
+            closed += 1
     state.block("panic", 72)
     state.set_enabled(False)
-    await m.answer("PANIC done")
+    await m.answer(
+        f"🛑 <b>PANIC</b>\nClosed: <b>{closed}</b>\nAuto OFF · blocked 72h\n/resume to unlock",
+        reply_markup=kb_main(),
+    )
+
+
+@dp.callback_query(F.data.startswith("cmd:"))
+async def cb_cmd(q: CallbackQuery):
+    action = (q.data or "").split(":", 1)[-1]
+    await q.answer()
+    bot = q.bot
+    chat = q.message.chat.id if q.message else TELEGRAM_CHAT_ID
+
+    if action == "menu" or action == "help":
+        await bot.send_message(chat, card_help(), reply_markup=kb_main())
+    elif action == "scan":
+        await bot.send_message(chat, "📡 <b>Scanning…</b>")
+        await scan_once(bot)
+        await bot.send_message(
+            chat,
+            f"✅ Scan done · pos {len(state.positions)}/{MAX_POSITIONS}",
+            reply_markup=kb_main(),
+        )
+    elif action == "status":
+        await bot.send_message(chat, await card_status(), reply_markup=kb_main())
+    elif action == "settings":
+        await bot.send_message(chat, card_settings(), reply_markup=kb_back())
+    elif action == "positions":
+        text, kb = await card_positions()
+        await bot.send_message(chat, text, reply_markup=kb)
+    elif action == "auto_toggle":
+        if not trader:
+            await bot.send_message(chat, "⚠️ No API keys", reply_markup=kb_main())
+        elif state.blocked():
+            await bot.send_message(
+                chat, f"🔒 Blocked: {state.data.get('blocked_reason')} — /resume",
+                reply_markup=kb_main(),
+            )
+        elif state.enabled():
+            state.set_enabled(False)
+            await bot.send_message(chat, "⚪ AUTO OFF", reply_markup=kb_main())
+        else:
+            bal = await trader.balance()
+            state.set_enabled(True)
+            await bot.send_message(
+                chat,
+                f"🟢 AUTO ON · bal ${(bal or 0):,.2f}",
+                reply_markup=kb_main(),
+            )
+    elif action == "resume":
+        state.unblock()
+        await bot.send_message(chat, "🔓 Unblocked", reply_markup=kb_main())
+    elif action == "panic":
+        closed = 0
+        if trader:
+            for sym in list(state.positions.keys()):
+                await trader.close(sym, state.positions[sym].get("side", "Buy"))
+                state.remove_pos(sym)
+                closed += 1
+        state.block("panic", 72)
+        state.set_enabled(False)
+        await bot.send_message(
+            chat, f"🛑 PANIC · closed {closed} · blocked 72h", reply_markup=kb_main(),
+        )
+
+
+@dp.callback_query(F.data.startswith("enter:"))
+async def cb_enter(q: CallbackQuery):
+    symbol = (q.data or "").split(":", 1)[-1]
+    await q.answer("Opening…")
+    sig = last_signals.get(symbol)
+    if not sig:
+        await q.message.answer(
+            "⚠️ Signal expired — run /scan for a fresh setup",
+            reply_markup=kb_main(),
+        )
+        return
+    ok = await try_enter(q.bot, symbol, sig, notify=True)
+    if not ok and trader and not state.blocked():
+        await q.message.answer(
+            "Could not open (already in position, cooldown, or limit).",
+            reply_markup=kb_main(),
+        )
+
+
+@dp.callback_query(F.data.startswith("close:"))
+async def cb_close(q: CallbackQuery):
+    symbol = (q.data or "").split(":", 1)[-1]
+    await q.answer("Closing…")
+    base = symbol.replace("USDT", "")
+    if not trader:
+        await q.message.answer("⚠️ No API", reply_markup=kb_main())
+        return
+    tr = state.positions.get(symbol)
+    side = (tr or {}).get("side", "Buy")
+    if tr:
+        tr["exit_reason"] = "MANUAL"
+        state.save()
+    res = await trader.close(symbol, side)
+    if res.get("ok"):
+        await on_closed(q.bot, symbol)
+    else:
+        # force local cleanup
+        state.remove_pos(symbol)
+        await q.message.answer(
+            f"⚠️ Close request for <b>{base}</b> — check exchange",
+            reply_markup=kb_main(),
+        )
+
+
 
 
 async def main():
@@ -468,11 +896,16 @@ async def main():
         if trader:
             asyncio.create_task(loop_recon(bot))
         try:
+            mode = "trading" if trader else "signals only"
             await bot.send_message(
                 TELEGRAM_CHAT_ID,
-                f"<b>TTM Squeeze Bot started</b>\n"
-                f"closed-bar only | 4H filter | Risk ${RISK_USD} | "
-                f"{'trading' if trader else 'signals only'}",
+                f"<b>🚀 TTM Squeeze online</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Mode: <b>{mode}</b>\n"
+                f"15m + {htf_label()} · EMA{EMA_FAST}/{EMA_SLOW}\n"
+                f"Risk ${RISK_USD:.0f} · max {MAX_POSITIONS} pos · lev {LEVERAGE:.0f}x\n"
+                f"Closed-bar · BTC filter {'ON' if REQUIRE_BTC_TREND else 'OFF'}",
+                reply_markup=kb_main(),
             )
         except Exception as e:
             log.error(e)
