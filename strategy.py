@@ -1,26 +1,24 @@
 """
-TTM Squeeze strategy — John Carter canon for 15m crypto futures.
+TTM Squeeze — Carter + crypto, CLOSED-BAR only (no intrabar / no HTF lookahead).
 
-Entry long:
-  1. ≥ MIN_SQUEEZE_BARS consecutive bars BB inside KC
-  2. Fire: BB expands (no longer fully inside KC) OR close > BB upper
-  3. Momentum > 0 (hist proxy)
-  4. Volume spike ≥ VOL_SPIKE_MIN
-  5. Close of fire bar bullish
-
-Stop: min low of squeeze zone − buffer (thesis invalid)
-Target: 2R soft TP, then trail; momentum fade exit
+Signal bar = last CLOSED 15m candle (forming candle stripped by caller).
+HTF series must already exclude the incomplete HTF bar.
+VOL_SPIKE and BW_EXPAND evaluated strictly on that signal bar.
 """
 from __future__ import annotations
 from typing import Optional
 
 from config import (
     BB_PERIOD, BB_MULT, KC_EMA, KC_ATR, KC_MULT,
-    MIN_SQUEEZE_BARS, MOM_LENGTH, VOL_SPIKE_MIN,
-    SL_BUFFER_PCT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
-    REQUIRE_EMA50_1H, REQUIRE_CLOSE_OUTSIDE_BB,
+    MIN_SQUEEZE_BARS, MAX_SQUEEZE_BARS, MOM_LENGTH, VOL_SPIKE_MIN,
+    BW_EXPAND_MIN, MOM_MIN_PCT,
+    EMA_FAST, EMA_SLOW, REQUIRE_EMA_STACK,
+    REQUIRE_HTF, HTF_EMA, REQUIRE_BTC_TREND,
+    SL_ATR_MULT, SL_BUFFER_PCT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
 )
-from indicators import bollinger, keltner, bb_inside_kc, momentum_hist, rsi
+from indicators import (
+    bollinger, keltner, bb_inside_kc, momentum_hist, momentum_series, ema, atr,
+)
 
 
 def detect_ttm(
@@ -29,16 +27,18 @@ def detect_ttm(
     lows: list[float],
     closes: list[float],
     volumes: list[float],
-    ema50_1h: float | None = None,
+    htf_closes: Optional[list[float]] = None,
+    btc_htf_closes: Optional[list[float]] = None,
 ) -> Optional[dict]:
-    need = max(BB_PERIOD, KC_EMA, KC_ATR) + MIN_SQUEEZE_BARS + 5
+    need = max(BB_PERIOD, KC_EMA, KC_ATR, EMA_SLOW, MOM_LENGTH) + MIN_SQUEEZE_BARS + 8
     if len(closes) < need:
         return None
 
-    # Build squeeze history (newest last in local lists; we walk oldest→newest)
     n = len(closes)
-    squeeze_flags = []  # True = BB inside KC at bar i
-    for i in range(need - 5, n):
+    start = max(BB_PERIOD + 1, n - (MIN_SQUEEZE_BARS + 14))
+
+    squeeze_flags: list[bool] = []
+    for i in range(start, n):
         bb = bollinger(closes[: i + 1], BB_PERIOD, BB_MULT)
         kc = keltner(highs[: i + 1], lows[: i + 1], closes[: i + 1], KC_EMA, KC_ATR, KC_MULT)
         squeeze_flags.append(bb_inside_kc(bb, kc) if bb and kc else False)
@@ -46,92 +46,121 @@ def detect_ttm(
     if len(squeeze_flags) < MIN_SQUEEZE_BARS + 2:
         return None
 
-    # Consecutive squeeze ending recently (must have been in squeeze)
-    # Look for run of True ending 1–3 bars before last, then fire on last bars
-    max_run = 0
-    cur = 0
-    for f in squeeze_flags:
-        if f:
-            cur += 1
-            max_run = max(max_run, cur)
-        else:
-            cur = 0
-
-    if max_run < MIN_SQUEEZE_BARS:
+    bb_sig = bollinger(closes, BB_PERIOD, BB_MULT)
+    kc_sig = keltner(highs, lows, closes, KC_EMA, KC_ATR, KC_MULT)
+    bb_prev = bollinger(closes[:-1], BB_PERIOD, BB_MULT)
+    kc_prev = keltner(highs[:-1], lows[:-1], closes[:-1], KC_EMA, KC_ATR, KC_MULT)
+    if not all((bb_sig, kc_sig, bb_prev, kc_prev)):
         return None
 
-    # Current bar must be FIRE (not still in full squeeze) OR close > upper
-    bb_now = bollinger(closes, BB_PERIOD, BB_MULT)
-    kc_now = keltner(highs, lows, closes, KC_EMA, KC_ATR, KC_MULT)
-    if not bb_now or not kc_now:
+    in_sq_sig = bb_inside_kc(bb_sig, kc_sig)
+    in_sq_prev = bb_inside_kc(bb_prev, kc_prev)
+    # Fire = first green after reds on CLOSED bars only
+    fired = in_sq_prev and not in_sq_sig
+    if not fired:
         return None
 
-    in_squeeze_now = bb_inside_kc(bb_now, kc_now)
+    # Length of the squeeze run that JUST ENDED (must end at prev bar)
+    # walk back from second-to-last flag (prev = signal-1)
+    run = 0
+    j = len(squeeze_flags) - 2  # prev bar in flags
+    while j >= 0 and squeeze_flags[j]:
+        run += 1
+        j -= 1
+    max_run = run
+    if max_run < MIN_SQUEEZE_BARS or max_run > MAX_SQUEEZE_BARS:
+        return None
+
+    bw_sig = bb_sig["bandwidth"]
+    bw_prev = bb_prev["bandwidth"]
+    if bw_prev <= 0 or bw_sig < bw_prev * BW_EXPAND_MIN:
+        if not (closes[-1] > bb_sig["upper"] or closes[-1] < bb_sig["lower"]):
+            return None
+
     close = closes[-1]
     open_ = opens[-1]
-    upper = bb_now["upper"]
-    lower = bb_now["lower"]
-    mid = bb_now["middle"]
+    mid = bb_sig["middle"]
 
-    # Need recent squeeze then expansion/fire
-    recent_sq = any(squeeze_flags[-(MIN_SQUEEZE_BARS + 3) : -1])
-    if not recent_sq:
-        return None
-
-    if REQUIRE_CLOSE_OUTSIDE_BB:
-        long_fire = close > upper and (not in_squeeze_now or close > upper)
-        short_fire = close < lower and (not in_squeeze_now or close < lower)
-        # classic: must close outside band after squeeze energy
-        long_fire = close > upper
-        short_fire = close < lower
-    else:
-        long_fire = (not in_squeeze_now and close > mid) or (close > upper)
-        short_fire = (not in_squeeze_now and close < mid) or (close < lower)
-
-    mom = momentum_hist(closes, MOM_LENGTH)
+    moms = momentum_series(closes, MOM_LENGTH, lookback=3)
+    mom = moms[-1]
+    mom_1 = moms[-2] if len(moms) >= 2 else None
     if mom is None:
         return None
+    mom_rising = mom_1 is not None and mom > mom_1
+    mom_falling = mom_1 is not None and mom < mom_1
+    mom_strong = abs(mom) / close * 100 >= MOM_MIN_PCT if close else False
 
-    # Volume
     if len(volumes) < 21:
         return None
-    avg_v = sum(volumes[-21:-1]) / 20
+    avg_v = sum(volumes[-21:-1]) / 20.0
     if avg_v <= 0:
         return None
     vol_x = volumes[-1] / avg_v
+    if vol_x < VOL_SPIKE_MIN:
+        return None
 
-    # Zone lows/highs during last squeeze run
+    # Zone extremes from the SAME squeeze run that just ended (prev bar = flags[-2])
     zone_lows, zone_highs = [], []
-    # walk back from end of flags
-    i = len(squeeze_flags) - 1
-    while i >= 0 and not squeeze_flags[i]:
-        i -= 1
+    i = len(squeeze_flags) - 2
     while i >= 0 and squeeze_flags[i]:
-        # map flag index to price index
-        pi = (need - 5) + i
+        pi = start + i
         if 0 <= pi < n:
             zone_lows.append(lows[pi])
             zone_highs.append(highs[pi])
         i -= 1
 
-    side = None
-    if long_fire and mom > 0 and vol_x >= VOL_SPIKE_MIN and close > open_:
-        if REQUIRE_EMA50_1H and ema50_1h is not None and close < ema50_1h:
-            pass  # reject long below EMA50 1h
+    e50 = ema(closes, EMA_FAST)
+    e200 = ema(closes, EMA_SLOW)
+    stack_long = stack_short = False
+    if e50 is not None:
+        if REQUIRE_EMA_STACK and e200 is not None:
+            stack_long = close > e50 > e200
+            stack_short = close < e50 < e200
         else:
-            side = "Buy"
-    elif ALLOW_SHORT and short_fire and mom < 0 and vol_x >= VOL_SPIKE_MIN and close < open_:
-        if REQUIRE_EMA50_1H and ema50_1h is not None and close > ema50_1h:
-            pass  # reject short above EMA50 1h
-        else:
-            side = "Sell"
+            stack_long = close > e50
+            stack_short = close < e50
+
+    htf_long = htf_short = True
+    if REQUIRE_HTF:
+        if htf_closes is None or len(htf_closes) < HTF_EMA + 5:
+            return None
+        htf_e = ema(htf_closes, HTF_EMA)
+        if htf_e is None:
+            return None
+        htf_long = htf_closes[-1] > htf_e
+        htf_short = htf_closes[-1] < htf_e
+
+    btc_ok_long = btc_ok_short = True
+    if REQUIRE_BTC_TREND:
+        if btc_htf_closes is None or len(btc_htf_closes) < HTF_EMA + 5:
+            return None
+        btc_e = ema(btc_htf_closes, HTF_EMA)
+        if btc_e is None:
+            return None
+        btc_ok_long = btc_htf_closes[-1] > btc_e
+        btc_ok_short = btc_htf_closes[-1] < btc_e
+
+    long_ok = (
+        fired and close > mid and close > open_
+        and mom > 0 and mom_rising and mom_strong
+        and stack_long and htf_long and btc_ok_long
+    )
+    short_ok = (
+        ALLOW_SHORT and fired and close < mid and close < open_
+        and mom < 0 and mom_falling and mom_strong
+        and stack_short and htf_short and btc_ok_short
+    )
+
+    side = "Buy" if long_ok else ("Sell" if short_ok else None)
     if side is None:
         return None
 
+    atr_v = atr(highs, lows, closes, 14) or atr(highs, lows, closes, 20)
     entry = close
     if side == "Buy":
-        sl_raw = min(zone_lows) if zone_lows else min(lows[-MIN_SQUEEZE_BARS:])
-        sl = sl_raw * (1 - SL_BUFFER_PCT / 100)
+        sl_zone = (min(zone_lows) if zone_lows else min(lows[-MIN_SQUEEZE_BARS:])) * (1 - SL_BUFFER_PCT / 100)
+        sl_atr = entry - SL_ATR_MULT * atr_v if atr_v else sl_zone
+        sl = min(sl_zone, sl_atr)
         max_sl = entry * (1 - SL_CAP_PCT / 100)
         if sl < max_sl:
             sl = max_sl
@@ -140,8 +169,9 @@ def detect_ttm(
         risk = entry - sl
         tp = entry + TP_R_MULTIPLE * risk
     else:
-        sl_raw = max(zone_highs) if zone_highs else max(highs[-MIN_SQUEEZE_BARS:])
-        sl = sl_raw * (1 + SL_BUFFER_PCT / 100)
+        sl_zone = (max(zone_highs) if zone_highs else max(highs[-MIN_SQUEEZE_BARS:])) * (1 + SL_BUFFER_PCT / 100)
+        sl_atr = entry + SL_ATR_MULT * atr_v if atr_v else sl_zone
+        sl = max(sl_zone, sl_atr)
         max_sl = entry * (1 + SL_CAP_PCT / 100)
         if sl > max_sl:
             sl = max_sl
@@ -151,6 +181,12 @@ def detect_ttm(
         tp = entry - TP_R_MULTIPLE * risk
 
     r_pct = abs(entry - sl) / entry * 100 if entry else 0
+    stars = 1
+    if max_run >= MIN_SQUEEZE_BARS + 2 and vol_x >= 2.0 and (mom_rising if side == "Buy" else mom_falling):
+        stars = 3
+    elif max_run >= MIN_SQUEEZE_BARS + 1 and vol_x >= 1.8:
+        stars = 2
+
     return {
         "side": side,
         "signal_type": "TTM_LONG" if side == "Buy" else "TTM_SHORT",
@@ -162,6 +198,11 @@ def detect_ttm(
         "squeeze_bars": max_run,
         "momentum": round(mom, 8),
         "vol_spike": round(vol_x, 2),
-        "bb_bandwidth": round(bb_now["bandwidth"], 2),
-        "stars": 2 if max_run >= MIN_SQUEEZE_BARS + 2 and vol_x >= 1.4 else 1,
+        "bb_bandwidth": round(bw_sig, 2),
+        "stars": stars,
+        "fired": True,
+        "trend_ok": stack_long if side == "Buy" else stack_short,
+        "htf_ok": htf_long if side == "Buy" else htf_short,
+        "btc_ok": btc_ok_long if side == "Buy" else btc_ok_short,
+        "atr": atr_v,
     }

@@ -1,4 +1,4 @@
-"""TTM indicators: BB, KC, ATR, momentum, RSI."""
+"""TTM indicators: BB, KC, ATR, momentum (Carter/LazyBear linreg), EMA."""
 from __future__ import annotations
 import math
 from typing import Optional
@@ -12,6 +12,12 @@ def ema(values: list[float], period: int) -> Optional[float]:
     for v in values[period:]:
         e = v * k + e * (1 - k)
     return e
+
+
+def sma(values: list[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
 
 def rsi(closes: list[float], period: int = 14) -> Optional[float]:
@@ -73,17 +79,35 @@ def bb_inside_kc(bb: dict, kc: dict) -> bool:
     return bb["upper"] <= kc["upper"] and bb["lower"] >= kc["lower"]
 
 
-def momentum_hist(closes: list[float], length: int = 12) -> Optional[float]:
-    """Carter-style momentum proxy: close - midline of HH/LL and SMA over length.
-    Positive = bullish bias for long on fire.
-    """
-    if len(closes) < length + 1:
+def _linreg_at_end(ys: list[float]) -> float:
+    n = len(ys)
+    if n < 2:
+        return ys[-1] if ys else 0.0
+    sx = (n - 1) * n / 2.0
+    sy = sum(ys)
+    sxy = sum(i * y for i, y in enumerate(ys))
+    sx2 = (n - 1) * n * (2 * n - 1) / 6.0
+    denom = n * sx2 - sx * sx
+    if abs(denom) < 1e-12:
+        return sy / n
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    return intercept + slope * (n - 1)
+
+
+def momentum_hist(closes: list[float], length: int = 20) -> Optional[float]:
+    if len(closes) < length:
         return None
-    window = closes[-(length + 1) : -1] if len(closes) > length else closes[:-1]
-    if len(window) < length:
-        window = closes[-length:]
-    hh = max(window)
-    ll = min(window)
-    sma = sum(window) / len(window)
-    midline = ((hh + ll) / 2 + sma) / 2
-    return closes[-1] - midline
+    window = closes[-length:]
+    hh, ll = max(window), min(window)
+    sma_v = sum(window) / length
+    midline = ((hh + ll) / 2.0 + sma_v) / 2.0
+    return _linreg_at_end([c - midline for c in window])
+
+
+def momentum_series(closes: list[float], length: int = 20, lookback: int = 3) -> list[Optional[float]]:
+    out: list[Optional[float]] = []
+    for i in range(lookback, 0, -1):
+        end = len(closes) - (i - 1)
+        out.append(None if end < length else momentum_hist(closes[:end], length))
+    return out

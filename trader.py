@@ -9,39 +9,50 @@ log = logging.getLogger("trader")
 
 
 class BybitTrader:
-    def __init__(self, key, secret, base_url="https://api-demo.bybit.com"):
+    def __init__(self, key, secret, base_url="https://api-demo.bybit.com", session: Optional[aiohttp.ClientSession] = None):
         self.key, self.secret, self.base = key, secret, base_url.rstrip("/")
+        self._session = session  # shared session from bot.main (optional)
         self._inst = {}
         self._mode = None
+        self._owns_session = session is None
 
     def _sign(self, ts, payload):
         return hmac.new(self.secret.encode(), f"{ts}{self.key}5000{payload}".encode(), hashlib.sha256).hexdigest()
 
+    async def _session_ctx(self):
+        """Yield a session: shared if provided, else temporary."""
+        if self._session is not None and not self._session.closed:
+            return self._session, False  # shared, do not close
+        return aiohttp.ClientSession(), True  # own, must close
+
     async def _req(self, method, path, params=None):
         params = params or {}
         ts = str(int(time.time() * 1000))
+        s, own = await self._session_ctx()
         try:
-            async with aiohttp.ClientSession() as s:
-                if method == "GET":
-                    q = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-                    headers = {
-                        "X-BAPI-API-KEY": self.key, "X-BAPI-SIGN": self._sign(ts, q),
-                        "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000",
-                    }
-                    url = f"{self.base}{path}" + (f"?{q}" if q else "")
-                    async with s.get(url, headers=headers, timeout=15) as r:
-                        return await r.json(content_type=None)
-                body = json.dumps(params, separators=(",", ":"))
+            if method == "GET":
+                q = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
                 headers = {
-                    "X-BAPI-API-KEY": self.key, "X-BAPI-SIGN": self._sign(ts, body),
+                    "X-BAPI-API-KEY": self.key, "X-BAPI-SIGN": self._sign(ts, q),
                     "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000",
-                    "Content-Type": "application/json",
                 }
-                async with s.post(f"{self.base}{path}", data=body, headers=headers, timeout=15) as r:
+                url = f"{self.base}{path}" + (f"?{q}" if q else "")
+                async with s.get(url, headers=headers, timeout=15) as r:
                     return await r.json(content_type=None)
+            body = json.dumps(params, separators=(",", ":"))
+            headers = {
+                "X-BAPI-API-KEY": self.key, "X-BAPI-SIGN": self._sign(ts, body),
+                "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000",
+                "Content-Type": "application/json",
+            }
+            async with s.post(f"{self.base}{path}", data=body, headers=headers, timeout=15) as r:
+                return await r.json(content_type=None)
         except Exception as e:
             log.error(f"{method} {path}: {e}")
             return {"retCode": -1, "retMsg": str(e)}
+        finally:
+            if own:
+                await s.close()
 
     async def balance(self) -> Optional[float]:
         r = await self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
@@ -58,7 +69,8 @@ class BybitTrader:
     async def instruments(self):
         if self._inst:
             return self._inst
-        async with aiohttp.ClientSession() as s:
+        s, own = await self._session_ctx()
+        try:
             cursor = ""
             while True:
                 p = {"category": "linear", "limit": 1000}
@@ -78,6 +90,9 @@ class BybitTrader:
                 cursor = data.get("result", {}).get("nextPageCursor", "")
                 if not cursor:
                     break
+        finally:
+            if own:
+                await s.close()
         return self._inst
 
     async def ensure_mode(self):
@@ -104,13 +119,17 @@ class BybitTrader:
         return f"{v:.{d}f}"
 
     async def last_price(self, symbol) -> Optional[float]:
-        async with aiohttp.ClientSession() as s:
+        s, own = await self._session_ctx()
+        try:
             async with s.get(f"{self.base}/v5/market/tickers", params={"category": "linear", "symbol": symbol}, timeout=10) as r:
                 d = await r.json(content_type=None)
             try:
                 return float(d["result"]["list"][0]["lastPrice"])
             except Exception:
                 return None
+        finally:
+            if own:
+                await s.close()
 
     async def set_leverage(self, symbol, lev):
         await self._req("POST", "/v5/position/set-leverage", {
@@ -194,7 +213,7 @@ class BybitTrader:
         r = await self._req("POST", "/v5/position/trading-stop", {
             "category": "linear", "symbol": symbol,
             "trailingStop": self._fmt(dist, inst["tick"]),
-            "takeProfit": "0", "tpslMode": "Full",
+            "tpslMode": "Full",
             "positionIdx": self.idx(side),
         })
         return {"ok": r.get("retCode") in (0, 34040)}
