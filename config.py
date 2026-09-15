@@ -72,3 +72,43 @@ MOM_FADE_BARS = int(os.getenv("MOM_FADE_BARS", "2"))
 
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 USE_CLOSED_BARS_ONLY = os.getenv("USE_CLOSED_BARS_ONLY", "true").lower() == "true"
+
+
+# ============================================================================
+# Pullback entry engine (v2): avoid chasing breakouts / buying at local highs.
+#
+# Research basis:
+#  - Carter/TTM Squeeze: fire = first bar BB re-emerges outside KC, direction from
+#    momentum histogram (rising & positive = long). Squeeze should run >=5-6 bars.
+#  - Classic trend-following literature (pullback playbooks): never buy the initial
+#    breakout — wait for price to retrace toward the fast EMA / broken level and
+#    confirm with a bullish (or bearish) reversal candle before entering.
+#  - Overextension filters: reject entries where price is already too many ATRs
+#    away from its EMA (a stretched candle = chasing, not a low-risk entry).
+#  - RSI sanity: avoid arming/entering when RSI is already at an exhausted extreme,
+#    since strong trends can still hold overbought/oversold but the edge is worse.
+# ============================================================================
+ENTRY_MODE = os.getenv("ENTRY_MODE", "pullback")  # "pullback" (recommended) or "breakout" (legacy instant-fire entry)
+
+# How long (in closed 15m bars) we keep watching a fired squeeze for a valid pullback+reclaim
+PULLBACK_MAX_BARS = int(os.getenv("PULLBACK_MAX_BARS", "8"))
+PULLBACK_MIN_BARS = int(os.getenv("PULLBACK_MIN_BARS", "1"))
+
+# Reject a fresh squeeze-fire from being armed at all if price is already this many
+# ATRs away from EMA_FAST -- i.e. the move already ran too far to call it a low-risk entry.
+EXT_ATR_MAX_FIRE = float(os.getenv("EXT_ATR_MAX_FIRE", "2.5"))
+
+# RSI sanity bands (14-period). Reject/­don't-confirm entries when RSI is at an exhausted extreme.
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+RSI_LONG_MIN = float(os.getenv("RSI_LONG_MIN", "45"))
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "78"))
+RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "22"))
+RSI_SHORT_MAX = float(os.getenv("RSI_SHORT_MAX", "55"))
+
+# Confirmation bar (the bar that actually triggers entry after the pullback) must show
+# renewed participation: its volume must be at least this multiple of the 20-bar average.
+PULLBACK_CONFIRM_VOL_MIN = float(os.getenv("PULLBACK_CONFIRM_VOL_MIN", "1.0"))
+
+# Trailing-stop distance is now ATR-based (1.5-2x ATR is the literature-standard range)
+# instead of a flat percent, so it adapts per-symbol volatility. Set to 0 to keep legacy TRAIL_PCT.
+TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.8"))

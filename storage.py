@@ -15,6 +15,7 @@ class State:
             "blocked_reason": "",
             "positions": {},
             "cooldown": {},
+            "armed": {},   # symbol -> pending pullback setup (fired but not yet confirmed)
         }
         self._load()
 
@@ -72,6 +73,17 @@ class State:
 
     def remove_pos(self, symbol):
         self.positions.pop(symbol, None)
+        self.save()
+
+    @property
+    def armed(self): return self.data.setdefault("armed", {})
+
+    def arm(self, symbol, **kw):
+        self.armed[symbol] = {**kw, "armed_at": time.time()}
+        self.save()
+
+    def disarm(self, symbol):
+        self.armed.pop(symbol, None)
         self.save()
 
     def cool(self, symbol, hours):

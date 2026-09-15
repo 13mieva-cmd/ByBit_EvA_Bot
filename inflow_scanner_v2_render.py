@@ -32,11 +32,19 @@ from config import (
     USE_CLOSED_BARS_ONLY, VOL_SPIKE_MIN, BW_EXPAND_MIN, EMA_FAST, EMA_SLOW,
     REQUIRE_EMA_STACK, SL_ATR_MULT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
     DEPOSIT_USD, RISK_PCT,
+    ENTRY_MODE, PULLBACK_MAX_BARS, PULLBACK_MIN_BARS, EXT_ATR_MAX_FIRE,
+    RSI_LONG_MIN, RSI_LONG_MAX, RSI_SHORT_MIN, RSI_SHORT_MAX, TRAIL_ATR_MULT,
 )
-from strategy import detect_ttm
+from strategy import detect_ttm, check_pullback_entry
 from storage import State, append_csv
 from trader import BybitTrader
-from indicators import momentum_hist, momentum_series
+from indicators import momentum_hist, momentum_series, atr as atr_ind
+
+# Bars required by detect_ttm(): max(BB_PERIOD, KC_EMA, KC_ATR, EMA_SLOW, MOM_LENGTH) + MIN_SQUEEZE_BARS + 8.
+# Scan-fetch limit MUST always be >= that, with margin, or detect_ttm() silently returns None every time.
+SCAN_KLINE_LIMIT = max(220, EMA_SLOW + MIN_SQUEEZE_BARS + 40)
+# Klines needed for the pullback-watch loop: only needs to cover fire bar + PULLBACK_MAX_BARS + indicator warmup
+ARMED_KLINE_LIMIT = max(SCAN_KLINE_LIMIT, EMA_SLOW + PULLBACK_MAX_BARS + 40)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ttm")
@@ -66,11 +74,14 @@ def kb_main() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📂 Positions", callback_data="cmd:positions"),
         ],
         [
-            InlineKeyboardButton(text="📖 Help", callback_data="cmd:help"),
+            InlineKeyboardButton(text="🔭 Watching", callback_data="cmd:armed"),
             InlineKeyboardButton(text="⚙️ Settings", callback_data="cmd:settings"),
         ],
         [
+            InlineKeyboardButton(text="📖 Help", callback_data="cmd:help"),
             InlineKeyboardButton(text="▶️ Resume", callback_data="cmd:resume"),
+        ],
+        [
             InlineKeyboardButton(text="🛑 PANIC", callback_data="cmd:panic"),
         ],
     ])
@@ -127,7 +138,18 @@ def card_help() -> str:
         f"• Squeeze {MIN_SQUEEZE_BARS}–{MAX_SQUEEZE_BARS} bars → FIRE\n"
         f"• BW expand ≥{BW_EXPAND_MIN}x · Vol ≥{VOL_SPIKE_MIN}x\n"
         f"• Momentum rising · bullish close\n"
+        f"• Not overextended: ≤{EXT_ATR_MAX_FIRE}×ATR from EMA{EMA_FAST} at fire\n"
+        f"• RSI sanity: long {RSI_LONG_MIN}-{RSI_LONG_MAX} · short {RSI_SHORT_MIN}-{RSI_SHORT_MAX}\n"
         f"• Long only: {'yes' if not ALLOW_SHORT else 'long+short'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Entry mode:</b> <code>{ENTRY_MODE.upper()}</code>\n"
+        + (
+            f"• Fire = watch-only. Bot waits up to {PULLBACK_MAX_BARS} bars for price to "
+            f"pull back to EMA{EMA_FAST} and reclaim with a confirming candle — "
+            f"never buys the breakout bar itself.\n"
+            if ENTRY_MODE != "breakout" else
+            f"• Legacy: enters immediately on the fire bar (chases the breakout).\n"
+        ) +
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Risk</b>\n"
         f"• Risk ${RISK_USD:.0f}/trade ({RISK_PCT}% of ${DEPOSIT_USD:.0f})\n"
@@ -156,8 +178,12 @@ def card_settings() -> str:
         f"cooldown <code>{COOLDOWN_HOURS}h</code>\n"
         f"Closed bars: <code>{USE_CLOSED_BARS_ONLY}</code>\n"
         f"API: <code>{BYBIT_BASE_URL.replace('https://','')}</code>\n"
-        f"Trail <code>{TRAIL_PCT}%</code> · "
-        f"BTC 15m gate <code>{BTC_15M_MIN}%</code>"
+        f"Trail <code>{TRAIL_ATR_MULT}xATR</code> · "
+        f"BTC 15m gate <code>{BTC_15M_MIN}%</code>\n"
+        f"Entry mode <code>{ENTRY_MODE}</code> · "
+        f"pullback window <code>{PULLBACK_MAX_BARS} bars</code>\n"
+        f"Ext filter <code>{EXT_ATR_MAX_FIRE}xATR</code> · "
+        f"RSI long <code>{RSI_LONG_MIN}-{RSI_LONG_MAX}</code> short <code>{RSI_SHORT_MIN}-{RSI_SHORT_MAX}</code>"
     )
 
 
@@ -180,6 +206,7 @@ async def card_status() -> str:
         f"Auto: <b>{auto}</b>",
         f"Blocked: <b>{'🔒 ' + reason if blk else '🔓 no'}</b>",
         f"Positions: <b>{npos}/{MAX_POSITIONS}</b>",
+        f"Watching (pullback): <b>{len(state.armed)}</b>",
         f"Day PnL: <b>${pnl_s}</b>",
     ]
     if bal is not None:
@@ -217,11 +244,11 @@ def card_signal(sig: dict, symbol: str) -> str:
     filters = []
     if sig.get("fired"):
         filters.append("FIRE")
-    if sig.get("trend_ok"):
+    if REQUIRE_EMA_STACK and sig.get("trend_ok"):
         filters.append(f"EMA{EMA_FAST}/{EMA_SLOW}")
-    if sig.get("htf_ok"):
+    if REQUIRE_HTF and sig.get("htf_ok"):
         filters.append(htf_label())
-    if sig.get("btc_ok"):
+    if REQUIRE_BTC_TREND and sig.get("btc_ok"):
         filters.append("BTC")
     filt = " · ".join(filters) if filters else "—"
     usd = size_usd(sig["sl_pct"])
@@ -243,7 +270,25 @@ def card_signal(sig: dict, symbol: str) -> str:
         f"(+{sig['tp_pct']:.2f}%)\n"
         f"Size ≈ <code>${usd:.0f}</code> · lev {LEVERAGE:.0f}x\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Closed-bar signal · 15m</i>"
+        f"<i>{'Pullback-confirmed entry' if 'PULLBACK' in sig.get('signal_type','') else 'Closed-bar signal'} · 15m</i>"
+    )
+
+
+def card_watch(sig: dict, symbol: str) -> str:
+    base = symbol.replace("USDT", "")
+    side = "LONG 🟢" if sig["side"] == "Buy" else "SHORT 🔴"
+    level = sig["zone_low"] if sig["side"] == "Buy" else sig["zone_high"]
+    return (
+        f"<b>🔭 Watching · {side}</b> — <b>{base}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Squeeze fired (<code>{sig['squeeze_bars']}</code> bars · vol <code>x{sig['vol_spike']}</code>) — "
+        f"NOT entering on the breakout bar.\n"
+        f"Waiting up to <code>{PULLBACK_MAX_BARS}</code> bars for a pullback to EMA{EMA_FAST} "
+        f"with a reclaim candle.\n"
+        f"RSI at fire: <code>{sig.get('rsi')}</code>\n"
+        f"Setup invalidates if price closes back through <code>${level:.6g}</code>.\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Watch-only — no entry yet.</i>"
     )
 
 
@@ -279,6 +324,11 @@ def card_closed(symbol: str, pnl, reason: str | None) -> str:
 
 
 def card_positions_empty() -> str:
+    armed_n = len(state.armed)
+    watch_line = (
+        f"\n🔭 <b>{armed_n}</b> setup(s) watching for a pullback right now."
+        if armed_n else ""
+    )
     return (
         f"<b>📂 Positions</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -287,6 +337,7 @@ def card_positions_empty() -> str:
         f"Бот ждёт TTM fire на 15m с фильтрами "
         f"{htf_label()} + EMA{EMA_FAST}/{EMA_SLOW}"
         f"{' + BTC' if REQUIRE_BTC_TREND else ''}."
+        f"{watch_line}"
     )
 
 
@@ -356,10 +407,6 @@ def allowed(msg) -> bool:
 @dp.message.middleware()
 async def auth_mw(handler, event, data):
     if isinstance(event, types.Message) and not allowed(event):
-        log.warning("auth deny uid=%s cid=%s text=%s",
-                    getattr(getattr(event, "from_user", None), "id", None),
-                    getattr(getattr(event, "chat", None), "id", None),
-                    getattr(event, "text", None))
         try:
             await event.answer("No access")
         except Exception:
@@ -424,7 +471,7 @@ def _strip_forming(kl: dict) -> dict:
     return {k: v[:-1] for k, v in kl.items()}
 
 
-async def klines(session, symbol, interval="15", limit=120, closed_only: bool | None = None):
+async def klines(session, symbol, interval="15", limit=250, closed_only: bool | None = None):
     if closed_only is None:
         closed_only = USE_CLOSED_BARS_ONLY
     d = await fetch(session, "/v5/market/kline", {
@@ -520,6 +567,41 @@ async def try_enter(bot, symbol, sig, notify: bool = True) -> bool:
     return True
 
 
+async def process_armed(bot: Bot, session):
+    """
+    Stage 2 of the entry engine: for every symbol with a pending (armed) squeeze-fire,
+    check whether a valid pullback + reclaim has happened yet. Runs BEFORE the universe
+    scan and independently of the top-N turnover ranking, so a setup is never lost just
+    because the coin temporarily drops out of the top MAX_SYMBOLS by volume.
+    """
+    for sym in list(state.armed.keys()):
+        armed = state.armed[sym]
+        kl = await klines(session, sym, limit=ARMED_KLINE_LIMIT, closed_only=True)
+        if not kl:
+            continue
+        res = check_pullback_entry(kl["o"], kl["h"], kl["l"], kl["c"], kl["v"], kl["ts"], armed)
+        if res is None:
+            continue
+        if res.get("expired") or res.get("invalid"):
+            state.disarm(sym)
+            why = "expired (no pullback in time)" if res.get("expired") else "invalidated (structure broken)"
+            await bot.send_message(
+                TELEGRAM_CHAT_ID,
+                f"⌛ <b>{sym.replace('USDT', '')}</b> pullback setup {why} — no entry.",
+                reply_markup=kb_back(),
+            )
+            continue
+        state.disarm(sym)
+        last_alert[sym] = time.time()
+        last_signals[sym] = res
+        await bot.send_message(
+            TELEGRAM_CHAT_ID, card_signal(res, sym), reply_markup=kb_signal(sym, res["side"]),
+        )
+        if trader and state.enabled() and not state.blocked():
+            await try_enter(bot, sym, res, notify=True)
+        await asyncio.sleep(0.08)
+
+
 async def scan_once(bot: Bot):
     session = http
     if session is None or session.closed:
@@ -528,6 +610,9 @@ async def scan_once(bot: Bot):
     if not await btc_ok(session):
         log.info("BTC filter skip")
         return
+
+    await process_armed(bot, session)
+
     btc_htf = None
     if REQUIRE_BTC_TREND:
         btc_htf = await htf_closes(session, "BTCUSDT", interval=BTC_HTF_INTERVAL)
@@ -536,9 +621,11 @@ async def scan_once(bot: Bot):
     n = 0
     for c in coins:
         sym = c["symbol"]
+        if sym in state.armed:
+            continue
         if time.time() - last_alert.get(sym, 0) < 4 * 3600:
             continue
-        kl = await klines(session, sym, limit=120, closed_only=True)
+        kl = await klines(session, sym, limit=SCAN_KLINE_LIMIT, closed_only=True)
         if not kl:
             continue
         htf = await htf_closes(session, sym) if REQUIRE_HTF else None
@@ -549,17 +636,33 @@ async def scan_once(bot: Bot):
         if not sig:
             continue
         n += 1
-        last_alert[sym] = time.time()
-        last_signals[sym] = sig
-        text = card_signal(sig, sym)
-        await bot.send_message(
-            TELEGRAM_CHAT_ID, text, reply_markup=kb_signal(sym, sig["side"]),
-        )
-        if trader and state.enabled() and not state.blocked():
-            await try_enter(bot, sym, sig, notify=True)
+
+        if ENTRY_MODE == "breakout":
+            last_alert[sym] = time.time()
+            last_signals[sym] = sig
+            await bot.send_message(
+                TELEGRAM_CHAT_ID, card_signal(sig, sym), reply_markup=kb_signal(sym, sig["side"]),
+            )
+            if trader and state.enabled() and not state.blocked():
+                await try_enter(bot, sym, sig, notify=True)
+        else:
+            state.arm(
+                sym,
+                side=sig["side"],
+                fired_ts=kl["ts"][-1],
+                zone_low=sig["zone_low"],
+                zone_high=sig["zone_high"],
+                meta={
+                    "squeeze_bars": sig["squeeze_bars"], "vol_spike": sig["vol_spike"],
+                    "bb_bandwidth": sig["bb_bandwidth"], "momentum": sig["momentum"],
+                    "stars": sig["stars"],
+                },
+            )
+            await bot.send_message(TELEGRAM_CHAT_ID, card_watch(sig, sym), reply_markup=kb_back())
 
         await asyncio.sleep(0.08)
-    log.info("Scan done alerts=%s", n)
+    log.info("Scan done alerts=%s armed=%s", n, len(state.armed))
+
 
 
 async def on_closed(bot, symbol):
@@ -621,6 +724,13 @@ async def reconcile(bot: Bot):
             continue
         gain_r = ((mark - entry) if side == "Buy" else (entry - mark)) / risk
 
+        if http is None or http.closed:
+            continue
+        kl = await klines(http, sym, "15", 40, closed_only=True)
+        if not kl or len(kl["c"]) < MOM_LENGTH + 3:
+            continue
+        c = kl["c"]
+
         if not tr.get("be") and gain_r >= BE_TRIGGER_R:
             be_sl = entry * (1.001 if side == "Buy" else 0.999)
             if (await trader.set_sl(sym, be_sl, side)).get("ok"):
@@ -633,28 +743,27 @@ async def reconcile(bot: Bot):
                 if (await trader.partial(sym, PARTIAL_PCT)).get("ok"):
                     tr["partial"] = True
                     state.save()
-            if (await trader.set_trail(sym, TRAIL_PCT, side)).get("ok"):
+            trail_pct = TRAIL_PCT
+            if TRAIL_ATR_MULT > 0:
+                atr_v = atr_ind(kl["h"], kl["l"], kl["c"], 14) or atr_ind(kl["h"], kl["l"], kl["c"], 20)
+                if atr_v and mark:
+                    trail_pct = max(0.1, (TRAIL_ATR_MULT * atr_v / mark) * 100)
+            if (await trader.set_trail(sym, trail_pct, side)).get("ok"):
                 tr["trail"] = True
                 state.save()
-                await bot.send_message(TELEGRAM_CHAT_ID, f"📉 Trail + partial · <b>{sym.replace('USDT', '')}</b>")
+                await bot.send_message(
+                    TELEGRAM_CHAT_ID,
+                    f"📉 Trail ({trail_pct:.2f}%) + partial · <b>{sym.replace('USDT', '')}</b>",
+                )
 
         opened_at = float(tr.get("opened_at") or 0)
         bars_held = int((time.time() - opened_at) / 900) if opened_at else 0
 
-        if http is None or http.closed:
-            continue
-        kl = await klines(http, sym, "15", 40, closed_only=True)
-        if not kl or len(kl["c"]) < MOM_LENGTH + 3:
-            continue
-
-        # Fade via reverse indices on closed series: [-1]=now, [-2]=prev, [-3]=prev2
-        c = kl["c"]
-        mom_1 = momentum_hist(c, MOM_LENGTH)            # bar [-1]
-        mom_2 = momentum_hist(c[:-1], MOM_LENGTH)        # bar [-2]
+        mom_1 = momentum_hist(c, MOM_LENGTH)
+        mom_2 = momentum_hist(c[:-1], MOM_LENGTH)
         mom_3 = momentum_hist(c[:-2], MOM_LENGTH) if MOM_FADE_BARS >= 2 else None
         fade = False
         if side == "Buy" and mom_1 is not None and mom_2 is not None:
-            # consecutive fade: still >0 but decreasing toward zero
             if MOM_FADE_BARS >= 2 and mom_3 is not None:
                 fade = (mom_1 > 0 and mom_2 > 0 and mom_3 > 0
                         and mom_1 < mom_2 and mom_2 < mom_3)
@@ -663,7 +772,7 @@ async def reconcile(bot: Bot):
         elif side == "Sell" and mom_1 is not None and mom_2 is not None:
             if MOM_FADE_BARS >= 2 and mom_3 is not None:
                 fade = (mom_1 < 0 and mom_2 < 0 and mom_3 < 0
-                        and mom_1 > mom_2 and mom_2 > mom_3)  # less negative = fading
+                        and mom_1 > mom_2 and mom_2 > mom_3)
             else:
                 fade = mom_1 < 0 and mom_2 < 0 and mom_1 > mom_2
 
@@ -679,6 +788,7 @@ async def reconcile(bot: Bot):
             tr["exit_reason"] = "TIME_STOP"
             state.save()
             await on_closed(bot, sym)
+
 
 
 async def loop_scan(bot):
@@ -699,24 +809,9 @@ async def loop_recon(bot):
         await asyncio.sleep(RECONCILE_SEC)
 
 
-@dp.message(Command("start"))
-@dp.message(Command("help"))
-@dp.message(Command("menu"))
+@dp.message(Command("start", "help", "menu"))
 async def cmd_start(m: types.Message):
-    try:
-        await m.answer(card_help(), reply_markup=kb_main())
-    except Exception as e:
-        log.exception("help/start failed: %s", e)
-        try:
-            await m.answer(
-                "TTM Squeeze Bot\n"
-                f"/scan /status /positions /settings\n"
-                f"/auto_on /auto_off /resume /panic\n"
-                f"Risk ${RISK_USD:.0f} | max {MAX_POSITIONS} | lev {LEVERAGE:.0f}x",
-                reply_markup=kb_main(),
-            )
-        except Exception:
-            await m.answer("Bot online. Use /status")
+    await m.answer(card_help(), reply_markup=kb_main())
 
 
 @dp.message(Command("scan"))
@@ -770,6 +865,21 @@ async def cmd_positions(m: types.Message):
     await m.answer(text, reply_markup=kb)
 
 
+@dp.message(Command("armed", "watching"))
+async def cmd_armed(m: types.Message):
+    if not state.armed:
+        await m.answer("🔭 No setups currently watching for a pullback.", reply_markup=kb_main())
+        return
+    lines = ["<b>🔭 Watching for pullback</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    now = time.time()
+    for sym, a in state.armed.items():
+        base = sym.replace("USDT", "")
+        side = "LONG" if a.get("side") == "Buy" else "SHORT"
+        age_bars = int((now - float(a.get("armed_at") or now)) / 900)
+        lines.append(f"• <b>{base}</b> {side} · {age_bars}/{PULLBACK_MAX_BARS} bars")
+    await m.answer("\n".join(lines), reply_markup=kb_main())
+
+
 @dp.message(Command("settings", "config"))
 async def cmd_settings(m: types.Message):
     await m.answer(card_settings(), reply_markup=kb_back())
@@ -805,11 +915,7 @@ async def cb_cmd(q: CallbackQuery):
     chat = q.message.chat.id if q.message else TELEGRAM_CHAT_ID
 
     if action == "menu" or action == "help":
-        try:
-            await bot.send_message(chat, card_help(), reply_markup=kb_main())
-        except Exception as e:
-            log.exception("callback help: %s", e)
-            await bot.send_message(chat, "Help temporarily unavailable. /status", reply_markup=kb_main())
+        await bot.send_message(chat, card_help(), reply_markup=kb_main())
     elif action == "scan":
         await bot.send_message(chat, "📡 <b>Scanning…</b>")
         await scan_once(bot)
@@ -825,6 +931,18 @@ async def cb_cmd(q: CallbackQuery):
     elif action == "positions":
         text, kb = await card_positions()
         await bot.send_message(chat, text, reply_markup=kb)
+    elif action == "armed":
+        if not state.armed:
+            await bot.send_message(chat, "🔭 No setups currently watching for a pullback.", reply_markup=kb_main())
+        else:
+            lines = ["<b>🔭 Watching for pullback</b>", "━━━━━━━━━━━━━━━━━━━━"]
+            now = time.time()
+            for sym, a in state.armed.items():
+                base = sym.replace("USDT", "")
+                side = "LONG" if a.get("side") == "Buy" else "SHORT"
+                age_bars = int((now - float(a.get("armed_at") or now)) / 900)
+                lines.append(f"• <b>{base}</b> {side} · {age_bars}/{PULLBACK_MAX_BARS} bars")
+            await bot.send_message(chat, "\n".join(lines), reply_markup=kb_main())
     elif action == "auto_toggle":
         if not trader:
             await bot.send_message(chat, "⚠️ No API keys", reply_markup=kb_main())
@@ -866,15 +984,18 @@ async def cb_enter(q: CallbackQuery):
     symbol = (q.data or "").split(":", 1)[-1]
     await q.answer("Opening…")
     sig = last_signals.get(symbol)
+    chat_id = q.message.chat.id if q.message else TELEGRAM_CHAT_ID
     if not sig:
-        await q.message.answer(
+        await q.bot.send_message(
+            chat_id,
             "⚠️ Signal expired — run /scan for a fresh setup",
             reply_markup=kb_main(),
         )
         return
     ok = await try_enter(q.bot, symbol, sig, notify=True)
     if not ok and trader and not state.blocked():
-        await q.message.answer(
+        await q.bot.send_message(
+            chat_id,
             "Could not open (already in position, cooldown, or limit).",
             reply_markup=kb_main(),
         )
@@ -897,10 +1018,10 @@ async def cb_close(q: CallbackQuery):
     if res.get("ok"):
         await on_closed(q.bot, symbol)
     else:
-        # force local cleanup
-        state.remove_pos(symbol)
+        # keep local position bookkeeping intact (position is likely still open on exchange);
+        # reconcile() will pick it up on the next pass instead of us silently losing track of it
         await q.message.answer(
-            f"⚠️ Close request for <b>{base}</b> — check exchange",
+            f"⚠️ Close failed for <b>{base}</b> — position kept in tracking, will retry via reconcile",
             reply_markup=kb_main(),
         )
 

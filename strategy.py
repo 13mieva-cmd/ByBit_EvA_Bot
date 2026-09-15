@@ -15,9 +15,12 @@ from config import (
     EMA_FAST, EMA_SLOW, REQUIRE_EMA_STACK,
     REQUIRE_HTF, HTF_EMA, REQUIRE_BTC_TREND,
     SL_ATR_MULT, SL_BUFFER_PCT, SL_CAP_PCT, TP_R_MULTIPLE, ALLOW_SHORT,
+    EXT_ATR_MAX_FIRE, RSI_PERIOD, RSI_LONG_MIN, RSI_LONG_MAX,
+    RSI_SHORT_MIN, RSI_SHORT_MAX, PULLBACK_MIN_BARS, PULLBACK_MAX_BARS,
+    PULLBACK_CONFIRM_VOL_MIN,
 )
 from indicators import (
-    bollinger, keltner, bb_inside_kc, momentum_hist, momentum_series, ema, atr,
+    bollinger, keltner, bb_inside_kc, momentum_hist, momentum_series, ema, atr, rsi,
 )
 
 
@@ -140,22 +143,34 @@ def detect_ttm(
         btc_ok_long = btc_htf_closes[-1] > btc_e
         btc_ok_short = btc_htf_closes[-1] < btc_e
 
+    # --- Anti-chasing filters (avoid "buying the top / selling the bottom") ---
+    atr_v = atr(highs, lows, closes, 14) or atr(highs, lows, closes, 20)
+    not_overextended = True
+    if e50 is not None and atr_v:
+        ext_atr = abs(close - e50) / atr_v
+        not_overextended = ext_atr <= EXT_ATR_MAX_FIRE
+
+    rsi_v = rsi(closes, RSI_PERIOD)
+    rsi_ok_long = rsi_v is not None and RSI_LONG_MIN <= rsi_v <= RSI_LONG_MAX
+    rsi_ok_short = rsi_v is not None and RSI_SHORT_MIN <= rsi_v <= RSI_SHORT_MAX
+
     long_ok = (
         fired and close > mid and close > open_
         and mom > 0 and mom_rising and mom_strong
         and stack_long and htf_long and btc_ok_long
+        and not_overextended and rsi_ok_long
     )
     short_ok = (
         ALLOW_SHORT and fired and close < mid and close < open_
         and mom < 0 and mom_falling and mom_strong
         and stack_short and htf_short and btc_ok_short
+        and not_overextended and rsi_ok_short
     )
 
     side = "Buy" if long_ok else ("Sell" if short_ok else None)
     if side is None:
         return None
 
-    atr_v = atr(highs, lows, closes, 14) or atr(highs, lows, closes, 20)
     entry = close
     if side == "Buy":
         sl_zone = (min(zone_lows) if zone_lows else min(lows[-MIN_SQUEEZE_BARS:])) * (1 - SL_BUFFER_PCT / 100)
@@ -205,4 +220,135 @@ def detect_ttm(
         "htf_ok": htf_long if side == "Buy" else htf_short,
         "btc_ok": btc_ok_long if side == "Buy" else btc_ok_short,
         "atr": atr_v,
+        "rsi": round(rsi_v, 2) if rsi_v is not None else None,
+        "zone_low": min(zone_lows) if zone_lows else min(lows[-MIN_SQUEEZE_BARS:]),
+        "zone_high": max(zone_highs) if zone_highs else max(highs[-MIN_SQUEEZE_BARS:]),
+    }
+
+
+def check_pullback_entry(
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+    ts: list[int],
+    armed: dict,
+) -> Optional[dict]:
+    """
+    Second stage of the v2 entry engine. Called on every scan for symbols that already
+    had a squeeze FIRE (see detect_ttm) but have not been entered yet.
+
+    Returns:
+      - None                  -> still waiting, keep the setup armed
+      - {"expired": True}     -> caller should disarm, no entry
+      - {"invalid": True}     -> caller should disarm, no entry (structure broken)
+      - full signal dict      -> caller should disarm AND treat this as an entry signal
+    """
+    side = armed["side"]
+    fired_ts = armed["fired_ts"]
+    zone_low = armed["zone_low"]
+    zone_high = armed["zone_high"]
+
+    idxs = [i for i, t in enumerate(ts) if t <= fired_ts]
+    if not idxs:
+        return {"invalid": True}
+    fire_idx = idxs[-1]
+
+    bars_since = (len(closes) - 1) - fire_idx
+    if bars_since < PULLBACK_MIN_BARS:
+        return None
+    if bars_since > PULLBACK_MAX_BARS:
+        return {"expired": True}
+    if fire_idx + 1 >= len(closes):
+        return None
+
+    since_lows = lows[fire_idx + 1:]
+    since_highs = highs[fire_idx + 1:]
+    if not since_lows or not since_highs:
+        return None
+
+    e_fast = ema(closes, EMA_FAST)
+    atr_v = atr(highs, lows, closes, 14) or atr(highs, lows, closes, 20)
+    rsi_v = rsi(closes, RSI_PERIOD)
+    if e_fast is None or atr_v is None or rsi_v is None:
+        return None
+
+    close, open_ = closes[-1], opens[-1]
+    if len(volumes) < 21:
+        return None
+    avg_v = sum(volumes[-21:-1]) / 20.0
+    vol_ok = avg_v > 0 and volumes[-1] >= avg_v * PULLBACK_CONFIRM_VOL_MIN
+
+    if side == "Buy":
+        if close < zone_low * (1 - SL_BUFFER_PCT / 100):
+            return {"invalid": True}
+        pulled_back = min(since_lows) <= e_fast * 1.01
+        confirm = (
+            pulled_back
+            and close > open_
+            and close > closes[-2]
+            and close > e_fast
+            and RSI_LONG_MIN <= rsi_v <= RSI_LONG_MAX
+            and vol_ok
+        )
+        if not confirm:
+            return None
+        sl_zone = min(min(since_lows), zone_low) * (1 - SL_BUFFER_PCT / 100)
+        sl_atr = close - SL_ATR_MULT * atr_v
+        sl = min(sl_zone, sl_atr)
+        max_sl = close * (1 - SL_CAP_PCT / 100)
+        if sl < max_sl:
+            sl = max_sl
+        if sl >= close:
+            sl = close * (1 - 0.5 / 100)
+        risk = close - sl
+        tp = close + TP_R_MULTIPLE * risk
+    else:
+        if close > zone_high * (1 + SL_BUFFER_PCT / 100):
+            return {"invalid": True}
+        pulled_back = max(since_highs) >= e_fast * 0.99
+        confirm = (
+            pulled_back
+            and close < open_
+            and close < closes[-2]
+            and close < e_fast
+            and RSI_SHORT_MIN <= rsi_v <= RSI_SHORT_MAX
+            and vol_ok
+        )
+        if not confirm:
+            return None
+        sl_zone = max(max(since_highs), zone_high) * (1 + SL_BUFFER_PCT / 100)
+        sl_atr = close + SL_ATR_MULT * atr_v
+        sl = max(sl_zone, sl_atr)
+        max_sl = close * (1 + SL_CAP_PCT / 100)
+        if sl > max_sl:
+            sl = max_sl
+        if sl <= close:
+            sl = close * (1 + 0.5 / 100)
+        risk = sl - close
+        tp = close - TP_R_MULTIPLE * risk
+
+    r_pct = abs(close - sl) / close * 100 if close else 0
+    meta = armed.get("meta", {})
+    return {
+        "side": side,
+        "signal_type": "TTM_LONG_PULLBACK" if side == "Buy" else "TTM_SHORT_PULLBACK",
+        "entry": close,
+        "sl": sl,
+        "tp": tp,
+        "sl_pct": r_pct,
+        "tp_pct": abs(tp - close) / close * 100,
+        "squeeze_bars": meta.get("squeeze_bars"),
+        "momentum": meta.get("momentum"),
+        "vol_spike": meta.get("vol_spike"),
+        "bb_bandwidth": meta.get("bb_bandwidth"),
+        "stars": meta.get("stars", 1),
+        "fired": True,
+        "trend_ok": True,
+        "htf_ok": True,
+        "btc_ok": True,
+        "atr": atr_v,
+        "rsi": round(rsi_v, 2),
+        "bars_since_fire": bars_since,
     }
