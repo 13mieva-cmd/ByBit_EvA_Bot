@@ -11,8 +11,18 @@ def _b(name: str, default: str) -> bool:
 
 
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bybit")
-API_KEY = os.getenv("BYBIT_API_KEY", os.getenv("API_KEY", ""))
-API_SECRET = os.getenv("BYBIT_API_SECRET", os.getenv("API_SECRET", ""))
+API_KEY = os.getenv("BYBIT_API_KEY", os.getenv("API_KEY", "")).strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", os.getenv("API_SECRET", "")).strip()
+
+# --- Demo / Testnet поддержка ---------------------------------------------
+# Оригинальный бот-предшественник по умолчанию стучался в DEMO-домен Bybit
+# (BYBIT_BASE_URL="https://api-demo.bybit.com"). Если у вас demo/testnet ключи,
+# а не ключи от боевого (live) аккаунта Bybit, включите один из двух вариантов
+# ниже -- иначе биржа будет отвечать retCode=10003 "API key is invalid",
+# т.к. demo/testnet ключи НЕ работают на live-домене (и наоборот).
+EXCHANGE_SANDBOX = _b("EXCHANGE_SANDBOX", "false")   # ccxt testnet-режим (api-testnet.bybit.com)
+BYBIT_DEMO_URL = os.getenv("BYBIT_DEMO_URL", "")     # напр. "https://api-demo.bybit.com" для demo-trading ключей Bybit
+# ---------------------------------------------------------------------------
 
 _default_symbols = "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT"
 SYMBOLS: List[str] = [s.strip() for s in os.getenv("SYMBOLS", _default_symbols).split(",") if s.strip()]

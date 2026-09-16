@@ -2,12 +2,15 @@
 Исполнение сделок (v3): корректный расчёт размера позиции (exchange.amount_to_precision),
 кап на объём, верификация защитного стопа, персистентные риск-контуры, сопровождение
 позиции (БУ, ATR-трейлинг, partial, time-stop, фейд по моментуму).
+
+Инициализация биржи вынесена в data_manager.build_exchange() -- единая точка,
+которая поддерживает demo/testnet ключи и даёт понятную диагностику при
+retCode=10003 "API key is invalid".
 """
 import logging
 import time
 from typing import Optional, Dict, Any
 
-import ccxt
 from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, InvalidOrder
 
 from config import (
@@ -21,6 +24,7 @@ from config import (
 from strategy import TradeSignal
 from storage import append_csv
 from indicators import atr as atr_ind, momentum_hist
+from data_manager import build_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +38,9 @@ class ExecutionManager:
         self.dry_run = DRY_RUN
         self._leverage_set = set()
 
-    def _init_exchange(self) -> ccxt.Exchange:
+    def _init_exchange(self):
         try:
-            exchange_class = getattr(ccxt, EXCHANGE_ID)
-            exchange = exchange_class({
-                "apiKey": API_KEY, "secret": API_SECRET,
-                "enableRateLimit": True, "options": {"defaultType": "swap"},
-            })
-            exchange.load_markets()
+            exchange = build_exchange(EXCHANGE_ID, API_KEY, API_SECRET)
             logger.info(f"ExecutionManager: биржа {EXCHANGE_ID} готова")
             return exchange
         except Exception as e:
