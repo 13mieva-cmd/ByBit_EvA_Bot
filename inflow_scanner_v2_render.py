@@ -6,18 +6,6 @@ inflow_scanner_v2_render.py -- Super Trader Bot (v3), главный модул�
 (TTM Squeeze + двухфазный вход на откате + персистентный риск-менеджмент) не
 требует менять команду запуска в деплое (Render/Procfile/systemd и т.п.) --
 просто замените исходный файл на этот, и все остальные модули из архива.
-
-Архитектура цикла:
-  1. Для каждого символа без открытой позиции и без активного "armed"-сетапа:
-     тянем ЗАКРЫТЫЕ бары -> Analyzer.analyze() -> Strategy.detect_fire().
-     Если сработало -- НЕ входим сразу, а армируем (ждём откат).
-  2. Для каждого символа с активным armed-сетапом: Strategy.check_pullback().
-     None -> ждём дальше. expired/invalid -> снимаем с ожидания.
-     TradeSignal -> ExecutionManager.execute_signal() (реальный вход, на откате).
-  3. Отдельно, каждые RECONCILE_INTERVAL секунд: ExecutionManager.reconcile()
-     сопровождает открытые позиции (БУ, ATR-трейл, partial, time-stop, фейд).
-  4. Ежедневный сброс P&L, персистентные риск-контуры (см. storage.py).
-  5. Опциональные Telegram-алерты (если заданы TELEGRAM_BOT_TOKEN/CHAT_ID).
 """
 
 import time
@@ -47,7 +35,6 @@ logger = logging.getLogger("SuperTraderBot")
 
 
 def notify(text: str):
-    """Best-effort Telegram-уведомление. Если токен/чат не заданы -- просто лог."""
     logger.info(f"[notify] {text}")
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
