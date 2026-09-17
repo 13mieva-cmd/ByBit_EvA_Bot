@@ -4,9 +4,16 @@
   - Кэш старшего таймфрейма обновляется по TTL (HIGHER_TF_REFRESH_SEC).
   - Ретраятся NetworkError/RequestTimeout/ExchangeError.
   - Отдельный get_live_price() для отображения — НИКОГДА для торговых решений.
-  - Поддержка demo/testnet ключей Bybit (EXCHANGE_SANDBOX / BYBIT_DEMO_URL,
-    он же старый BYBIT_BASE_URL) -- без этого live-ключи и demo-ключи
-    несовместимы, биржа отвечает retCode=10003 "API key is invalid".
+
+  Demo/testnet поддержка Bybit (важно понимать разницу, обе взаимоисключающие):
+    - Testnet (EXCHANGE_SANDBOX=true)      -> ccxt exchange.set_sandbox_mode(True)
+    - Demo Trading (BYBIT_BASE_URL/DEMO)   -> ccxt exchange.enable_demo_trading(True)
+  Это два РАЗНЫХ механизма ccxt для Bybit. Ручное переопределение exchange.urls
+  НЕ решает проблему полностью: Demo Trading поддерживает не все эндпоинты
+  (retCode=10032 "Demo trading are not supported" на некоторых из них, например
+  при попытке ccxt подгрузить spot/inverse/option рынки при loadMarkets()).
+  Официальный ccxt-метод enable_demo_trading(True) сам знает, какие вызовы можно
+  делать в demo-режиме, и является рекомендованным способом (см. ccxt/ccxt#25545).
 """
 import time
 import logging
@@ -27,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exchange:
     """Общая инициализация ccxt-биржи с поддержкой demo/testnet и понятной
-    диагностикой при ошибке аутентификации (retCode 10003 и т.п.)."""
+    диагностикой при ошибке аутентификации (retCode 10003, 10032 и т.п.)."""
     if not api_key or not api_secret:
         logger.warning(
             "BYBIT_API_KEY/BYBIT_API_SECRET не заданы (пусто) -- бот сможет работать "
@@ -40,24 +47,47 @@ def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exch
         "enableRateLimit": True,
         "options": {"defaultType": "swap"},
     })
+
+    is_demo = bool(BYBIT_DEMO_URL) and exchange_id == "bybit"
+
     if EXCHANGE_SANDBOX and hasattr(exchange, "set_sandbox_mode"):
         exchange.set_sandbox_mode(True)
-        logger.info(f"{exchange_id}: включён ccxt sandbox/testnet режим (EXCHANGE_SANDBOX=true)")
-    if BYBIT_DEMO_URL and exchange_id == "bybit":
-        try:
-            for key in list(exchange.urls.get("api", {}).keys()):
-                exchange.urls["api"][key] = BYBIT_DEMO_URL
-            logger.info(f"bybit: API-домен переопределён на {BYBIT_DEMO_URL} (BYBIT_DEMO_URL/BYBIT_BASE_URL)")
-        except Exception as e:
-            logger.warning(f"Не удалось переопределить demo URL для bybit: {e}")
+        logger.info(f"{exchange_id}: включён ccxt testnet-режим (EXCHANGE_SANDBOX=true)")
+
+    if is_demo:
+        if hasattr(exchange, "enable_demo_trading"):
+            # Официальный ccxt-механизм для Bybit Demo Trading: сам переключает домены
+            # и корректно ограничивает набор эндпоинтов, которые бот пытается вызывать,
+            # избегая retCode=10032 "Demo trading are not supported".
+            exchange.enable_demo_trading(True)
+            logger.info("bybit: включён demo trading через ccxt exchange.enable_demo_trading(True)")
+        else:
+            # Фолбэк для старых версий ccxt без enable_demo_trading: ручное переопределение
+            # домена + принудительное ограничение типов рынков до linear (USDT-perpetual),
+            # единственного, что поддерживает Demo Trading.
+            try:
+                for key in list(exchange.urls.get("api", {}).keys()):
+                    exchange.urls["api"][key] = BYBIT_DEMO_URL
+                exchange.options["fetchMarkets"] = ["linear"]
+                logger.info(f"bybit: (fallback) домен переопределён на {BYBIT_DEMO_URL}, fetchMarkets=['linear']")
+            except Exception as e:
+                logger.warning(f"Не удалось настроить demo-режим вручную: {e}")
+
     try:
         exchange.load_markets()
     except Exception as e:
         msg = str(e)
-        if "10003" in msg or "invalid" in msg.lower():
+        if "10032" in msg:
+            logger.critical(
+                "Bybit Demo Trading отклонил запрос (retCode=10032 'Demo trading are not supported'). "
+                "Обновите пакет ccxt до версии, где есть exchange.enable_demo_trading() "
+                "('pip install -U ccxt' -- нужна версия не старее 4.3.x), либо переменной "
+                "EXCHANGE_SANDBOX=true переключитесь на настоящий testnet вместо demo trading."
+            )
+        elif "10003" in msg or "invalid" in msg.lower():
             logger.critical(
                 "Биржа отклонила API-ключ (retCode=10003 / invalid key). Проверьте: "
-                "1) нет лишних пробелов/кавычек в BYBIT_API_KEY/BYBIT_API_SECRET в переменных окружения; "
+                "1) нет лишних пробелов/кавычек в BYBIT_API_KEY/BYBIT_API_SECRET; "
                 "2) ключ от LIVE-аккаунта, а не demo/testnet (или наоборот) -- задайте BYBIT_BASE_URL "
                 "(или BYBIT_DEMO_URL) = https://api-demo.bybit.com для demo-ключей, либо EXCHANGE_SANDBOX=true для testnet; "
                 "3) на ключе нет IP-whitelist, не включающего IP хостинга (или whitelist выключен); "

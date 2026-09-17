@@ -15,12 +15,8 @@ API_KEY = os.getenv("BYBIT_API_KEY", os.getenv("API_KEY", "")).strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", os.getenv("API_SECRET", "")).strip()
 
 # --- Demo / Testnet поддержка ---------------------------------------------
-# ВАЖНО: у бота-предшественника переменная называлась BYBIT_BASE_URL (по умолчанию
-# "https://api-demo.bybit.com"). Здесь она читается как есть для совместимости --
-# если в Railway/Render уже стоит BYBIT_BASE_URL, менять ничего не нужно.
-# BYBIT_DEMO_URL -- новый алиас той же переменной (можно использовать любое из имён).
-# Если задан любой из них -- ccxt будет ходить именно на этот домен вместо live-Bybit.
-EXCHANGE_SANDBOX = _b("EXCHANGE_SANDBOX", "false")   # ccxt testnet-режим (api-testnet.bybit.com)
+# Совместимо со старой переменной BYBIT_BASE_URL бота-предшественника.
+EXCHANGE_SANDBOX = _b("EXCHANGE_SANDBOX", "false")
 BYBIT_DEMO_URL = os.getenv("BYBIT_DEMO_URL", os.getenv("BYBIT_BASE_URL", "")).strip()
 # ---------------------------------------------------------------------------
 
