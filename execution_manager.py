@@ -4,8 +4,8 @@
 позиции (БУ, ATR-трейлинг, partial, time-stop, фейд по моментуму).
 
 Инициализация биржи вынесена в data_manager.build_exchange() -- единая точка,
-которая поддерживает demo/testnet ключи и даёт понятную диагностику при
-retCode=10003 "API key is invalid".
+которая поддерживает demo/testnet ключи (BYBIT_BASE_URL/BYBIT_DEMO_URL/EXCHANGE_SANDBOX)
+и даёт понятную диагностику при retCode=10003 "API key is invalid".
 """
 import logging
 import time

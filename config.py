@@ -15,13 +15,13 @@ API_KEY = os.getenv("BYBIT_API_KEY", os.getenv("API_KEY", "")).strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", os.getenv("API_SECRET", "")).strip()
 
 # --- Demo / Testnet поддержка ---------------------------------------------
-# Оригинальный бот-предшественник по умолчанию стучался в DEMO-домен Bybit
-# (BYBIT_BASE_URL="https://api-demo.bybit.com"). Если у вас demo/testnet ключи,
-# а не ключи от боевого (live) аккаунта Bybit, включите один из двух вариантов
-# ниже -- иначе биржа будет отвечать retCode=10003 "API key is invalid",
-# т.к. demo/testnet ключи НЕ работают на live-домене (и наоборот).
+# ВАЖНО: у бота-предшественника переменная называлась BYBIT_BASE_URL (по умолчанию
+# "https://api-demo.bybit.com"). Здесь она читается как есть для совместимости --
+# если в Railway/Render уже стоит BYBIT_BASE_URL, менять ничего не нужно.
+# BYBIT_DEMO_URL -- новый алиас той же переменной (можно использовать любое из имён).
+# Если задан любой из них -- ccxt будет ходить именно на этот домен вместо live-Bybit.
 EXCHANGE_SANDBOX = _b("EXCHANGE_SANDBOX", "false")   # ccxt testnet-режим (api-testnet.bybit.com)
-BYBIT_DEMO_URL = os.getenv("BYBIT_DEMO_URL", "")     # напр. "https://api-demo.bybit.com" для demo-trading ключей Bybit
+BYBIT_DEMO_URL = os.getenv("BYBIT_DEMO_URL", os.getenv("BYBIT_BASE_URL", "")).strip()
 # ---------------------------------------------------------------------------
 
 _default_symbols = "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT"

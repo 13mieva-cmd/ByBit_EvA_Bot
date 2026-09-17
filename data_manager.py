@@ -4,9 +4,9 @@
   - Кэш старшего таймфрейма обновляется по TTL (HIGHER_TF_REFRESH_SEC).
   - Ретраятся NetworkError/RequestTimeout/ExchangeError.
   - Отдельный get_live_price() для отображения — НИКОГДА для торговых решений.
-  - Поддержка demo/testnet ключей Bybit (EXCHANGE_SANDBOX / BYBIT_DEMO_URL) --
-    без этого live-ключи и demo-ключи несовместимы, биржа отвечает
-    retCode=10003 "API key is invalid" при попытке подключиться не на тот домен.
+  - Поддержка demo/testnet ключей Bybit (EXCHANGE_SANDBOX / BYBIT_DEMO_URL,
+    он же старый BYBIT_BASE_URL) -- без этого live-ключи и demo-ключи
+    несовместимы, биржа отвечает retCode=10003 "API key is invalid".
 """
 import time
 import logging
@@ -47,7 +47,7 @@ def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exch
         try:
             for key in list(exchange.urls.get("api", {}).keys()):
                 exchange.urls["api"][key] = BYBIT_DEMO_URL
-            logger.info(f"bybit: API-домен переопределён на demo URL {BYBIT_DEMO_URL}")
+            logger.info(f"bybit: API-домен переопределён на {BYBIT_DEMO_URL} (BYBIT_DEMO_URL/BYBIT_BASE_URL)")
         except Exception as e:
             logger.warning(f"Не удалось переопределить demo URL для bybit: {e}")
     try:
@@ -58,7 +58,8 @@ def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exch
             logger.critical(
                 "Биржа отклонила API-ключ (retCode=10003 / invalid key). Проверьте: "
                 "1) нет лишних пробелов/кавычек в BYBIT_API_KEY/BYBIT_API_SECRET в переменных окружения; "
-                "2) ключ от LIVE-аккаунта, а не demo/testnet (или наоборот) -- см. EXCHANGE_SANDBOX/BYBIT_DEMO_URL в config.py; "
+                "2) ключ от LIVE-аккаунта, а не demo/testnet (или наоборот) -- задайте BYBIT_BASE_URL "
+                "(или BYBIT_DEMO_URL) = https://api-demo.bybit.com для demo-ключей, либо EXCHANGE_SANDBOX=true для testnet; "
                 "3) на ключе нет IP-whitelist, не включающего IP хостинга (или whitelist выключен); "
                 "4) у ключа включены права Contract Trade / Unified Trading, а не только Read-only."
             )

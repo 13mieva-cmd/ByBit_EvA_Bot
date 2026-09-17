@@ -1,11 +1,8 @@
 """
 inflow_scanner_v2_render.py -- Super Trader Bot (v3), главный модуль.
-
-Имя файла сохранено таким же, как у бота-предшественника, специально: этот файл
-полностью заменяет исходный inflow_scanner_v2_render.py и не требует менять
-команду запуска в деплое (Render/Railway/Procfile/systemd и т.п.).
+Имя файла сохранено таким же, как у бота-предшественника, чтобы не менять
+команду запуска в деплое (Railway/Render/Procfile/systemd и т.п.).
 """
-
 import time
 import logging
 import sys

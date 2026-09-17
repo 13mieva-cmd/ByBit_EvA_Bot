@@ -1,31 +1,33 @@
 # Super Trader Bot (v3) — заменяет предыдущего бота полностью
 
-Главный файл называется `inflow_scanner_v2_render.py` — так же, как у бота-предшественника,
-чтобы деплой (Render/Railway/Procfile/systemd) не пришлось перенастраивать.
+Главный файл называется `inflow_scanner_v2_render.py` — так же, как у бота-предшественника.
+
+## Если видите ошибку "API key is invalid" (retCode 10003)
+
+Бот падает на этапе подключения к бирже, ДО запуска стратегии. Обычно причина одна из:
+
+1. У вас demo/testnet ключи Bybit, а бот бьёт в LIVE API. **В этой версии это уже
+   исправлено** -- бот распознаёт вашу существующую переменную `BYBIT_BASE_URL`
+   (например, `https://api-demo.bybit.com`) точно так же, как это делал бот-предшественник.
+   Ничего переименовывать в Railway не нужно.
+2. Опечатка/лишний пробел в `BYBIT_API_KEY` / `BYBIT_API_SECRET`.
+3. На ключе включён IP-whitelist, не пропускающий IP хостинга.
+4. У ключа не включены права Contract Trade / Unified Trading.
 
 ## Запуск
 ```
 pip install -r requirements.txt
-export BYBIT_API_KEY="..."
-export BYBIT_API_SECRET="..."
 python inflow_scanner_v2_render.py
 ```
 
-## Если видите ошибку "API key is invalid" (retCode 10003)
-Это означает, что Bybit отклонил ключ/секрет ещё на этапе подключения (до запуска
-стратегии). Проверьте по порядку:
-
-1. В переменных окружения (Railway/Render → Variables) нет случайных пробелов,
-   переносов строк или кавычек вокруг `BYBIT_API_KEY` / `BYBIT_API_SECRET`.
-2. Ключ создан для того же типа аккаунта, к которому стучится бот:
-   - Если у вас ключи **demo-аккаунта** Bybit (Demo Trading, домен `api-demo.bybit.com`,
-     как было в самой первой версии бота) — задайте `BYBIT_DEMO_URL=https://api-demo.bybit.com`.
-   - Если у вас ключи **testnet** — задайте `EXCHANGE_SANDBOX=true`.
-   - Если у вас обычные **live**-ключи — ничего из этого включать не нужно (по умолчанию
-     оба параметра выключены, бот бьёт в боевой Bybit API).
-3. На ключе не включён IP-whitelist, не пропускающий IP хостинга (либо добавьте
-   IP в whitelist, либо отключите его).
-4. У ключа включены права **Contract Trade / Unified Trading**, а не только Read-only.
+## Переменные окружения (основные)
+- `BYBIT_API_KEY`, `BYBIT_API_SECRET` — ключи Bybit
+- `BYBIT_BASE_URL` (или `BYBIT_DEMO_URL`) — домен API; задайте `https://api-demo.bybit.com`
+  для demo-ключей, оставьте пустым для live
+- `EXCHANGE_SANDBOX=true` — альтернативный способ включить ccxt testnet-режим
+- `DRY_RUN=true|false` — без реальных ордеров / реальная торговля
+- `SYMBOLS` — список пар через запятую
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — опциональные уведомления
 
 ## Что нового в v3
 - Двухфазный вход FIRE -> PULLBACK CONFIRM (не покупаем хай, ждём откат к EMA50)
@@ -35,7 +37,7 @@ python inflow_scanner_v2_render.py
 - Верификация SL на бирже после входа
 - ATR-трейлинг, безубыток, частичное закрытие, тайм-стоп, фейд по моментуму
 - Корректный расчёт размера позиции через exchange.amount_to_precision()
-- Поддержка demo/testnet ключей Bybit (EXCHANGE_SANDBOX / BYBIT_DEMO_URL)
+- Поддержка demo/testnet ключей Bybit (BYBIT_BASE_URL/BYBIT_DEMO_URL/EXCHANGE_SANDBOX)
 
 ## Структура
 - `inflow_scanner_v2_render.py` — главный цикл
